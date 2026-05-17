@@ -43,13 +43,13 @@ Drive inside your alliance’s **Match Loading Zone** and touch the wall (red or
 
 ### Keybinds
 
-| Keybind   | What Spawns                                      | Description |
-|-----------|--------------------------------------------------|-------------|
-| **M + 1** | Nested Cup + **Alliance/Yellow Pin**            | Cup containing a red_yellow or blue_yellow pin |
-| **M + 2** | Nested Cup + **Yellow/Yellow Pin**              | Cup containing a pure yellow/yellow pin |
-| **M + 3** | **Individual Cup**                              | Single gray cup |
-| **M + 4** | **Individual Alliance/Yellow Pin**              | Red_yellow or blue_yellow pin |
-| **M + 5** | **Individual Yellow/Yellow Pin**                | Pure yellow/yellow pin |
+| Keybind   | What Spawns                                     |
+|-----------|-------------------------------------------------|
+| **M + 1** | Nested Cup + **Alliance/Yellow Pin**            | 
+| **M + 2** | Nested Cup + **Yellow/Yellow Pin**              |
+| **M + 3** | **Individual Cup**                              |
+| **M + 4** | **Individual Alliance/Yellow Pin**              | 
+| **M + 5** | **Individual Yellow/Yellow Pin**                |
 
 ---
 
