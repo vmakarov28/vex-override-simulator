@@ -39,7 +39,7 @@ Built with **Pygame + Pymunk** for realistic rigid-body physics, accurate scorin
 
 ## Match Loading System
 
-Stand inside your alliance’s **Match Loading Zone** (red or blue taped rectangles in the corners).
+Drive inside your alliance’s **Match Loading Zone** and touch the wall (red or blue taped rectangles in the corners).
 
 ### Keybinds
 
@@ -51,16 +51,11 @@ Stand inside your alliance’s **Match Loading Zone** (red or blue taped rectang
 | **M + 4** | **Individual Alliance/Yellow Pin**              | Red_yellow or blue_yellow pin |
 | **M + 5** | **Individual Yellow/Yellow Pin**                | Pure yellow/yellow pin |
 
-**Inventory Limits (Per Team):**
-- 10 Cups
-- 12 Alliance-Colored/Yellow Pins
-- 1 Yellow/Yellow Pin
-
 ---
 
 ## Endgame (Last 20 Seconds)
 
-- **18-inch height limit** while in the Midfield
+- **18-inch height limit** while in the Midfield so scoring cannot exceed goal/pin/cup/pin height.
 - **+8 points per robot** parked in the Midfield (live bonus)
 - **Center Goal** locks after reaching Pin + Cup + Pin (3 items)
 - Yellow pin ownership in center goal is decided by **Midfield robot majority** at match end (SC5b)
