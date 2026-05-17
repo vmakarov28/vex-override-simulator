@@ -75,3 +75,8 @@ pip install -r requirements.txt
 
 # Run the simulator
 python main.py --mode interactive
+
+
+cd C:\Users\aipla\Desktop\override_sim
+venv\Scripts\activate
+python main.py --mode interactive
