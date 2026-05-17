@@ -1,27 +1,82 @@
-# vex-override-simulator
-simulates the vex override game
-controls:
-- W/A/S/D for drive
-- E for intake
-- Q score pin
-- F flip pin
-- Shift + Q score Cup
-- Shift + F flip pin
-- M + 1/2/3/4/5 for matchloading combinations
-- 
-Matchload Combinations:
-## Keybinds Table
+# VEX Override Simulator
+
+A high-fidelity 2D physics simulator for the **2026-2027 VEX V5 Robotics Competition game: Override**.
+
+Built with **Pygame + Pymunk** for realistic rigid-body physics, accurate scoring, and strategy training.
+
+---
+
+## Features
+
+- **Full Physics Simulation** — Rounded convex polygons, velocity limiting, realistic friction/elasticity, and proper collision handling.
+- **Accurate Scoring** — Per-half pin scoring, clear/dark cup orientation, toggle-controlled yellow ownership, and proper stack visibility rules.
+- **Endgame System** — Complete implementation of the last 20 seconds:
+  - 18-inch height limit in the Midfield
+  - Live +8 parking bonus per robot in the Midfield
+  - Center goal locks after Pin + Cup + Pin stack (3 items)
+  - SC5b yellow ownership applied at match end based on Midfield robot majority
+- **Match Loading** — Realistic inventory system with 5 different load combinations.
+- **Interactive Controls** — Full keyboard support for driving, intaking, scoring, flipping, toggling, and match loading.
+- **Live HUD** — Real-time scores, timer, Midfield parking bonus, and matchload inventory tracking.
+
+---
+
+## Controls
+
+| Action              | Red Alliance (WASD)      | Blue Alliance (Arrows)      |
+|---------------------|--------------------------|-----------------------------|
+| Drive               | W / A / S / D            | ↑ / ← / ↓ / →               |
+| Intake              | **E**                    | **Right Shift**             |
+| Score Pin           | **Q**                    | **Right Ctrl**              |
+| Score Cup           | **Shift + Q**            | **Shift + Right Ctrl**      |
+| Flip Pin            | **F**                    | **[**                         |
+| Flip Cup            | **Shift + F**            | **Shift + [**                 |
+| Toggle (Roller)     | **T**                    | —                           |
+| Match Load          | **M + 1/2/3/4/5**        | **M + 1/2/3/4/5**           |
+| Reset Match         | **R**                    | **R**                       |
+
+---
+
+## Match Loading System
+
+Stand inside your alliance’s **Match Loading Zone** (red or blue taped rectangles in the corners).
+
+### Keybinds
 
 | Keybind   | What Spawns                                      | Description |
 |-----------|--------------------------------------------------|-------------|
-| **M + 1** | Nested Cup + **Alliance/Yellow Pin**            | Spawns a cup containing a red_yellow (Red) or blue_yellow (Blue) pin |
-| **M + 2** | Nested Cup + **Yellow/Yellow Pin**              | Spawns a cup containing a pure yellow/yellow pin |
-| **M + 3** | **Individual Cup**                              | Spawns a single gray cup |
-| **M + 4** | **Individual Alliance/Yellow Pin**              | Spawns a red_yellow or blue_yellow pin |
-| **M + 5** | **Individual Yellow/Yellow Pin**                | Spawns a pure yellow/yellow pin |
+| **M + 1** | Nested Cup + **Alliance/Yellow Pin**            | Cup containing a red_yellow or blue_yellow pin |
+| **M + 2** | Nested Cup + **Yellow/Yellow Pin**              | Cup containing a pure yellow/yellow pin |
+| **M + 3** | **Individual Cup**                              | Single gray cup |
+| **M + 4** | **Individual Alliance/Yellow Pin**              | Red_yellow or blue_yellow pin |
+| **M + 5** | **Individual Yellow/Yellow Pin**                | Pure yellow/yellow pin |
 
-## Notes
-- You can only match load **one item at a time**.
-- Once you run out of an item type, that keybind will stop working.
-- Robot must be touching the wall witchin the match load zone
-- Spawned objects appear in the correct position inside the loading zone (touching the wall).
+**Inventory Limits (Per Team):**
+- 10 Cups
+- 12 Alliance-Colored/Yellow Pins
+- 1 Yellow/Yellow Pin
+
+---
+
+## Endgame (Last 20 Seconds)
+
+- **18-inch height limit** while in the Midfield
+- **+8 points per robot** parked in the Midfield (live bonus)
+- **Center Goal** locks after reaching Pin + Cup + Pin (3 items)
+- Yellow pin ownership in center goal is decided by **Midfield robot majority** at match end (SC5b)
+
+---
+
+## How to Run
+
+```bash
+# Create and activate virtual environment
+python -m venv venv
+source venv/bin/activate          # Linux/Mac
+venv\Scripts\activate             # Windows
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the simulator
+python main.py --mode interactive
