@@ -80,3 +80,7 @@ python main.py --mode interactive
 cd C:\Users\aipla\Desktop\override_sim
 venv\Scripts\activate
 python main.py --mode interactive
+
+
+del artifacts\models\*.pt
+python main.py --mode train-vis
