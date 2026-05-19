@@ -1,0 +1,27 @@
+# VEX Override Neural Strategy Lab — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Physics + simulation ──────────────────────────────────────────────────────
+pygame==2.5.2
+pymunk==6.6.0
+
+# ── Deep learning ─────────────────────────────────────────────────────────────
+# PyTorch: install from https://pytorch.org for your CUDA version.
+# For CUDA 12.x (RTX 5080):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# For CPU only:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=2.2.0
+
+# ── Science / numerical ───────────────────────────────────────────────────────
+numpy>=1.26.0
+
+# ── Video recording ───────────────────────────────────────────────────────────
+opencv-python>=4.9.0
+
+# ── Visualisation (heatmaps) ──────────────────────────────────────────────────
+matplotlib>=3.8.0
+
+# ── Optional: experiment tracking ────────────────────────────────────────────
+# wandb          # Weights & Biases — run: wandb login
+# tensorboard    # TensorBoard logging
