@@ -1,19 +1,21 @@
 """
 utils/observation_builder.py
 ────────────────────────────────────────────────────────────────────────────
-Builds the fixed-size 524-dimensional observation vector for one agent.
+Builds the fixed-size 551-dimensional observation vector for one agent.
 
 Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
   [  0: 24]  Self state
   [ 24: 36]  Teammate state
   [ 36: 56]  Opponents (2 × 10)
-  [ 56:182]  Goals (9 × 14 = 126)
-  [182:382]  K-nearest pins (20 × 10 = 200)
-  [382:487]  K-nearest cups (15 × 7 = 105)
-  [487:507]  Toggles (4 × 5 = 20)
-  [507:524]  Global match state (17)
+  [ 56:209]  Goals (9 × 17 = 153)
+               +3 bits vs. v4: top-pin UP color one-hot [red, blue, yellow]
+               This lets robots decide flip/cup-orientation before scoring.
+  [209:409]  K-nearest pins (20 × 10 = 200)
+  [409:514]  K-nearest cups (15 × 7 = 105)
+  [514:534]  Toggles (4 × 5 = 20)
+  [534:551]  Global match state (17)
   ──────────
-  Total: 524
+  Total: 551
 """
 
 import math
@@ -42,7 +44,7 @@ MAX_ANG_VEL = 10.0
 K_PINS = 20   # nearest pins to encode
 K_CUPS = 15   # nearest cups to encode
 
-OBS_DIM = 524
+OBS_DIM = 551
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color → one-hot helper  (3 bits: [red, blue, yellow])
@@ -261,6 +263,21 @@ def build_observation(
                     yellow_halves += 1
         yellow_halves_norm = min(1.0, yellow_halves / 5.0)
 
+        # Top-pin UP color one-hot [is_red, is_blue, is_yellow].
+        # Gives robots direct color information for cup-orientation and
+        # flip decisions without requiring them to infer it from denial_potential.
+        top_pin_up_red = top_pin_up_blue = top_pin_up_yellow = 0.0
+        if goal.stack:
+            top_obj, top_is_p = goal.stack[-1]
+            if top_is_p:
+                up_col = top_obj.get_up_color()
+                if up_col == C_RED:
+                    top_pin_up_red = 1.0
+                elif up_col == C_BLUE:
+                    top_pin_up_blue = 1.0
+                elif up_col == C_YELLOW:
+                    top_pin_up_yellow = 1.0
+
         obs[ptr + 0]  = gdx
         obs[ptr + 1]  = gdy
         obs[ptr + 2]  = gdist
@@ -275,7 +292,10 @@ def build_observation(
         obs[ptr + 11] = can_score_cup
         obs[ptr + 12] = denial_potential
         obs[ptr + 13] = yellow_halves_norm
-        ptr += 14
+        obs[ptr + 14] = top_pin_up_red
+        obs[ptr + 15] = top_pin_up_blue
+        obs[ptr + 16] = top_pin_up_yellow
+        ptr += 17
 
     # ── [182:382] K-nearest pins (20 × 10) ───────────────────────────────────
     live_pins = [p for p in pins if not p.scored]
