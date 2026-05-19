@@ -6,12 +6,12 @@ Neural network architecture for the VEX Override MAPPO system.
 Components
 ----------
 Policy (actor)
-  - Shared MLP backbone: 524 → [512, 256, 128]
+  - Shared MLP backbone: 551 → [512, 256, 128]
   - Continuous head: 128 → 2  (mean + log_std for left/right motors)
   - Discrete head:   128 → 7  (Bernoulli logit per button action)
 
 CentralizedCritic
-  - Takes concatenated obs from both robots on the same alliance: 1048 → 1
+  - Takes concatenated obs from both robots on the same alliance: 1102 → 1
   - Hidden: [512, 256, 128] → 1
   - Used ONLY during training; discarded at inference.
 
@@ -61,7 +61,7 @@ def _init_weights(module, gain=1.0):
 # ─────────────────────────────────────────────────────────────────────────────
 class Policy(nn.Module):
     """
-    Decentralised actor — uses only local 524-dim observation.
+    Decentralised actor — uses only local 551-dim observation.
 
     Forward returns
     ---------------
@@ -95,7 +95,7 @@ class Policy(nn.Module):
         _init_weights(self.disc_head,    gain=0.01)
 
     def forward(self, obs: torch.Tensor):
-        """obs : (B, 524)  →  cont_mean, cont_log_std, disc_logits"""
+        """obs : (B, 551)  →  cont_mean, cont_log_std, disc_logits"""
         feats = self.backbone(obs)
         mean    = self.cont_mean(feats)
         log_std = self.cont_log_std(feats).clamp(LOG_STD_MIN, LOG_STD_MAX)
@@ -109,7 +109,7 @@ class Policy(nn.Module):
 
         Parameters
         ----------
-        obs          : (B, 524) or (524,) — current observation(s)
+        obs          : (B, 551) or (551,) — current observation(s)
         action_mask  : (B, 7) or (7,) bool tensor — True = action legal
         deterministic: bool — if True, use mode instead of sampling
 
@@ -204,7 +204,7 @@ class Policy(nn.Module):
 class CentralizedCritic(nn.Module):
     """
     Centralised value function.
-    Input  : concatenated observations of both alliance robots → (B, 1048)
+    Input  : concatenated observations of both alliance robots → (B, 1102)
     Output : scalar value estimate → (B, 1)
     """
 
@@ -220,7 +220,7 @@ class CentralizedCritic(nn.Module):
 
     def forward(self, obs1: torch.Tensor, obs2: torch.Tensor) -> torch.Tensor:
         """
-        obs1, obs2 : (B, 524) — observations of robot 0 and robot 1 (same alliance)
+        obs1, obs2 : (B, 551) — observations of robot 0 and robot 1 (same alliance)
         Returns    : (B, 1)   — value estimates
         """
         joint = torch.cat([obs1, obs2], dim=-1)

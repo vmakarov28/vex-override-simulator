@@ -300,15 +300,92 @@ class OverrideEnv:
         for r in self.sim.robots:
             self._prev_scores[r.robot_id] = r.successful_scores
 
-        # 3. Carrying proximity reward
+        # 3. Carrying proximity reward — only when a legal score exists at a nearby goal.
+        # A robot holding the wrong element for every reachable goal earns nothing here,
+        # preventing the "park at goal unable to score" exploit.
         for rid in AGENT_IDS:
             r = robot_map[rid]
-            if r.carrying_pin is not None or r.carrying_cup is not None:
-                dist = self._carrying_target_dist(rid, robot_map)
-                prox = rw["carrying_proximity_scale"] / (1.0 + dist / GOAL_PROXIMITY_NORM)
+            if r.carrying_pin is None and r.carrying_cup is None:
+                continue
+            rx, ry = float(r.body.position.x), float(r.body.position.y)
+            best = None
+            for g in self.sim.goals:
+                if g.alliance not in ("neutral", r.alliance):
+                    continue
+                can_pin = r.carrying_pin is not None and not _stack_top_is_pin(g.stack)
+                can_cup = r.carrying_cup is not None and     _stack_top_is_pin(g.stack)
+                if can_pin or can_cup:
+                    d = math.hypot(rx - g.x, ry - g.y)
+                    if best is None or d < best:
+                        best = d
+            if best is not None:
+                prox = rw["carrying_proximity_scale"] / (1.0 + best / GOAL_PROXIMITY_NORM)
                 rewards[rid] += prox
 
-        # 4. Score attempt reward
+        # 3b. Fetch-needed-element redirect reward.
+        # When a robot holds an element it cannot currently score anywhere, reward it
+        # for approaching the specific element type it is missing so it can complete
+        # the stack and return.
+        for rid in AGENT_IDS:
+            r = robot_map[rid]
+            rx, ry = float(r.body.position.x), float(r.body.position.y)
+            # Determine whether this robot can score anywhere right now.
+            can_score_anywhere = any(
+                g.alliance in ("neutral", r.alliance) and (
+                    (r.carrying_pin is not None and not _stack_top_is_pin(g.stack)) or
+                    (r.carrying_cup is not None and     _stack_top_is_pin(g.stack))
+                )
+                for g in self.sim.goals
+            )
+            if can_score_anywhere:
+                continue  # proximity reward above already pulls this robot to the goal
+            needs_pin = r.carrying_cup is not None and r.carrying_pin is None
+            needs_cup = r.carrying_pin is not None and r.carrying_cup is None
+            if not needs_pin and not needs_cup:
+                continue
+            best = None
+            if needs_pin:
+                for p in self.sim.pins:
+                    if p.scored or p.carried_by is not None:
+                        continue
+                    d = math.hypot(rx - float(p.body.position.x),
+                                   ry - float(p.body.position.y))
+                    if best is None or d < best:
+                        best = d
+            else:
+                for c in self.sim.cups:
+                    if c.scored or c.carried_by is not None:
+                        continue
+                    d = math.hypot(rx - float(c.body.position.x),
+                                   ry - float(c.body.position.y))
+                    if best is None or d < best:
+                        best = d
+            if best is not None:
+                rewards[rid] += rw["fetch_needed_scale"] / (1.0 + best / GOAL_PROXIMITY_NORM)
+
+        # 3c. Wrong-element loitering penalty.
+        # Small per-step cost when a robot lingers within scoring radius of a goal
+        # where it cannot make a legal score.  This breaks the stable equilibrium of
+        # parking at an unreachable goal while the holding-timeout ramp is still low.
+        for rid in AGENT_IDS:
+            r = robot_map[rid]
+            if r.carrying_pin is None and r.carrying_cup is None:
+                continue
+            rx, ry = float(r.body.position.x), float(r.body.position.y)
+            for g in self.sim.goals:
+                if g.alliance not in ("neutral", r.alliance):
+                    continue
+                if math.hypot(rx - g.x, ry - g.y) > SCORING_RADIUS * 1.5:
+                    continue
+                can_pin = r.carrying_pin is not None and not _stack_top_is_pin(g.stack)
+                can_cup = r.carrying_cup is not None and     _stack_top_is_pin(g.stack)
+                if not can_pin and not can_cup:
+                    rewards[rid] += rw["wrong_element_loiter"]
+                    break
+
+        # 4. Score attempt reward — only fires when the attempt is actually legal
+        # (correct element for the goal's current stack state).  Prevents rewarding
+        # robots for repeatedly pressing score on a goal they can never fill.
         for rid in AGENT_IDS:
             if not score_attempted[rid]:
                 continue
@@ -317,7 +394,11 @@ class OverrideEnv:
             for g in self.sim.goals:
                 if g.alliance not in ("neutral", r.alliance):
                     continue
-                if math.hypot(rx - g.x, ry - g.y) <= SCORING_RADIUS + 4.0:
+                if math.hypot(rx - g.x, ry - g.y) > SCORING_RADIUS + 4.0:
+                    continue
+                can_pin = r.carrying_pin is not None and not _stack_top_is_pin(g.stack)
+                can_cup = r.carrying_cup is not None and     _stack_top_is_pin(g.stack)
+                if can_pin or can_cup:
                     rewards[rid] += rw["score_attempt_in_zone"]
                     break
 
@@ -392,7 +473,26 @@ class OverrideEnv:
             ally_rids = [r for r in AGENT_IDS if robot_map[r].alliance == scorer_alliance]
 
             if new_is_pin:
-                for col in [new_obj.get_up_color(), new_obj.get_down_color()]:
+                pin_idx = len(pre_stack)  # 0-based position of the new pin in the stack
+
+                # Determine which halves are actually visible at placement time.
+                # UP half: always visible — it is now the top of the stack.
+                # DOWN half: hidden by the goal post for the first pin (index 0);
+                #            for deeper pins, visible only if the cup below has its
+                #            clear side facing up (dark side down = blocks nothing).
+                up_vis = True
+                if pin_idx == 0:
+                    down_vis = False  # goal post always hides the bottom-most pin's DOWN half
+                else:
+                    prev_obj, prev_is_pin = post_stack[pin_idx - 1]
+                    down_vis = _eff_clear_up(prev_obj) if not prev_is_pin else True
+
+                towner = _get_toggle_for_goal(goal, list(self.sim.toggles))
+
+                for visible, col in ((up_vis, new_obj.get_up_color()),
+                                     (down_vis, new_obj.get_down_color())):
+                    if not visible:
+                        continue  # hidden half scores 0 pts; don't signal for it
                     if col == C_RED:
                         r_val = rw["score_own_pin"] if scorer_alliance == "red" else rw["score_opp_half"]
                         b_val = rw["score_opp_half"] if scorer_alliance == "red" else rw["score_own_pin"]
@@ -400,31 +500,44 @@ class OverrideEnv:
                         r_val = rw["score_opp_half"] if scorer_alliance == "red" else rw["score_own_pin"]
                         b_val = rw["score_own_pin"] if scorer_alliance == "blue" else rw["score_opp_half"]
                     elif col == C_YELLOW:
-                        towner = _get_toggle_for_goal(goal, list(self.sim.toggles))
-                        if towner == scorer_alliance:
-                            r_val = rw["score_yellow_owned"] if scorer_alliance == "red" else 0.0
-                            b_val = rw["score_yellow_owned"] if scorer_alliance == "blue" else 0.0
+                        # Yellow reward belongs to whichever alliance owns the toggle,
+                        # regardless of who placed the pin.  The opposing alliance
+                        # effectively gifted points, so they receive score_opp_half.
+                        if towner == "red":
+                            r_val = rw["score_yellow_owned"]
+                            b_val = rw["score_opp_half"]
+                        elif towner == "blue":
+                            r_val = rw["score_opp_half"]
+                            b_val = rw["score_yellow_owned"]
                         else:
-                            r_val = rw["score_yellow_neutral"] if scorer_alliance == "red" else 0.0
-                            b_val = rw["score_yellow_neutral"] if scorer_alliance == "blue" else 0.0
+                            r_val = rw["score_yellow_neutral"]
+                            b_val = rw["score_yellow_neutral"]
                     else:
                         r_val = b_val = 0.0
                     for rid in ["red1", "red2"]: rewards[rid] += r_val
                     for rid in ["blue1", "blue2"]: rewards[rid] += b_val
             else:
+                # Cup placed on top of a pin.
+                # Visibility rule (mirrors game_objects.py get_score):
+                #   eff_clear_up=True  → clear side up, dark side DOWN → dark bottom
+                #                        faces the pin's UP half → pin UP is BLOCKED.
+                #   eff_clear_up=False → dark side up, clear side DOWN → clear bottom
+                #                        faces the pin's UP half → pin UP is VISIBLE.
                 eff_clear = _eff_clear_up(new_obj)
                 cup_idx = len(pre_stack)
                 if cup_idx > 0:
                     below_obj, below_is_pin = post_stack[cup_idx - 1]
                     if below_is_pin:
-                        blocked_col = below_obj.get_up_color()
-                        if not eff_clear:
-                            if _is_opponent_color(blocked_col, scorer_alliance):
+                        pin_up_col = below_obj.get_up_color()
+                        if eff_clear:
+                            # Dark bottom faces pin — pin's UP half is BLOCKED (denied).
+                            if _is_opponent_color(pin_up_col, scorer_alliance):
                                 for rid in ally_rids: rewards[rid] += rw["denial_success"]
-                            elif _is_own_color(blocked_col, scorer_alliance):
+                            elif _is_own_color(pin_up_col, scorer_alliance):
                                 for rid in ally_rids: rewards[rid] += rw["denial_own"]
                         else:
-                            if _is_opponent_color(blocked_col, scorer_alliance):
+                            # Clear bottom faces pin — pin's UP half stays VISIBLE.
+                            if _is_opponent_color(pin_up_col, scorer_alliance):
                                 for rid in ally_rids: rewards[rid] += rw["denial_preserved_opp"]
                 if cup_idx >= 1:
                     for rid in ally_rids: rewards[rid] += rw["stack_bonus"]
@@ -546,6 +659,15 @@ class OverrideEnv:
 def _zero_action():
     return {"left": 0.0, "right": 0.0, "intake": False, "score_pin": False,
             "score_cup": False, "toggle": False, "flip_pin": False, "flip_cup": False}
+
+
+def _stack_top_is_pin(stack) -> bool:
+    """True if the topmost element in a goal stack is a pin (not a cup).
+
+    Centralises the ``bool(stack) and stack[-1][1]`` idiom used throughout
+    the reward logic so that any future stack-format change only needs one fix.
+    """
+    return bool(stack) and bool(stack[-1][1])
 
 
 def _eff_clear_up(cup) -> bool:

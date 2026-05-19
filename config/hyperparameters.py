@@ -1,50 +1,72 @@
 """
-config/hyperparameters.py  (v3)
+config/hyperparameters.py  (v5)
 =================================
-REWARD REDESIGN v3
+REWARD REDESIGN v5
 ------------------
-Root causes fixed from v2:
+Cumulative fixes (v3 problems preserved for history; v5 adds new fixes):
 
-  PROBLEM 1: Approach reward saturated at destination.
-    FIX: Replace carrying approach-delta reward with a CONTINUOUS PROXIMITY
-    REWARD that fires every step based on dist to nearest valid goal. Being
-    at the goal earns max reward each step. Being far earns almost nothing.
-    This keeps the robot at the goal rather than just "arriving" once.
+  PROBLEM 1 (v3): Approach reward saturated at destination.
+    FIX: Continuous proximity reward fires every step based on dist to
+    nearest valid goal, keeping the robot at the goal.
 
-  PROBLEM 2: No incentive to actually press the score button.
-    FIX: score_attempt_in_zone reward fires any time the robot attempts
-    score_pin or score_cup while within scoring range of any valid goal.
-    This gives explicit reinforcement for the behaviour we want.
+  PROBLEM 2 (v3): No incentive to actually press the score button.
+    FIX: score_attempt_in_zone reward; now gated on stack-legal attempts only.
 
-  PROBLEM 3: Robots park while holding objects.
-    FIX: holding_timeout_penalty kicks in after HOLDING_TIMEOUT_STEPS
-    and GROWS each step. Combined with the proximity reward the robot
-    only comes out ahead by scoring quickly. Long carrying = net loss.
+  PROBLEM 3 (v3): Robots park while holding objects.
+    FIX: holding_timeout_penalty ramps up after HOLDING_TIMEOUT_STEPS.
 
-  PROBLEM 4: Idle penalty too weak.
-    FIX: 6x stronger (-0.05/step). Extra start_zone_penalty on top of
-    idle when near own starting position specifically breaks the
-    "blue robots never leave spawn" behaviour.
+  PROBLEM 4 (v3): Idle penalty too weak.
+    FIX: -0.05/step idle + start_zone_penalty.
 
-  PROBLEM 5: Flip spam and no cost.
-    FIX: flip_penalty = -0.5 per flip action taken. Flipping while
-    holding an object is now costly, so the policy will only do it when
-    the expected scoring gain justifies it.
+  PROBLEM 5 (v3→v5): Flip spam and no cost.
+    FIX: flip_penalty = -0.15 per flip.  Small enough not to suppress
+    intentional flips; large enough that random flip spam is unprofitable.
 
-  PROBLEM 6: Pinning exploit.
-    FIX: Track consecutive contact steps between each robot pair.
-    After PINNING_STEPS_LIMIT (60 steps = 3 s), penalise the faster
-    robot (the aggressor) every step. Matches FOUL_PINNING_SECONDS.
+  PROBLEM 6 (v3): Pinning exploit.
+    FIX: PINNING_STEPS_LIMIT contact tracking + per-step penalty.
 
-  PROBLEM 7: Carrying robot approaches opponent goals it cannot score in.
-    FIX: _carrying_target_dist() returns distance to nearest VALID goal
-    (own alliance goals + neutral goals) rather than nearest any goal.
+  PROBLEM 7 (v3): Carrying robot approaches opponent goals.
+    FIX: _carrying_target_dist() uses valid goals only.
+
+  PROBLEM 8 (v5): Cup denial rewards were inverted.
+    FIX: eff_clear=True means dark bottom faces pin → pin UP is BLOCKED
+    (successful denial).  The if/else branches in _compute_rewards were
+    swapped, rewarding failure and punishing success.  Now corrected.
+
+  PROBLEM 9 (v5): Pin causal reward evaluated invisible halves.
+    FIX: DOWN half of the bottom-most pin (index 0) is always hidden by
+    the goal post and never scores; it is now excluded from the reward
+    signal.  Deeper pins check actual cup-below visibility before awarding.
+
+  PROBLEM 10 (v5): Yellow pin reward was asymmetric / non-causal.
+    FIX: Yellow reward is now assigned to whichever alliance owns the
+    toggle for that goal, regardless of who placed the pin.  The placing
+    alliance receives score_opp_half if the toggle is owned by the enemy.
+
+  PROBLEM 11 (v5): Proximity reward fired regardless of scoring legality.
+    FIX: carrying_proximity_scale only fires when the robot's held element
+    can make a legal score at a reachable goal (correct stack state).
+
+  PROBLEM 12 (v5): Robots crowded at goals with the wrong element.
+    FIX: fetch_needed_scale redirects robots toward the missing element
+    type (pin or cup) when they cannot score anywhere.  wrong_element_loiter
+    penalty actively discourages camping within scoring radius of an
+    unreachable goal.
+
+  PROBLEM 13 (v5): score_attempt_in_zone fired on illegal attempts.
+    FIX: Reward now checks can_score_pin / can_score_cup at the attempted
+    goal before awarding, so button-mashing on an empty goal earns nothing.
+
+  PROBLEM 14 (v5): Observation lacked top-pin UP color per goal.
+    FIX: Each goal slot in the 524-dim observation gains 3 bits (one-hot
+    for red/blue/yellow) encoding the UP-half color of the goal's top pin.
+    OBS_DIM updated from 524 → 551.
 """
 
 # -------------------------------------------------------------------------
 # OBSERVATION / ACTION SPACE
 # -------------------------------------------------------------------------
-OBS_DIM     = 524
+OBS_DIM     = 551   # 524 base + 3 bits × 9 goals for top-pin UP color
 ACTION_CONT = 2
 ACTION_DISC = 7
 
@@ -144,7 +166,8 @@ REWARD_WEIGHTS = {
     "toggle_loss":            -2.0,
 
     # --- Carrying proximity (continuous, every step) ---------------------
-    "carrying_proximity_scale": 0.15,   # max per step when at goal
+    "carrying_proximity_scale": 0.15,   # max per step when at goal with correct element
+    "fetch_needed_scale":        0.10,   # approach reward toward the element type needed to continue stack
 
     # --- Score attempt (explicit reinforcement for pressing the button) --
     "score_attempt_in_zone":   0.8,
@@ -158,10 +181,11 @@ REWARD_WEIGHTS = {
 
     # --- Penalties -------------------------------------------------------
     "holding_penalty_rate":   -0.20,   # grows to this after HOLDING_RAMP_STEPS
-    "flip_penalty":            0.0,   # neutral — flipping is a necessary mechanic, not something to reward or punish
+    "flip_penalty":           -0.15,   # small cost per flip; only flip when pin/cup color justifies it
     "idle_penalty":           -0.05,
     "start_zone_penalty":     -0.05,
     "pinning_violation":      -0.8,
+    "wrong_element_loiter":   -0.08,   # per-step penalty for parking at a goal with the wrong element
 
     # --- Endgame ---------------------------------------------------------
     "midfield_endgame":        0.08,
