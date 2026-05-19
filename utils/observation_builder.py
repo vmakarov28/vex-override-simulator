@@ -95,7 +95,7 @@ def build_observation(
     simulator,
 ) -> np.ndarray:
     """
-    Build the 524-dim observation vector for `robot`.
+    Build the 551-dim observation vector for `robot`.
 
     Parameters
     ----------
@@ -110,7 +110,7 @@ def build_observation(
 
     Returns
     -------
-    np.ndarray of shape (524,), dtype float32
+    np.ndarray of shape (551,), dtype float32
     """
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     ptr = 0
@@ -210,7 +210,7 @@ def build_observation(
     remaining_opps = max(0, 2 - len(opponents))
     ptr += remaining_opps * 10
 
-    # ── [56:182] Goals (9 × 14 = 126) ────────────────────────────────────────
+    # ── [56:209] Goals (9 × 17 = 153) ────────────────────────────────────────
     for goal in goals:
         gx, gy = float(goal.x), float(goal.y)
         gdx, gdy = _rel(rx, ry, gx, gy)
@@ -297,7 +297,7 @@ def build_observation(
         obs[ptr + 16] = top_pin_up_yellow
         ptr += 17
 
-    # ── [182:382] K-nearest pins (20 × 10) ───────────────────────────────────
+    # ── [209:409] K-nearest pins (20 × 10) ───────────────────────────────────
     live_pins = [p for p in pins if not p.scored]
     live_pins.sort(key=lambda p: math.hypot(float(p.body.position.x) - rx,
                                              float(p.body.position.y) - ry))
@@ -315,7 +315,7 @@ def build_observation(
             obs[ptr + 7] = dn_oh[0]; obs[ptr + 8] = dn_oh[1]; obs[ptr + 9] = dn_oh[2]
         ptr += 10
 
-    # ── [382:487] K-nearest cups (15 × 7) ────────────────────────────────────
+    # ── [409:514] K-nearest cups (15 × 7) ────────────────────────────────────
     live_cups = [c for c in cups if not c.scored]
     live_cups.sort(key=lambda c: math.hypot(float(c.body.position.x) - rx,
                                              float(c.body.position.y) - ry))
@@ -335,7 +335,7 @@ def build_observation(
             obs[ptr + 6] = min_cup_g
         ptr += 7
 
-    # ── [487:507] Toggles (4 × 5) ────────────────────────────────────────────
+    # ── [514:534] Toggles (4 × 5) ────────────────────────────────────────────
     for tog in toggles:
         tgx, tgy = float(tog.x), float(tog.y)
         obs[ptr + 0] = (tgx - rx) / FIELD_WIDTH
@@ -346,7 +346,7 @@ def build_observation(
         obs[ptr + 4] = 1.0 if tog.owner == opp else 0.0
         ptr += 5
 
-    # ── [507:524] Global match state (17) ────────────────────────────────────
+    # ── [534:551] Global match state (17) ────────────────────────────────────
     tr = float(simulator.time_remaining)
     te = float(simulator.time_elapsed)
     full = float(TOTAL_SECONDS)
@@ -383,7 +383,7 @@ def build_observation(
 def build_all_observations(simulator) -> dict:
     """
     Build observations for all four robots at once.
-    Returns {robot_id: np.ndarray(524,)} dict.
+    Returns {robot_id: np.ndarray(551,)} dict.
     """
     return {
         robot.robot_id: build_observation(
