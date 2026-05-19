@@ -312,10 +312,8 @@ class OverrideEnv:
             for g in self.sim.goals:
                 if g.alliance not in ("neutral", r.alliance):
                     continue
-                can_pin = (r.carrying_pin is not None and
-                           (not g.stack or not g.stack[-1][1]))
-                can_cup = (r.carrying_cup is not None and
-                           bool(g.stack) and g.stack[-1][1])
+                can_pin = r.carrying_pin is not None and not _stack_top_is_pin(g.stack)
+                can_cup = r.carrying_cup is not None and     _stack_top_is_pin(g.stack)
                 if can_pin or can_cup:
                     d = math.hypot(rx - g.x, ry - g.y)
                     if best is None or d < best:
@@ -334,8 +332,8 @@ class OverrideEnv:
             # Determine whether this robot can score anywhere right now.
             can_score_anywhere = any(
                 g.alliance in ("neutral", r.alliance) and (
-                    (r.carrying_pin is not None and (not g.stack or not g.stack[-1][1])) or
-                    (r.carrying_cup is not None and bool(g.stack) and g.stack[-1][1])
+                    (r.carrying_pin is not None and not _stack_top_is_pin(g.stack)) or
+                    (r.carrying_cup is not None and     _stack_top_is_pin(g.stack))
                 )
                 for g in self.sim.goals
             )
@@ -379,10 +377,8 @@ class OverrideEnv:
                     continue
                 if math.hypot(rx - g.x, ry - g.y) > SCORING_RADIUS * 1.5:
                     continue
-                can_pin = (r.carrying_pin is not None and
-                           (not g.stack or not g.stack[-1][1]))
-                can_cup = (r.carrying_cup is not None and
-                           bool(g.stack) and g.stack[-1][1])
+                can_pin = r.carrying_pin is not None and not _stack_top_is_pin(g.stack)
+                can_cup = r.carrying_cup is not None and     _stack_top_is_pin(g.stack)
                 if not can_pin and not can_cup:
                     rewards[rid] += rw["wrong_element_loiter"]
                     break
@@ -400,10 +396,8 @@ class OverrideEnv:
                     continue
                 if math.hypot(rx - g.x, ry - g.y) > SCORING_RADIUS + 4.0:
                     continue
-                can_pin = (r.carrying_pin is not None and
-                           (not g.stack or not g.stack[-1][1]))
-                can_cup = (r.carrying_cup is not None and
-                           bool(g.stack) and g.stack[-1][1])
+                can_pin = r.carrying_pin is not None and not _stack_top_is_pin(g.stack)
+                can_cup = r.carrying_cup is not None and     _stack_top_is_pin(g.stack)
                 if can_pin or can_cup:
                     rewards[rid] += rw["score_attempt_in_zone"]
                     break
@@ -665,6 +659,15 @@ class OverrideEnv:
 def _zero_action():
     return {"left": 0.0, "right": 0.0, "intake": False, "score_pin": False,
             "score_cup": False, "toggle": False, "flip_pin": False, "flip_cup": False}
+
+
+def _stack_top_is_pin(stack) -> bool:
+    """True if the topmost element in a goal stack is a pin (not a cup).
+
+    Centralises the ``bool(stack) and stack[-1][1]`` idiom used throughout
+    the reward logic so that any future stack-format change only needs one fix.
+    """
+    return bool(stack) and bool(stack[-1][1])
 
 
 def _eff_clear_up(cup) -> bool:
