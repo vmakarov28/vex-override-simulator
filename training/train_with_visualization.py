@@ -17,6 +17,17 @@ Run:
 
 import os
 import sys
+import warnings
+
+# Suppress pygame startup noise before any imports that transitively load pygame.
+# PYGAME_HIDE_SUPPORT_PROMPT silences "Hello from the pygame community."
+# The warnings filter silences the pkg_resources deprecation UserWarning from
+# pygame/pkgdata.py that fires on every process start (main + 16 workers).
+# These must be set here — multiprocessing "spawn" re-imports this module in
+# each child before _worker_fn runs, so worker-local suppression fires too late.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+warnings.filterwarnings("ignore", message="pkg_resources", category=UserWarning)
+
 import time
 import argparse
 import numpy as np
