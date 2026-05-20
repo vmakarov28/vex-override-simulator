@@ -217,6 +217,30 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     but not so dominant that scoring robots abandon their last elements.
     ENDGAME_RAMP_SECONDS aligned to 3 s so obs[ptr+19] urgency ramp rises
     0→1 over exactly the same window, giving the policy a clean park-now cue.
+
+  PROBLEM 47 (v8.2): Quadratic holding-timeout had no ceiling — at 400
+    carry-steps overshoot=360, ratio=36, penalty=-7.2/step, causing
+    catastrophic gradient spikes for any robot stuck in a carry loop.
+    FIX: Ratio capped at HOLDING_RAMP_SQ_CAP (9.0), so the maximum
+    per-step penalty is -0.20 × 9 = -1.8/step.  The cap engages at
+    overshoot = 3 × HOLDING_RAMP_STEPS (~11 s of carrying) — by that
+    point the penalty is already catastrophic; further escalation only
+    destabilises training without changing the robot's optimal action.
+
+  PROBLEM 48 (v8.2): CRITIC_LR (8e-4) was imported in mappo.py but
+    both policy and critic used LEARNING_RATE (2.5e-4).  Slower critic
+    convergence delayed value estimates, slowing policy improvement.
+    FIX: Separate policy_optimizer (LEARNING_RATE) and critic_optimizer
+    (CRITIC_LR) per alliance, with independent grad-norm clips.  Checkpoint
+    format updated to store four optimizer state-dicts.  obs_dim also stored
+    in checkpoint so mismatched architecture is detected at load time.
+
+  PROBLEM 49 (v8.2): environment/override_env.py (PettingZoo wrapper) still
+    used the old linear uncapped holding-timeout and had no PROX_CARRY_DECAY
+    cut-off — evaluation rewards diverged from training rewards, making
+    evaluation scores meaningless as a training signal proxy.
+    FIX: PettingZoo wrapper section 3 and 5 updated to match v8 training
+    wrapper (quadratic + capped timeout; proximity cut at PROX_CARRY_DECAY).
 """
 
 # -------------------------------------------------------------------------
@@ -366,7 +390,11 @@ REWARD_WEIGHTS = {
 # NEW v3 CONSTANTS (holding timeout, pinning, start zone, etc.)
 # -------------------------------------------------------------------------
 HOLDING_TIMEOUT_STEPS = 40     # after this many steps carrying, penalty starts
-HOLDING_RAMP_STEPS    = 60     # penalty reaches full strength after this many more steps
+HOLDING_RAMP_STEPS    = 60     # one "ramp unit" for the quadratic formula
+# Quadratic cap: ratio = min((overshoot/HOLDING_RAMP_STEPS)^2, CAP)
+# Cap = 9.0  →  max penalty = |holding_penalty_rate| × 9 = 1.8/step.
+# Engages at overshoot = 3 × HOLDING_RAMP_STEPS = 180 steps (~9 s of carry).
+HOLDING_RAMP_SQ_CAP   = 9.0
 
 PINNING_STEPS_LIMIT   = 60     # 3 seconds at 20 Hz
 PINNING_CONTACT_DIST  = 22.0   # inches (robot width + margin)

@@ -4,18 +4,24 @@ environment/override_env.py
 PettingZoo Multi-Agent Environment for Override
 ===============================================
 
-Full reward parity with training/env_wrapper.py v5:
-- Legality-gated proximity reward (3)
+Reward parity with training/env_wrapper.py v8 (core sections):
+- Legality-gated proximity reward with PROX_CARRY_DECAY_STEPS cut-off (3)
 - Fetch-needed redirect (3b)
 - Wrong-element loiter penalty (3c)
+- Quadratic + capped holding-timeout (5)
 - Goal-level causal scoring: corrected cup denial direction, pin DOWN-half
   visibility check, toggle-aware yellow pin reward (10)
 - Toggle gain/loss events (11)
 - Pinning violation via deterministic sorted-tuple contact tracking (8)
 
+Note: v8-only rewards (resource_denial_bonus, defensive_position_bonus,
+endgame_score_multiplier, toggle grace window, ally separation, teammate
+overlap) are implemented in training/env_wrapper.py and are NOT replicated
+here — the PettingZoo wrapper is used for external evaluation only.
+
 9-dim action: [left, right, intake, score_pin, score_cup, toggle,
                flip_pin, flip_cup, match_load]
-551-dim observation built by utils/observation_builder.
+564-dim observation built by utils/observation_builder.
 """
 
 import math
@@ -31,10 +37,10 @@ from simulation.game_objects import C_RED, C_BLUE, C_YELLOW
 from utils.observation_builder import build_all_observations, OBS_DIM
 from config.hyperparameters import (
     REWARD_WEIGHTS, GOAL_PROXIMITY_NORM,
-    HOLDING_TIMEOUT_STEPS, HOLDING_RAMP_STEPS,
+    HOLDING_TIMEOUT_STEPS, HOLDING_RAMP_STEPS, HOLDING_RAMP_SQ_CAP,
     IDLE_SPEED_THRESHOLD, START_ZONE_RADIUS,
     PINNING_STEPS_LIMIT, PINNING_CONTACT_DIST,
-    FIELD_DIAGONAL,
+    FIELD_DIAGONAL, PROX_CARRY_DECAY_STEPS,
 )
 from config.game_rules import SCORING_RADIUS, MIDFIELD_CENTER, MIDFIELD_HALF
 
@@ -256,10 +262,13 @@ class OverrideEnv(ParallelEnv):
         # 3. Carrying proximity — only fires when a legal score exists at some goal.
         # A robot holding the wrong element for every reachable goal earns nothing,
         # preventing the "park at goal unable to score" exploit.
+        # v8: proximity cut-off after PROX_CARRY_DECAY_STEPS (matches training wrapper).
         for rid in AGENT_IDS:
             r = robot_map.get(rid)
             if not r or (r.carrying_pin is None and r.carrying_cup is None):
                 continue
+            if self._carry_steps[rid] >= PROX_CARRY_DECAY_STEPS:
+                continue   # hard deadline: no proximity reward after 1.75 s carrying
             rx, ry = float(r.body.position.x), float(r.body.position.y)
             best = None
             for g in self.sim.goals:
@@ -355,12 +364,15 @@ class OverrideEnv(ParallelEnv):
                     rewards[rid] += rw["score_attempt_in_zone"]
                     break
 
-        # 5. Holding timeout penalty — ramps up after HOLDING_TIMEOUT_STEPS.
+        # 5. Holding timeout penalty — quadratic + capped ramp (v8, PROBLEM 47).
+        # Matches training/env_wrapper.py: ratio = min((overshoot/ramp)^2, CAP).
         for rid in AGENT_IDS:
             cs = self._carry_steps[rid]
             if cs > HOLDING_TIMEOUT_STEPS:
                 overshoot = cs - HOLDING_TIMEOUT_STEPS
-                rewards[rid] += rw["holding_penalty_rate"] * (overshoot / HOLDING_RAMP_STEPS)
+                ratio = min((overshoot / HOLDING_RAMP_STEPS) ** 2,
+                            HOLDING_RAMP_SQ_CAP)
+                rewards[rid] += rw["holding_penalty_rate"] * ratio
 
         # 6. Flip penalty.
         for rid in AGENT_IDS:

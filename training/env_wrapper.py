@@ -45,6 +45,7 @@ from config.hyperparameters import (
     ENDGAME_RAMP_SECONDS, ENDGAME_RAMP_MAX_MULT,
     PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
     DEFENSIVE_LINE_PERP_DIST, PARK_WINDOW_SECONDS,
+    HOLDING_RAMP_SQ_CAP,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
@@ -347,7 +348,7 @@ class OverrideEnv:
         return obs, rewards, done, info
 
     # =========================================================================
-    # REWARD COMPUTATION (v7)
+    # REWARD COMPUTATION (v8)
     # =========================================================================
     def _compute_rewards(
         self,
@@ -622,11 +623,14 @@ class OverrideEnv:
         # 5. Holding timeout penalty — quadratic ramp after HOLDING_TIMEOUT_STEPS.
         # Quadratic means each extra HOLDING_RAMP_STEPS of overshoot squares the cost,
         # making prolonged carrying catastrophic rather than merely annoying.
+        # Cap at HOLDING_RAMP_SQ_CAP (9.0) → max -1.8/step to prevent gradient spikes
+        # for robots stuck in a carry loop (PROBLEM 47).
         for rid in AGENT_IDS:
             cs = self._carry_steps[rid]
             if cs > HOLDING_TIMEOUT_STEPS:
                 overshoot = cs - HOLDING_TIMEOUT_STEPS
-                ratio     = (overshoot / HOLDING_RAMP_STEPS) ** 2
+                ratio     = min((overshoot / HOLDING_RAMP_STEPS) ** 2,
+                                HOLDING_RAMP_SQ_CAP)
                 rewards[rid] += rw["holding_penalty_rate"] * ratio
         _track("holding_timeout")
 
