@@ -1,9 +1,9 @@
 """
-config/hyperparameters.py  (v5)
+config/hyperparameters.py  (v6)
 =================================
-REWARD REDESIGN v5
+REWARD REDESIGN v6
 ------------------
-Cumulative fixes (v3 problems preserved for history; v5 adds new fixes):
+Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
 
   PROBLEM 1 (v3): Approach reward saturated at destination.
     FIX: Continuous proximity reward fires every step based on dist to
@@ -61,6 +61,31 @@ Cumulative fixes (v3 problems preserved for history; v5 adds new fixes):
     FIX: Each goal slot in the 524-dim observation gains 3 bits (one-hot
     for red/blue/yellow) encoding the UP-half color of the goal's top pin.
     OBS_DIM updated from 524 → 551.
+
+  PROBLEM 15 (v6): Robots spin in place rather than drive.
+    FIX: spin_penalty fires every step when angular velocity is high AND
+    translational speed is low, making in-place spinning unprofitable.
+
+  PROBLEM 16 (v6): Robots camp near an already-owned toggle all match.
+    FIX: toggle_camping penalty fires every step a robot lingers within
+    TOGGLE_CAMP_RADIUS of a toggle its own alliance already controls.
+
+  PROBLEM 17 (v6): No direct incentive to drive quickly toward targets.
+    FIX: forward_speed_scale rewards the component of velocity that points
+    toward the robot's current target (goal when carrying, nearest element
+    when empty), giving a dense signal for purposeful fast movement.
+
+  PROBLEM 18 (v6): Wrong-element loiter penalty too weak (was -0.08).
+    FIX: Raised to -0.15/step so the penalty beats the proximity reward
+    at close range, actively expelling the robot from unserviceable goals.
+
+  PROBLEM 19 (v6): fetch_needed_scale too weak (was 0.10).
+    FIX: Raised to 0.15 to more aggressively redirect robots toward the
+    element type they need to resume scoring.
+
+  PROBLEM 20 (v6): Intake/scoring radii too generous (16/14 in).
+    FIX: SCORING_RADIUS 16→12, INTAKE_RADIUS 14→10 in game_rules.py so
+    robots must approach precisely before interacting.
 """
 
 # -------------------------------------------------------------------------
@@ -167,7 +192,7 @@ REWARD_WEIGHTS = {
 
     # --- Carrying proximity (continuous, every step) ---------------------
     "carrying_proximity_scale": 0.15,   # max per step when at goal with correct element
-    "fetch_needed_scale":        0.10,   # approach reward toward the element type needed to continue stack
+    "fetch_needed_scale":        0.15,   # approach reward toward the element type needed to continue stack
 
     # --- Score attempt (explicit reinforcement for pressing the button) --
     "score_attempt_in_zone":   0.8,
@@ -185,7 +210,10 @@ REWARD_WEIGHTS = {
     "idle_penalty":           -0.05,
     "start_zone_penalty":     -0.05,
     "pinning_violation":      -0.8,
-    "wrong_element_loiter":   -0.08,   # per-step penalty for parking at a goal with the wrong element
+    "wrong_element_loiter":   -0.15,   # per-step: carrying wrong element within scoring radius of goal
+    "spin_penalty":           -0.10,   # per-step: high angular velocity + low translational speed
+    "toggle_camping":         -0.08,   # per-step: loitering near a toggle your alliance already owns
+    "forward_speed_scale":     0.03,   # per-step: velocity component pointing toward current target
 
     # --- Endgame ---------------------------------------------------------
     "midfield_endgame":        0.08,
@@ -207,6 +235,20 @@ GOAL_PROXIMITY_NORM   = 36.0   # normalization constant for proximity reward
 
 # Diagonal of the 144x144 field (used for approach reward normalization)
 FIELD_DIAGONAL = 203.65   # sqrt(144^2 + 144^2)
+
+# -------------------------------------------------------------------------
+# v6: Spin / camping / forward-speed constants
+# -------------------------------------------------------------------------
+# Spin penalty fires when |angular_velocity| > threshold AND trans_speed < threshold.
+# Angular velocity is in rad/s (Pymunk default).  A robot spinning freely in place
+# typically exceeds 2 rad/s; normal turning while driving is usually below 1.5 rad/s.
+SPIN_ANG_VEL_THRESHOLD  = 2.0    # rad/s — above this counts as "spinning"
+SPIN_TRANS_THRESHOLD    = 20.0   # inches/s — below this = not meaningfully moving forward
+
+# Toggle camping: penalise lingering near a toggle the robot's own alliance already owns.
+# Set slightly wider than TOGGLE_INTERACTION_RANGE (18 in) so a robot just sitting
+# adjacent to an owned toggle also gets penalised.
+TOGGLE_CAMP_RADIUS      = 24.0   # inches
 
 # -------------------------------------------------------------------------
 # CURRICULUM STAGES

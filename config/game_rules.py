@@ -33,8 +33,8 @@ ROBOT_MASS = 5.0
 ROBOT_DRIVE_FORCE = 3000.0
 ROBOT_TURN_TORQUE = 15000.0
 ROBOT_MAX_SPEED = 400.0
-INTAKE_RADIUS = 14.0
-SCORING_RADIUS = 16.0
+INTAKE_RADIUS = 10.0    # v6: reduced from 14 — robots must approach precisely
+SCORING_RADIUS = 12.0   # v6: reduced from 16 — tighter scoring contact required
 MAX_PINS_HELD = 1
 MAX_CUPS_HELD = 1
 

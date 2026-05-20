@@ -1,10 +1,15 @@
 """
-training/env_wrapper.py  (v4 - Upgraded)
+training/env_wrapper.py  (v6)
 ==========================================================================
-Major improvements:
-  - Holding penalty now starts AFTER 60 steps (~3 seconds)
-  - Then ramps up gradually to discourage stalling
-  - Stronger anti-reward-hacking measures
+Reward shaping history:
+  v4 — Holding ramp, anti-reward-hacking baseline
+  v5 — Legality-gated proximity, fetch-needed redirect, wrong-element
+        loiter, causal cup denial, yellow toggle-owner attribution,
+        score-attempt legality gate, top-pin UP color observation (551-dim)
+  v6 — Spin penalty (in-place spinning), toggle-camping penalty,
+        forward-speed reward (velocity toward target), strengthened
+        wrong_element_loiter (-0.15) and fetch_needed_scale (0.15),
+        tighter intake/scoring radii (game_rules.py: 10/12 in)
 """
 
 import math
@@ -24,6 +29,7 @@ from config.hyperparameters import (
     START_ZONE_RADIUS, HOLDING_TIMEOUT_STEPS, HOLDING_RAMP_STEPS,
     PINNING_STEPS_LIMIT, PINNING_CONTACT_DIST,
     GOAL_PROXIMITY_NORM,
+    SPIN_ANG_VEL_THRESHOLD, SPIN_TRANS_THRESHOLD, TOGGLE_CAMP_RADIUS,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
@@ -563,7 +569,92 @@ class OverrideEnv:
                 if abs(rx - mc_x) + abs(ry - mc_y) <= MIDFIELD_HALF + 10.0:
                     rewards[r.robot_id] += rw["midfield_endgame"]
 
-        # 13. RND Intrinsic Reward — use pre-built post_obs to avoid redundant builds
+        # 13a. Spin penalty — penalise in-place spinning.
+        # Fires when angular velocity is high AND translational speed is low,
+        # distinguishing deliberate tight turns (ang_vel high, trans_speed moderate)
+        # from pointless in-place spinning (ang_vel high, trans_speed ≈ 0).
+        for rid in AGENT_IDS:
+            r = robot_map[rid]
+            ang_vel     = abs(float(r.body.angular_velocity))
+            trans_speed = math.hypot(float(r.body.velocity.x),
+                                     float(r.body.velocity.y))
+            if ang_vel > SPIN_ANG_VEL_THRESHOLD and trans_speed < SPIN_TRANS_THRESHOLD:
+                rewards[rid] += rw["spin_penalty"]
+
+        # 13b. Toggle-camping penalty — penalise lingering near a toggle the
+        # robot's own alliance already owns.  A robot should claim the toggle
+        # then leave, not camp beside it for the rest of the match.
+        for rid in AGENT_IDS:
+            r = robot_map[rid]
+            rx, ry = float(r.body.position.x), float(r.body.position.y)
+            for t in self.sim.toggles:
+                tx = float(t.body.position.x) if hasattr(t, "body") else t.x
+                ty = float(t.body.position.y) if hasattr(t, "body") else t.y
+                if (math.hypot(rx - tx, ry - ty) < TOGGLE_CAMP_RADIUS
+                        and t.owner == r.alliance):
+                    rewards[rid] += rw["toggle_camping"]
+                    break   # only penalise once per robot per step
+
+        # 13c. Forward-speed reward — reward the component of velocity directed
+        # toward the robot's current target.  Empty-handed: nearest uncollected
+        # element.  Carrying: nearest goal where scoring is legal.
+        # This gives a dense, continuous incentive for fast purposeful movement
+        # and complements the sparser approach-delta and proximity signals.
+        for rid in AGENT_IDS:
+            r   = robot_map[rid]
+            rx  = float(r.body.position.x)
+            ry  = float(r.body.position.y)
+            vx  = float(r.body.velocity.x)
+            vy  = float(r.body.velocity.y)
+            spd = math.hypot(vx, vy)
+            if spd < 1.0:
+                continue   # stationary — skip to avoid division noise
+
+            target_x = target_y = None
+            best_d   = None
+
+            if r.carrying_pin is not None or r.carrying_cup is not None:
+                # Carrying: aim for nearest goal where a legal score exists.
+                for g in self.sim.goals:
+                    if g.alliance not in ("neutral", r.alliance):
+                        continue
+                    can_pin = r.carrying_pin is not None and not _stack_top_is_pin(g.stack)
+                    can_cup = r.carrying_cup is not None and     _stack_top_is_pin(g.stack)
+                    if not (can_pin or can_cup):
+                        continue
+                    d = math.hypot(rx - g.x, ry - g.y)
+                    if best_d is None or d < best_d:
+                        best_d, target_x, target_y = d, g.x, g.y
+            else:
+                # Empty-handed: aim for nearest uncollected element.
+                for pin in self.sim.pins:
+                    if pin.scored or pin.carried_by is not None:
+                        continue
+                    px = float(pin.body.position.x)
+                    py = float(pin.body.position.y)
+                    d  = math.hypot(rx - px, ry - py)
+                    if best_d is None or d < best_d:
+                        best_d, target_x, target_y = d, px, py
+                for cup in self.sim.cups:
+                    if cup.scored or cup.carried_by is not None:
+                        continue
+                    cx = float(cup.body.position.x)
+                    cy = float(cup.body.position.y)
+                    d  = math.hypot(rx - cx, ry - cy)
+                    if best_d is None or d < best_d:
+                        best_d, target_x, target_y = d, cx, cy
+
+            if target_x is None or best_d < 1.0:
+                continue   # no valid target or already at target
+
+            # Unit vector toward target; dot with normalised velocity → [-1, 1]
+            inv_d = 1.0 / best_d
+            ux, uy = (target_x - rx) * inv_d, (target_y - ry) * inv_d
+            dot = (vx * ux + vy * uy) / spd
+            if dot > 0.0:
+                rewards[rid] += rw["forward_speed_scale"] * dot
+
+        # 14. RND Intrinsic Reward — use pre-built post_obs to avoid redundant builds
         if self.rnd is not None:
             # Update predictor once per update cadence (not once per agent)
             do_update = self.rnd.should_update(self._step_count)
