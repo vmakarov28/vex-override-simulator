@@ -487,12 +487,16 @@ def build_all_observations(simulator) -> dict:
     }
 
 
-def get_action_mask(robot, goals, rules_engine) -> np.ndarray:
+def get_action_mask(robot, goals) -> np.ndarray:
     """
     Returns a boolean mask (7,) for the discrete action head.
     True = action is LEGAL (not masked out).
 
     Actions: [intake, score_pin, score_cup, toggle, flip_pin, flip_cup, match_load]
+
+    Note: the `rules_engine` parameter was removed in v8.2 (PROBLEM 52).
+    Legality is determined entirely by robot state and goal stacks; no
+    rules-engine state (endgame_active, scores, etc.) gates any action.
     """
     mask = np.ones(7, dtype=bool)
 

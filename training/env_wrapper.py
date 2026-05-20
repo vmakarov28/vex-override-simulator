@@ -42,7 +42,6 @@ from config.hyperparameters import (
     GOAL_PROXIMITY_NORM,
     SPIN_ANG_VEL_THRESHOLD, SPIN_TRANS_THRESHOLD, TOGGLE_CAMP_RADIUS,
     ALLY_SEPARATION_TARGET, TIME_TO_SCORE_TARGET,
-    ENDGAME_RAMP_SECONDS, ENDGAME_RAMP_MAX_MULT,
     PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
     DEFENSIVE_LINE_PERP_DIST, PARK_WINDOW_SECONDS,
     HOLDING_RAMP_SQ_CAP,
@@ -1038,7 +1037,7 @@ class OverrideEnv:
 
     def get_action_masks(self) -> Dict[str, np.ndarray]:
         return {
-            r.robot_id: get_action_mask(r, self.sim.goals, self.sim.rules_engine)
+            r.robot_id: get_action_mask(r, self.sim.goals)
             for r in self.sim.robots
         }
 

@@ -241,6 +241,26 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     evaluation scores meaningless as a training signal proxy.
     FIX: PettingZoo wrapper section 3 and 5 updated to match v8 training
     wrapper (quadratic + capped timeout; proximity cut at PROX_CARRY_DECAY).
+
+  PROBLEM 50 (v8.2): Drop+recarry exploit introduced by PROX_CARRY_DECAY.
+    With v8's 35-step proximity cut-off, a robot near a goal could:
+      drop (-0.5)  +  re-intake (+0.8)  =  +0.3 net, AND reset carry_steps
+      to 0, granting another 35 steps × 0.05 = 1.75 of proximity reward.
+    Total: ~+2.05 per drop-recarry cycle.  Not exploitable in v7 (no decay)
+    but a real attack surface in v8.  COOLDOWN_INTAKE=5 only delays the cycle.
+    FIX: drop_penalty -0.5 -> -1.0.  Drop+intake is now -0.2 net, removing
+    the positive-feedback loop while still letting accidental drops recover.
+
+  PROBLEM 51 (v8.2): utils/opponent_pool.py had no architecture fingerprint.
+    A stale pool.pt from v7 (OBS_DIM=554) would silently load() but crash
+    later inside sample() when load_state_dict() hit shape mismatches —
+    cryptic failure deep inside CUDA at first opponent sample.
+    FIX: Store OBS_DIM in pool file; raise ValueError on load() if it
+    differs from current OBS_DIM, with instructions to delete the file.
+
+  PROBLEM 52 (v8.2): get_action_mask() took an unused rules_engine
+    parameter, suggesting legality depends on rules state when it does not.
+    FIX: Removed the parameter; updated env_wrapper.py call site.
 """
 
 # -------------------------------------------------------------------------
@@ -357,7 +377,7 @@ REWARD_WEIGHTS = {
 
     # --- Object interaction ----------------------------------------------
     "intake_success":          0.8,
-    "drop_penalty":           -0.5,
+    "drop_penalty":           -1.0,   # v8.2: -0.5 -> -1.0 to close drop+recarry exploit (PROBLEM 50)
 
     # --- Penalties -------------------------------------------------------
     "holding_penalty_rate":   -0.20,   # grows to this after HOLDING_RAMP_STEPS
