@@ -354,7 +354,7 @@ NUM_PARALLEL_ENVS = 32
 ROLLOUT_STEPS     = 512
 MINIBATCH_SIZE    = 256
 PPO_EPOCHS        = 10
-TOTAL_ENV_STEPS   = 40_000_000
+TOTAL_ENV_STEPS   = 24_000_000   # ~15 h at 16 envs × 512 steps/update, 19 s/update
 
 # -------------------------------------------------------------------------
 # NETWORK ARCHITECTURE
