@@ -1,26 +1,31 @@
 """
 utils/observation_builder.py
 ────────────────────────────────────────────────────────────────────────────
-Builds the fixed-size 564-dimensional observation vector for one agent.
+Builds the fixed-size 588-dimensional observation vector for one agent.
 
 Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
   [  0: 24]  Self state
   [ 24: 36]  Teammate state
   [ 36: 56]  Opponents (2 × 10)
   [ 56:209]  Goals (9 × 17 = 153)
-  [209:409]  K-nearest pins (20 × 10 = 200)
-  [409:514]  K-nearest cups (15 × 7 = 105)
-  [514:534]  Toggles (4 × 5 = 20)
-  [534:554]  Global match state (20)  [v7]
-  [554:564]  v8.1 self-awareness + defensive intel (10)
+  [209:429]  K-nearest pins (20 × 11 = 220)  [v8.3: +1 nearest-goal dist per pin]
+  [429:534]  K-nearest cups (15 × 7 = 105)
+  [534:554]  Toggles (4 × 5 = 20)
+  [554:574]  Global match state (20)  [v7]
+  [574:584]  v8.1 self-awareness + defensive intel (10)
                - own carry_steps / TIME_TO_SCORE_TARGET (1)
                - own holding-overshoot ratio (1)
                - opp1 carrying pin UP colour one-hot (3)
                - opp2 carrying pin UP colour one-hot (3)
                - yellow pins remaining / 12 (1)
                - can-score-anywhere bit (1)
+  [584:588]  v8.2 movement intelligence (4)
+               - own speed magnitude / MAX_SPEED (1)
+               - teammate carry_steps / TIME_TO_SCORE_TARGET (1)
+               - opp1 speed magnitude / MAX_SPEED (1)
+               - opp2 speed magnitude / MAX_SPEED (1)
   ──────────
-  Total: 564
+  Total: 588
 """
 
 import math
@@ -53,7 +58,7 @@ MAX_ANG_VEL = 10.0
 K_PINS = 20   # nearest pins to encode
 K_CUPS = 15   # nearest cups to encode
 
-OBS_DIM = 564
+OBS_DIM = 588
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color → one-hot helper  (3 bits: [red, blue, yellow])
@@ -306,7 +311,9 @@ def build_observation(
         obs[ptr + 16] = top_pin_up_yellow
         ptr += 17
 
-    # ── [209:409] K-nearest pins (20 × 10) ───────────────────────────────────
+    # ── [209:429] K-nearest pins (20 × 11) ───────────────────────────────────
+    # Slot layout per pin: [dx, dy, dist, carried, up_r, up_g, up_b, dn_r, dn_g, dn_b,
+    #                       nearest_goal_dist]  (v8.3: +1 mirrors cup obs[ptr+6])
     live_pins = [p for p in pins if not p.scored]
     live_pins.sort(key=lambda p: math.hypot(float(p.body.position.x) - rx,
                                              float(p.body.position.y) - ry))
@@ -322,7 +329,11 @@ def build_observation(
             obs[ptr + 3] = 1.0 if p.carried_by is not None else 0.0
             obs[ptr + 4] = up_oh[0]; obs[ptr + 5] = up_oh[1]; obs[ptr + 6] = up_oh[2]
             obs[ptr + 7] = dn_oh[0]; obs[ptr + 8] = dn_oh[1]; obs[ptr + 9] = dn_oh[2]
-        ptr += 10
+            # v8.3: distance from this pin to its nearest goal (helps pick pins
+            # close to the robot's intended scoring location, not just nearest pin)
+            pin_g_dists = [math.hypot(px_ - g.x, py_ - g.y) for g in goals]
+            obs[ptr + 10] = min(pin_g_dists) / FIELD_DIAG if pin_g_dists else 0.0
+        ptr += 11
 
     # ── [409:514] K-nearest cups (15 × 7) ────────────────────────────────────
     live_cups = [c for c in cups if not c.scored]
@@ -462,6 +473,28 @@ def build_observation(
                 break
     obs[ptr + 9] = can_anywhere
     ptr += 10
+
+    # ── v8.2 movement intelligence (4) ──────────────────────────────────────
+    # Provides explicit speed scalars that the policy would otherwise have to
+    # recompute from raw velocity components (nonlinear operation slows early
+    # learning of spin-penalty avoidance and carrying_speed_bonus shaping).
+
+    # (a) Own speed magnitude — used by carrying_speed_scale reward and
+    # spin_penalty avoidance; avoids network relearning sqrt(rvx²+rvy²).
+    obs[ptr + 0] = min(1.0, math.hypot(rvx, rvy) / MAX_SPEED)
+
+    # (b) Teammate carry_steps normalized — policy can coordinate: if teammate
+    # is near their timeout, target a different goal to avoid crowding.
+    tm_carry = float(getattr(teammates[0], "_carry_steps", 0)) if teammates else 0.0
+    obs[ptr + 1] = min(1.0, tm_carry / float(TIME_TO_SCORE_TARGET))
+
+    # (c–d) Opponent speed magnitudes — distinguishes a charging opponent
+    # from a stationary one without requiring the policy to combine ovx/ovy.
+    for i, opp in enumerate(opponents[:2]):
+        ovx_ = float(opp.body.velocity.x)
+        ovy_ = float(opp.body.velocity.y)
+        obs[ptr + 2 + i] = min(1.0, math.hypot(ovx_, ovy_) / MAX_SPEED)
+    ptr += 4
 
     assert ptr == OBS_DIM, f"Obs dim mismatch: {ptr} != {OBS_DIM}"
     return obs

@@ -21,7 +21,7 @@ here — the PettingZoo wrapper is used for external evaluation only.
 
 9-dim action: [left, right, intake, score_pin, score_cup, toggle,
                flip_pin, flip_cup, match_load]
-564-dim observation built by utils/observation_builder.
+588-dim observation built by utils/observation_builder.
 """
 
 import math
@@ -41,6 +41,7 @@ from config.hyperparameters import (
     IDLE_SPEED_THRESHOLD, START_ZONE_RADIUS,
     PINNING_STEPS_LIMIT, PINNING_CONTACT_DIST,
     FIELD_DIAGONAL, PROX_CARRY_DECAY_STEPS,
+    PARK_WINDOW_SECONDS,
 )
 from config.game_rules import SCORING_RADIUS, MIDFIELD_CENTER, MIDFIELD_HALF
 
@@ -520,8 +521,12 @@ class OverrideEnv(ParallelEnv):
                     for rid in ["blue1", "blue2"]: rewards[rid] += rw["toggle_gain"]
                     for rid in ["red1",  "red2"]:  rewards[rid] += rw["toggle_loss"]
 
-        # 12. Midfield endgame bonus.
-        if self.sim.rules_engine.endgame_active:
+        # 12. Midfield endgame bonus — v8.3 parity fix (PROBLEM 56):
+        # Only fires in the final PARK_WINDOW_SECONDS (3 s) to match
+        # training/env_wrapper.py.  Previously fired for the full 20-s
+        # endgame (20× too large), making evaluation scores meaningless.
+        tr = float(self.sim.time_remaining)
+        if self.sim.rules_engine.endgame_active and tr <= PARK_WINDOW_SECONDS:
             mc_x, mc_y = MIDFIELD_CENTER
             for r in self.sim.robots:
                 if abs(float(r.body.position.x) - mc_x) + \

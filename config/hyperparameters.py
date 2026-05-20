@@ -261,12 +261,59 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
   PROBLEM 52 (v8.2): get_action_mask() took an unused rules_engine
     parameter, suggesting legality depends on rules state when it does not.
     FIX: Removed the parameter; updated env_wrapper.py call site.
+
+  PROBLEM 53 (v8.3): Observation was missing explicit speed-magnitude features.
+    Policy had rvx/rvy for self and opponents but had to rediscover
+    sqrt(rvx²+rvy²) — a nonlinear operation — slowing spin-avoidance and
+    speed-reward learning.  Teammate carry_steps was also absent, preventing
+    per-robot carry-duration awareness needed for goal-assignment coordination.
+    FIX: 4-dim v8.2 obs block appended after v8.1:
+      - own speed magnitude / MAX_SPEED (1)
+      - teammate carry_steps / TIME_TO_SCORE_TARGET (1)
+      - opp1 speed magnitude / MAX_SPEED (1)
+      - opp2 speed magnitude / MAX_SPEED (1)
+    Also: per-pin nearest-goal distance added to each pin slot (matches what
+    cups already had), giving robots directional guidance on which pin to
+    fetch based on proximity to the intended goal.  Pins 20×10→20×11 dims.
+    OBS_DIM 564 → 588.
+
+  PROBLEM 54 (v8.3): forward_speed_scale (0.03/step) was only 30% the
+    strength of spin_penalty (-0.10/step).  Policy learned "don't spin" but
+    had weak incentive to go fast — the positive signal wasn't worth changing
+    locomotion patterns.  Also: no reward for raw speed magnitude while
+    carrying (only heading-aligned component).
+    FIX 1: forward_speed_scale 0.03 → 0.06 (doubles direction-aligned
+    speed reward, now balanced against spin_penalty).
+    FIX 2: carrying_speed_scale = 0.015/step fires on raw |v|/MAX_SPEED
+    while carrying, creating a direction-agnostic "go fast with the goods"
+    layer.  Max total from both signals: 0.075/step; holding_timeout cap
+    at -1.8/step dominates after step ~45, preventing circling exploit.
+
+  PROBLEM 55 (v8.3): time_to_score_bonus rewards the carry phase (pickup →
+    score) but the fetch phase (score → next pickup) was shaped only by the
+    delta-based approach_scale, which saturates at zero once near the target.
+    No positive one-time signal motivated urgency in the return-fetch phase.
+    FIX: intake_cycle_bonus = 1.5 fires at pickup: bonus × max(0, 1 −
+    steps_since_last_score / INTAKE_CYCLE_TARGET).  A robot returning
+    quickly from its last score earns up to 1.5; a slow robot earns
+    progressively less.  Drop-exploit guard: bonus only fires when the
+    most recent relevant event (score or drop) was a score, preventing the
+    drop→re-intake cycle from collecting the bonus twice.
+
+  PROBLEM 56 (v8.3): environment/override_env.py (PettingZoo wrapper)
+    midfield_endgame section fired for the entire 20-second endgame at
+    1.0/step → 400 reward per robot per game.  Training wrapper correctly
+    gates it to the final PARK_WINDOW_SECONDS (3 s) → 60 reward per robot.
+    The 27× inflation made evaluation scores incomparable to training, and
+    could cause the evaluation policy to over-value parking vs. scoring.
+    FIX: Added `tr <= PARK_WINDOW_SECONDS` gate to PettingZoo wrapper
+    section 12, matching training/env_wrapper.py v8.2 behaviour exactly.
 """
 
 # -------------------------------------------------------------------------
 # OBSERVATION / ACTION SPACE
 # -------------------------------------------------------------------------
-OBS_DIM     = 564   # v8.1: 554 base + 10 v8.1 features (own carry_step, overshoot, opp1/opp2 carrying colors, yellow_left, can_score_anywhere)
+OBS_DIM     = 588   # v8.3: 564 base + 20 (per-pin goal dist) + 4 (v8.2 block: speed, tm_carry, opp speeds)
 ACTION_CONT = 2
 ACTION_DISC = 7
 
@@ -388,7 +435,9 @@ REWARD_WEIGHTS = {
     "wrong_element_loiter":   -0.15,   # per-step: carrying wrong element within scoring radius of goal
     "spin_penalty":           -0.10,   # per-step: high angular velocity + low translational speed
     "toggle_camping":         -0.15,   # per-step: loitering near a toggle your alliance already owns
-    "forward_speed_scale":     0.03,   # per-step: velocity component pointing toward current target
+    "forward_speed_scale":     0.06,   # per-step: velocity component pointing toward current target (v8.3: 0.03→0.06)
+    "carrying_speed_scale":    0.015,  # per-step: raw speed bonus when carrying — direction-agnostic "go fast" layer
+    "intake_cycle_bonus":      1.5,    # one-time at intake: bonus × max(0, 1 - steps_since_last_score/INTAKE_CYCLE_TARGET)
 
     # --- v7: division of labour & cycle efficiency -----------------------
     "teammate_overlap_penalty": -0.12,  # per-step: both alliance robots inside SCORING_RADIUS of same goal
@@ -465,6 +514,14 @@ ENDGAME_RAMP_MAX_MULT   = 4.0   # unused by section 12 since v8.2 (no ramp); kep
 
 # v8.2: parking reward only fires this many seconds before match end.
 PARK_WINDOW_SECONDS     = 3.0
+
+# -------------------------------------------------------------------------
+# v8.3: Cycle-speed / carrying-drive constants
+# -------------------------------------------------------------------------
+# Intake cycle bonus target: a robot that returns from its last score and
+# picks up the next element within this many steps earns the full bonus;
+# bonus scales to 0 at >= INTAKE_CYCLE_TARGET steps.  50 steps = 2.5 s.
+INTAKE_CYCLE_TARGET     = 50
 
 # -------------------------------------------------------------------------
 # v8: Cycle-efficiency / toggle-leave constants
@@ -564,7 +621,7 @@ CURRICULUM_STAGES = [
 # -------------------------------------------------------------------------
 # LOGGING / CHECKPOINTING
 # -------------------------------------------------------------------------
-LOG_EVERY_UPDATES  = 50
+LOG_EVERY_UPDATES  = 10
 SAVE_EVERY_UPDATES = 500
 EVAL_EVERY_UPDATES = 500
 EVAL_NUM_MATCHES   = 5

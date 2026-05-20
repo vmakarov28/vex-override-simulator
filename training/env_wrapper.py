@@ -1,5 +1,5 @@
 """
-training/env_wrapper.py  (v8)
+training/env_wrapper.py  (v8.3)
 ==========================================================================
 Reward shaping history:
   v4 — Holding ramp, anti-reward-hacking baseline
@@ -21,6 +21,11 @@ Reward shaping history:
         events 2-3× larger, score_attempt_in_zone 0.8→4.0, time_to_score
         bonus 1.5→4.0 (35-step target), toggle grace window, per-alliance
         score_delta logging, RND 5× stronger, entropy anneal 2.5× longer.
+  v8.3 — Drive-speed overhaul: forward_speed_scale 0.03→0.06,
+        carrying_speed_scale (0.015/step raw speed while carrying),
+        intake_cycle_bonus (1.5 one-time at pickup based on return speed
+        from last score; drop-exploit guarded).  +20 per-pin obs dims,
+        +4 movement-intelligence obs dims (588-dim total).
 """
 
 import math
@@ -44,11 +49,12 @@ from config.hyperparameters import (
     ALLY_SEPARATION_TARGET, TIME_TO_SCORE_TARGET,
     PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
     DEFENSIVE_LINE_PERP_DIST, PARK_WINDOW_SECONDS,
-    HOLDING_RAMP_SQ_CAP,
+    HOLDING_RAMP_SQ_CAP, INTAKE_CYCLE_TARGET,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
     AUTONOMOUS_SECONDS, MIDFIELD_HALF, ROBOT_STARTS,
+    ROBOT_MAX_SPEED,
 )
 from simulation.game_objects import C_RED, C_BLUE, C_YELLOW
 from training.rnd import RNDModule
@@ -88,6 +94,15 @@ class OverrideEnv:
         self._prev_target_dist: Dict[str, float]    = {rid: 0.0 for rid in AGENT_IDS}
         self._prev_scores: Dict[str, int]           = {rid: 0 for rid in AGENT_IDS}
 
+        # v8.3: full-cycle bonus tracking
+        # _steps_since_last_score: steps elapsed since this robot last scored.
+        # Initialised large so first-episode pickups earn no cycle bonus.
+        # _last_drop_step: global step count of last drop event, used to
+        # guard against the drop→re-intake cycle-bonus exploit.
+        self._steps_since_last_score: Dict[str, int] = {rid: MAX_EPISODE_STEPS + 1
+                                                         for rid in AGENT_IDS}
+        self._last_drop_step: Dict[str, int]          = {rid: -1 for rid in AGENT_IDS}
+
         # v7: per-component reward sum tracker (summed across all robots and
         # all steps since last drain).  drain_reward_components() returns the
         # current dict and resets it — used by training loops for TB-style
@@ -113,6 +128,8 @@ class OverrideEnv:
         self._toggle_grace = {}
         self._contact_steps      = {p: 0 for p in ROBOT_PAIRS}
         self._prev_scores        = {rid: 0 for rid in AGENT_IDS}
+        self._steps_since_last_score = {rid: MAX_EPISODE_STEPS + 1 for rid in AGENT_IDS}
+        self._last_drop_step         = {rid: -1 for rid in AGENT_IDS}
         # NOTE: do NOT clear self._reward_components here.  Per-component
         # sums persist across episodes within a rollout so the training loop
         # can drain them once per update cycle for logging.
@@ -267,6 +284,11 @@ class OverrideEnv:
         self.sim.step(CONTROL_DT, sim_actions)
         self._step_count += 1
 
+        # v8.3: advance cycle counter for all robots; reset to 0 in
+        # _compute_rewards when a score is detected for that robot.
+        for rid in AGENT_IDS:
+            self._steps_since_last_score[rid] += 1
+
         post_red  = self.sim.rules_engine.red_score
         post_blue = self.sim.rules_engine.blue_score
         robot_map = {r.robot_id: r for r in self.sim.robots}
@@ -390,7 +412,8 @@ class OverrideEnv:
         rc["score_delta_red"]  = rc.get("score_delta_red",  0.0) + rw["score_delta"] * (red_delta  - blue_delta) * 2
         rc["score_delta_blue"] = rc.get("score_delta_blue", 0.0) + rw["score_delta"] * (blue_delta - red_delta)  * 2
 
-        # 2. Intake / drop  (+ v7 time-to-score bonus, v8.1 resource denial)
+        # 2. Intake / drop  (+ v7 time-to-score bonus, v8.1 resource denial,
+        #                    v8.3 intake_cycle_bonus)
         # v8.1 FIX: time_to_score_bonus reads from pre_carry_steps, NOT
         # self._carry_steps.  The latter is reset to 0 in step() before we
         # run if the robot just scored (carrying_pin became None during
@@ -417,10 +440,24 @@ class OverrideEnv:
                         if nearest_robot is not None and nearest_robot.alliance != r.alliance:
                             rewards[rid] += rw["resource_denial_bonus"]
 
+                # v8.3: intake_cycle_bonus — rewards fast return from last score
+                # to next pickup (fetch phase of the cycle).
+                # Guard: only fires when the most recent relevant event was a
+                # SCORE, not a DROP.  Prevents drop→re-intake exploit where the
+                # bonus would fire on re-intake after a deliberate drop.
+                # last_score_step approximated as (step_count - steps_since_last_score).
+                last_score_step = self._step_count - self._steps_since_last_score[rid]
+                if last_score_step > self._last_drop_step[rid]:
+                    cycle_steps = self._steps_since_last_score[rid]
+                    cycle_ratio = max(0.0, 1.0 - cycle_steps / float(INTAKE_CYCLE_TARGET))
+                    if cycle_ratio > 0.0:
+                        rewards[rid] += rw["intake_cycle_bonus"] * cycle_ratio
+
             scored = r.successful_scores > self._prev_scores.get(rid, 0)
             if (had_pin and not now_pin and not scored) or \
                (had_cup and not now_cup and not scored):
                 rewards[rid] += rw["drop_penalty"]
+                self._last_drop_step[rid] = self._step_count  # v8.3: track for exploit guard
 
             if scored:
                 # v8.1 FIX: use PRE-step carry counter — post-update value
@@ -428,6 +465,8 @@ class OverrideEnv:
                 carry_steps = pre_carry_steps.get(rid, 0)
                 ratio = max(0.0, 1.0 - carry_steps / float(TIME_TO_SCORE_TARGET))
                 rewards[rid] += rw["time_to_score_bonus"] * ratio
+                # v8.3: reset cycle counter so next intake measures return speed
+                self._steps_since_last_score[rid] = 0
 
         for r in self.sim.robots:
             self._prev_scores[r.robot_id] = r.successful_scores
@@ -896,7 +935,24 @@ class OverrideEnv:
                 rewards[rid] += rw["forward_speed_scale"] * dot
         _track("forward_speed")
 
-        # 13d. v8.1 — Defensive position bonus.
+        # 13d. v8.3 — Carrying speed bonus.
+        # Direction-agnostic per-step reward proportional to raw speed magnitude
+        # while carrying.  Complements forward_speed_scale (which requires
+        # heading alignment with target) by creating a global "go fast with
+        # the goods" incentive.  Safe: max 0.015/step; holding_timeout cap
+        # (-1.8/step) dominates from step ~45 onward, preventing circling.
+        for rid in AGENT_IDS:
+            r = robot_map[rid]
+            if r.carrying_pin is None and r.carrying_cup is None:
+                continue
+            spd = math.hypot(float(r.body.velocity.x), float(r.body.velocity.y))
+            if spd < 1.0:
+                continue
+            spd_frac = min(1.0, spd / float(ROBOT_MAX_SPEED))
+            rewards[rid] += rw["carrying_speed_scale"] * spd_frac
+        _track("carrying_speed")
+
+        # 13f. v8.1 — Defensive position bonus.
         # Reward empty-handed robots for positioning themselves on the line
         # between a carrying enemy and that enemy's nearest scorable goal.
         # Encourages defensive blocking play without requiring contact,
