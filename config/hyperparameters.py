@@ -206,6 +206,17 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
       - opp1, opp2 carrying pin UP colour one-hot (3 + 3)
       - yellow pins remaining normalised (1)
       - can-score-anywhere bit (1)
+
+  PROBLEM 46 (v8.2): Midfield parking reward fired for the entire 20-second
+    endgame at a negligible rate (0.08/step × ramp), so robots never learned
+    to treat parking as a discrete last-second commitment — it was just a
+    weak always-on trickle.
+    FIX: Reward now ONLY fires in the final PARK_WINDOW_SECONDS (3 s) of
+    the match at a strong flat rate (midfield_endgame 0.08 → 1.0, no ramp).
+    90 total reward for perfect 3-second parking ≈ 6 pin scores — meaningful
+    but not so dominant that scoring robots abandon their last elements.
+    ENDGAME_RAMP_SECONDS aligned to 3 s so obs[ptr+19] urgency ramp rises
+    0→1 over exactly the same window, giving the policy a clean park-now cue.
 """
 
 # -------------------------------------------------------------------------
@@ -348,7 +359,7 @@ REWARD_WEIGHTS = {
     "yellow_approach_unowned":   0.03,   # yellow_approach scale when alliance doesn't yet own a toggle (encourages flip-first strategy)
 
     # --- Endgame ---------------------------------------------------------
-    "midfield_endgame":        0.08,   # base per-step reward; multiplied by 1..ENDGAME_RAMP_MAX_MULT in final seconds
+    "midfield_endgame":        1.0,    # per-step reward; only fires in final PARK_WINDOW_SECONDS (3 s); no ramp
 }
 
 # -------------------------------------------------------------------------
@@ -401,8 +412,11 @@ TIME_TO_SCORE_TARGET    = 35
 # Endgame midfield ramp: in the final ENDGAME_RAMP_SECONDS of the match the
 # midfield_endgame reward multiplier ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT.
 # This makes second-1 parking >> second-19 parking, teaching last-second commit.
-ENDGAME_RAMP_SECONDS    = 10.0
-ENDGAME_RAMP_MAX_MULT   = 4.0
+ENDGAME_RAMP_SECONDS    = 3.0    # v8.2: narrowed to match PARK_WINDOW_SECONDS so obs urgency ramp aligns with reward window
+ENDGAME_RAMP_MAX_MULT   = 4.0   # unused by section 12 since v8.2 (no ramp); kept for reference
+
+# v8.2: parking reward only fires this many seconds before match end.
+PARK_WINDOW_SECONDS     = 3.0
 
 # -------------------------------------------------------------------------
 # v8: Cycle-efficiency / toggle-leave constants

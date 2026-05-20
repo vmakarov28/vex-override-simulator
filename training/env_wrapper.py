@@ -44,7 +44,7 @@ from config.hyperparameters import (
     ALLY_SEPARATION_TARGET, TIME_TO_SCORE_TARGET,
     ENDGAME_RAMP_SECONDS, ENDGAME_RAMP_MAX_MULT,
     PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
-    DEFENSIVE_LINE_PERP_DIST,
+    DEFENSIVE_LINE_PERP_DIST, PARK_WINDOW_SECONDS,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
@@ -786,27 +786,19 @@ class OverrideEnv:
                 self._toggle_grace[toggle.toggle_id] = TOGGLE_LEAVE_GRACE_STEPS
         _track("toggle_events")
 
-        # 12. Midfield endgame bonus  (v7: ramping multiplier)
-        # Base rate `midfield_endgame` is paid every step in endgame.  In the
-        # final ENDGAME_RAMP_SECONDS, multiply by a linear ramp 1 → ENDGAME_RAMP_MAX_MULT
-        # so robots only get the BIG reward by parking very late.  Earlier parking
-        # still earns the base rate (so it isn't punished), but the marginal
-        # gain from staying until the buzzer is much larger.
-        if self.sim.rules_engine.endgame_active:
-            tr = float(self.sim.time_remaining)
-            if tr <= ENDGAME_RAMP_SECONDS:
-                # Linear ramp: tr=ENDGAME_RAMP_SECONDS → mult=1
-                #              tr=0                   → mult=ENDGAME_RAMP_MAX_MULT
-                ramp = 1.0 + (ENDGAME_RAMP_MAX_MULT - 1.0) * (
-                    (ENDGAME_RAMP_SECONDS - tr) / ENDGAME_RAMP_SECONDS)
-            else:
-                ramp = 1.0
+        # 12. Midfield park bonus — v8.2: ONLY fires in the final PARK_WINDOW_SECONDS
+        # (3 s) of the match at a strong flat rate.  No ramp multiplier needed;
+        # the narrow window already makes last-second commitment clearly better
+        # than early parking.  obs[ptr+19] urgency ramp covers the same 3-s window
+        # so the policy gets a clean "park now" cue without any reward engineering.
+        tr = float(self.sim.time_remaining)
+        if self.sim.rules_engine.endgame_active and tr <= PARK_WINDOW_SECONDS:
             mc_x = mc_y = 72.0
             for r in self.sim.robots:
                 rx = float(r.body.position.x)
                 ry = float(r.body.position.y)
                 if abs(rx - mc_x) + abs(ry - mc_y) <= MIDFIELD_HALF + 10.0:
-                    rewards[r.robot_id] += rw["midfield_endgame"] * ramp
+                    rewards[r.robot_id] += rw["midfield_endgame"]
         _track("midfield_endgame")
 
         # 13a. Spin penalty — penalise in-place spinning.
