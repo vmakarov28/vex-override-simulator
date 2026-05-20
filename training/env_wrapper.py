@@ -1,5 +1,5 @@
 """
-training/env_wrapper.py  (v7)
+training/env_wrapper.py  (v8)
 ==========================================================================
 Reward shaping history:
   v4 — Holding ramp, anti-reward-hacking baseline
@@ -16,6 +16,11 @@ Reward shaping history:
         ally separation bonus (anti-crowding), ramping midfield_endgame
         (1×→4× across final 10 s).  +3 obs features (554-dim) and
         per-component reward tracking exposed via drain_reward_components().
+  v8 — Cycle-efficiency overhaul: proximity hard cut-off at 35 carry-steps,
+        quadratic holding-timeout ramp, proximity_scale 0.15→0.05, causal
+        events 2-3× larger, score_attempt_in_zone 0.8→4.0, time_to_score
+        bonus 1.5→4.0 (35-step target), toggle grace window, per-alliance
+        score_delta logging, RND 5× stronger, entropy anneal 2.5× longer.
 """
 
 import math
@@ -38,6 +43,7 @@ from config.hyperparameters import (
     SPIN_ANG_VEL_THRESHOLD, SPIN_TRANS_THRESHOLD, TOGGLE_CAMP_RADIUS,
     ALLY_SEPARATION_TARGET, TIME_TO_SCORE_TARGET,
     ENDGAME_RAMP_SECONDS, ENDGAME_RAMP_MAX_MULT,
+    PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
@@ -87,6 +93,10 @@ class OverrideEnv:
         # per-signal logging.
         self._reward_components: Dict[str, float]   = {}
 
+        # v8: toggle grace tracker — {toggle_id: steps_remaining} so camping
+        # penalty doesn't fire immediately after a successful flip.
+        self._toggle_grace: Dict[int, int] = {}
+
         self.rnd = RNDModule(obs_dim=OBS_DIM, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")) if RND_ENABLED else None
 
     # -------------------------------------------------------------------------
@@ -99,6 +109,7 @@ class OverrideEnv:
         self._prev_carrying_cup  = {rid: None for rid in AGENT_IDS}
         self._prev_toggle_owners = {t.toggle_id: t.owner for t in self.sim.toggles}
         self._carry_steps        = {rid: 0 for rid in AGENT_IDS}
+        self._toggle_grace = {}
         self._contact_steps      = {p: 0 for p in ROBOT_PAIRS}
         self._prev_scores        = {rid: 0 for rid in AGENT_IDS}
         # NOTE: do NOT clear self._reward_components here.  Per-component
@@ -207,6 +218,13 @@ class OverrideEnv:
             for k in self._cooldowns[rid]:
                 if self._cooldowns[rid][k] > 0:
                     self._cooldowns[rid][k] -= 1
+
+        # Decrement toggle grace counters each step
+        for tid in list(self._toggle_grace.keys()):
+            if self._toggle_grace[tid] > 1:
+                self._toggle_grace[tid] -= 1
+            else:
+                del self._toggle_grace[tid]
 
         self.sim.step(CONTROL_DT, sim_actions)
         self._step_count += 1

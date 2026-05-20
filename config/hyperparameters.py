@@ -1,5 +1,5 @@
 """
-config/hyperparameters.py  (v7)
+config/hyperparameters.py  (v8)
 =================================
 REWARD REDESIGN v7
 ------------------
@@ -131,6 +131,44 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
   PROBLEM 29 (v7): Visualisation cadence too sparse during early learning.
     FIX: First 2 M env steps record a vis video every 100 updates rather
     than every 500.  Also: a final result video is recorded at end of run.
+
+  PROBLEM 30 (v8): Proximity reward dominated causal scoring 10:1.
+    FIX: carrying_proximity_scale 0.15→0.05; score_own_pin 6→15;
+    score_yellow_owned 8→20; score_yellow_neutral 3→8; denial_success
+    5→12; score_delta weight 5→7.  Causal events now dominate shaping.
+
+  PROBLEM 31 (v8): Score attempt rate near zero across all training.
+    FIX: score_attempt_in_zone 0.8→4.0.  Pressing the score button
+    at a legal goal is now worth ~80 steps of proximity reward.
+
+  PROBLEM 32 (v8): Linear holding-timeout ramp too weak vs proximity.
+    FIX: Ramp formula changed to quadratic in env_wrapper so penalty
+    becomes catastrophic after 2×HOLDING_TIMEOUT_STEPS.
+
+  PROBLEM 33 (v8): Proximity reward fires for indefinitely parked robots.
+    FIX: Proximity cuts to zero after PROX_CARRY_DECAY_STEPS (35 steps
+    = 1.75 s) carry time, creating a hard deadline to score or lose pull.
+
+  PROBLEM 34 (v8): score_delta always logs 0.000 (red+blue cancel).
+    FIX: Added score_delta_red / score_delta_blue per-alliance keys to
+    the reward-component tracker so the signal is visible in [Rwd] logs.
+
+  PROBLEM 35 (v8): Toggle camping persists immediately after capture.
+    FIX: TOGGLE_LEAVE_GRACE_STEPS (20) grace window after any toggle
+    flip; toggle_camping -0.08→-0.15 to push robots away faster.
+
+  PROBLEM 36 (v8): Fast cycle not rewarded enough.
+    FIX: time_to_score_bonus 1.5→4.0; TIME_TO_SCORE_TARGET 80→35 steps
+    (1.75 s).  A robot scoring in under 1.75 s earns the full bonus.
+
+  PROBLEM 37 (v8): Entropy collapsing too fast onto suboptimal policy.
+    FIX: ENTROPY_ANNEAL_STEPS 12M→30M; ENTROPY_COEF_MIN 0.005→0.008.
+
+  PROBLEM 38 (v8): RND intrinsic reward near-zero (0.002 / update).
+    FIX: RND_REWARD_SCALE 0.02→0.10.
+
+  PROBLEM 39 (v8): Self-play pool too homogeneous (90% old checkpoints).
+    FIX: POOL_SAMPLE_PROB 0.90→0.75.
 """
 
 # -------------------------------------------------------------------------
@@ -166,8 +204,8 @@ GAE_LAMBDA           = 0.95
 CLIP_EPS             = 0.25          # More conservative updates
 VALUE_LOSS_COEF      = 0.5
 ENTROPY_COEF             = 0.025       # Higher initial entropy
-ENTROPY_COEF_MIN         = 0.005
-ENTROPY_ANNEAL_STEPS     = 12_000_000  # Keep exploration longer
+ENTROPY_COEF_MIN         = 0.008
+ENTROPY_ANNEAL_STEPS     = 30_000_000  # Keep exploration longer
 MAX_GRAD_NORM            = 0.5
 
 # -------------------------------------------------------------------------
@@ -191,12 +229,12 @@ LOG_STD_MAX   = 0.0
 # SELF-PLAY / POLICY POOL (Anti-Collapse Settings)
 # -------------------------------------------------------------------------
 POOL_SIZE              = 16          # Increased for better diversity
-POOL_SAMPLE_PROB       = 0.90        # Sample historical opponents 90% of time
+POOL_SAMPLE_PROB       = 0.75        # Sample historical opponents 75% of time
 CHECKPOINT_EVERY       = 500
 SELF_PLAY_OPPONENT_MIX = 0.65        # 65% pool + 35% latest policy
 
 # -------------------------------------------------------------------------
-# REWARD WEIGHTS  (v3)
+# REWARD WEIGHTS  (v8)
 #
 # Hierarchy:
 #   1. Terminal win/loss          -> game outcome matters most
@@ -215,16 +253,16 @@ REWARD_WEIGHTS = {
     "win_terminal":           10.0,   # x (score_diff / 80)
 
     # --- Step-level score signal -----------------------------------------
-    "score_delta":             5.0,   # (my_delta - opp_delta) per step
+    "score_delta":             7.0,   # (my_delta - opp_delta) per step
 
     # --- Causal scoring events -------------------------------------------
-    "score_own_pin":           6.0,
-    "score_yellow_owned":      8.0,
-    "score_yellow_neutral":    3.0,
+    "score_own_pin":          15.0,
+    "score_yellow_owned":     20.0,
+    "score_yellow_neutral":    8.0,
     "score_opp_half":         -4.0,
 
     # --- Cup denial ------------------------------------------------------
-    "denial_success":          5.0,
+    "denial_success":         12.0,
     "denial_own":             -4.0,
     "denial_preserved_opp":   -1.0,
 
@@ -236,11 +274,11 @@ REWARD_WEIGHTS = {
     "toggle_loss":            -2.0,
 
     # --- Carrying proximity (continuous, every step) ---------------------
-    "carrying_proximity_scale": 0.15,   # max per step when at goal with correct element
-    "fetch_needed_scale":        0.15,   # approach reward toward the element type needed to continue stack
+    "carrying_proximity_scale": 0.05,   # max per step when at goal with correct element
+    "fetch_needed_scale":        0.08,   # approach reward toward the element type needed to continue stack
 
     # --- Score attempt (explicit reinforcement for pressing the button) --
-    "score_attempt_in_zone":   0.8,
+    "score_attempt_in_zone":   4.0,
 
     # --- Empty-hand approach shaping -------------------------------------
     "approach_scale":          8.0,
@@ -257,12 +295,12 @@ REWARD_WEIGHTS = {
     "pinning_violation":      -0.8,
     "wrong_element_loiter":   -0.15,   # per-step: carrying wrong element within scoring radius of goal
     "spin_penalty":           -0.10,   # per-step: high angular velocity + low translational speed
-    "toggle_camping":         -0.08,   # per-step: loitering near a toggle your alliance already owns
+    "toggle_camping":         -0.15,   # per-step: loitering near a toggle your alliance already owns
     "forward_speed_scale":     0.03,   # per-step: velocity component pointing toward current target
 
     # --- v7: division of labour & cycle efficiency -----------------------
     "teammate_overlap_penalty": -0.12,  # per-step: both alliance robots inside SCORING_RADIUS of same goal
-    "time_to_score_bonus":       1.5,   # one-time at score moment: bonus × max(0, 1 - carry_steps/TARGET)
+    "time_to_score_bonus":       4.0,   # one-time at score moment: bonus × max(0, 1 - carry_steps/TARGET)
     "yellow_approach_scale":     0.06,  # per-step: bonus when empty robot approaches yellow pin & alliance owns toggle
     "ally_separation_bonus":     0.02,  # per-step: bonus when teammates >= ALLY_SEPARATION_TARGET apart
 
@@ -314,14 +352,26 @@ ALLY_SEPARATION_TARGET  = 45.0
 
 # Time-to-score: a robot that scores within TIME_TO_SCORE_TARGET steps of
 # picking up earns close-to-full bonus; longer carries fade to zero linearly.
-# 80 steps at 20 Hz = 4 seconds of carrying.
-TIME_TO_SCORE_TARGET    = 80
+# 35 steps at 20 Hz = 1.75 seconds of carrying.
+TIME_TO_SCORE_TARGET    = 35
 
 # Endgame midfield ramp: in the final ENDGAME_RAMP_SECONDS of the match the
 # midfield_endgame reward multiplier ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT.
 # This makes second-1 parking >> second-19 parking, teaching last-second commit.
 ENDGAME_RAMP_SECONDS    = 10.0
 ENDGAME_RAMP_MAX_MULT   = 4.0
+
+# -------------------------------------------------------------------------
+# v8: Cycle-efficiency / toggle-leave constants
+# -------------------------------------------------------------------------
+# Proximity reward hard cut-off: after carrying for this many steps without
+# scoring, carrying_proximity_scale drops to zero.  Creates a 1.75-second
+# deadline before the carrot disappears (then holding timeout stick starts).
+PROX_CARRY_DECAY_STEPS  = 35
+
+# Grace window after a toggle flip: robots are NOT penalised for toggle_camping
+# during this window, giving them time to physically leave the toggle zone.
+TOGGLE_LEAVE_GRACE_STEPS = 20
 
 # -------------------------------------------------------------------------
 # CURRICULUM STAGES
@@ -421,7 +471,7 @@ HEATMAPS_DIR  = "artifacts/heatmaps"
 # RANDOM NETWORK DISTILLATION (RND) - Anti-Collapse / Curiosity
 # -------------------------------------------------------------------------
 RND_ENABLED           = True
-RND_REWARD_SCALE      = 0.02          # Intrinsic reward strength
+RND_REWARD_SCALE      = 0.10          # Intrinsic reward strength
 RND_UPDATE_EVERY      = 8             # Update RND network every N steps
 RND_HIDDEN            = [512, 256]    # RND predictor network size
 RND_LR                = 1e-4          # Learning rate for RND predictor
