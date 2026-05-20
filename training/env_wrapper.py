@@ -333,6 +333,10 @@ class OverrideEnv:
         for rid in ["blue1", "blue2"]: rewards[rid] += rw["score_delta"] * (blue_delta - red_delta)
         _track("score_delta")
 
+        # Per-alliance breakdown (the combined sum is always 0; these are diagnostic)
+        rc["score_delta_red"]  = rc.get("score_delta_red",  0.0) + rw["score_delta"] * (red_delta  - blue_delta) * 2
+        rc["score_delta_blue"] = rc.get("score_delta_blue", 0.0) + rw["score_delta"] * (blue_delta - red_delta)  * 2
+
         # 2. Intake / drop  (+ v7 time-to-score bonus)
         # Time-to-score: when scored == True for a robot, dispatch a bonus
         # inversely proportional to how long they had been carrying.  The
@@ -369,6 +373,9 @@ class OverrideEnv:
         for rid in AGENT_IDS:
             r = robot_map[rid]
             if r.carrying_pin is None and r.carrying_cup is None:
+                continue
+            # v8: hard cut-off — no proximity reward after PROX_CARRY_DECAY_STEPS
+            if self._carry_steps[rid] >= PROX_CARRY_DECAY_STEPS:
                 continue
             rx, ry = float(r.body.position.x), float(r.body.position.y)
             best = None
@@ -546,13 +553,15 @@ class OverrideEnv:
                     break
         _track("score_attempt")
 
-        # 5. Holding timeout penalty — ramps up after HOLDING_TIMEOUT_STEPS
+        # 5. Holding timeout penalty — quadratic ramp after HOLDING_TIMEOUT_STEPS.
+        # Quadratic means each extra HOLDING_RAMP_STEPS of overshoot squares the cost,
+        # making prolonged carrying catastrophic rather than merely annoying.
         for rid in AGENT_IDS:
             cs = self._carry_steps[rid]
             if cs > HOLDING_TIMEOUT_STEPS:
                 overshoot = cs - HOLDING_TIMEOUT_STEPS
-                penalty   = rw["holding_penalty_rate"] * (overshoot / HOLDING_RAMP_STEPS)
-                rewards[rid] += penalty
+                ratio     = (overshoot / HOLDING_RAMP_STEPS) ** 2
+                rewards[rid] += rw["holding_penalty_rate"] * ratio
         _track("holding_timeout")
 
         # 6. Empty-hand approach delta
@@ -703,6 +712,9 @@ class OverrideEnv:
                 elif curr_owner == "blue":
                     for rid in ["blue1", "blue2"]: rewards[rid] += rw["toggle_gain"]
                     for rid in ["red1", "red2"]: rewards[rid] += rw["toggle_loss"]
+                # v8: grant grace window so robots aren't immediately penalised
+                # for toggle_camping right after a successful flip.
+                self._toggle_grace[toggle.toggle_id] = TOGGLE_LEAVE_GRACE_STEPS
         _track("toggle_events")
 
         # 12. Midfield endgame bonus  (v7: ramping multiplier)
@@ -742,12 +754,16 @@ class OverrideEnv:
         _track("spin_penalty")
 
         # 13b. Toggle-camping penalty — penalise lingering near a toggle the
-        # robot's own alliance already owns.  A robot should claim the toggle
-        # then leave, not camp beside it for the rest of the match.
+        # robot's own alliance already owns, unless inside the post-flip grace
+        # window (v8: robots get TOGGLE_LEAVE_GRACE_STEPS steps to physically
+        # leave after claiming a toggle before the penalty resumes).
         for rid in AGENT_IDS:
             r = robot_map[rid]
             rx, ry = float(r.body.position.x), float(r.body.position.y)
             for t in self.sim.toggles:
+                tid = getattr(t, "toggle_id", None)
+                if self._toggle_grace.get(tid, 0) > 0:
+                    continue  # grace window — don't penalise yet
                 tx = float(t.body.position.x) if hasattr(t, "body") else t.x
                 ty = float(t.body.position.y) if hasattr(t, "body") else t.y
                 if (math.hypot(rx - tx, ry - ty) < TOGGLE_CAMP_RADIUS
@@ -828,6 +844,11 @@ class OverrideEnv:
                 if do_update:
                     self.rnd.update(obs_t.unsqueeze(0))
             _track("rnd_intrinsic")
+
+        # Diagnostic: average carry steps across robots (tracks cycle speed improvement)
+        rc["avg_carry_steps"] = rc.get("avg_carry_steps", 0.0) + (
+            sum(self._carry_steps.values()) / len(AGENT_IDS)
+        )
 
         return rewards
 
