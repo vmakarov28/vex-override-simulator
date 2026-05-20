@@ -44,6 +44,7 @@ from config.hyperparameters import (
     ALLY_SEPARATION_TARGET, TIME_TO_SCORE_TARGET,
     ENDGAME_RAMP_SECONDS, ENDGAME_RAMP_MAX_MULT,
     PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
+    DEFENSIVE_LINE_PERP_DIST,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
@@ -226,6 +227,43 @@ class OverrideEnv:
             else:
                 del self._toggle_grace[tid]
 
+        # v8.1: snapshot per-robot carry-step counters BEFORE sim.step() can
+        # reset them (a successful score sets carrying_pin=None during
+        # sim.step(), which would then zero the counter before
+        # _compute_rewards reads it).  time_to_score_bonus needs the
+        # pre-step value to know how long the carry actually lasted.
+        pre_step_carry = dict(self._carry_steps)
+
+        # v8.1: nearest robot to each unowned element BEFORE this step's
+        # actions resolve.  Used by resource_denial_bonus: a robot that
+        # intakes an element an opponent was closer to gets a strategic
+        # one-time bonus.
+        pre_element_nearest_rid: Dict[int, str] = {}
+        for _p in self.sim.pins:
+            if _p.scored or _p.carried_by is not None:
+                continue
+            _px = float(_p.body.position.x); _py = float(_p.body.position.y)
+            _best_rid = None; _best_d = float('inf')
+            for _r in self.sim.robots:
+                _d = math.hypot(float(_r.body.position.x) - _px,
+                                float(_r.body.position.y) - _py)
+                if _d < _best_d:
+                    _best_d, _best_rid = _d, _r.robot_id
+            if _best_rid is not None:
+                pre_element_nearest_rid[id(_p)] = _best_rid
+        for _c in self.sim.cups:
+            if _c.scored or _c.carried_by is not None:
+                continue
+            _cx = float(_c.body.position.x); _cy = float(_c.body.position.y)
+            _best_rid = None; _best_d = float('inf')
+            for _r in self.sim.robots:
+                _d = math.hypot(float(_r.body.position.x) - _cx,
+                                float(_r.body.position.y) - _cy)
+                if _d < _best_d:
+                    _best_d, _best_rid = _d, _r.robot_id
+            if _best_rid is not None:
+                pre_element_nearest_rid[id(_c)] = _best_rid
+
         self.sim.step(CONTROL_DT, sim_actions)
         self._step_count += 1
 
@@ -244,6 +282,13 @@ class OverrideEnv:
                 self._carry_steps[rid] += 1
             else:
                 self._carry_steps[rid] = 0
+
+        # v8.1: expose carry_step counter to observation_builder via a
+        # public attribute on each robot.  observation_builder reads
+        # `robot._carry_steps`; default 0 if env_wrapper has not set it yet.
+        for rid in AGENT_IDS:
+            r = robot_map[rid]
+            r._carry_steps = self._carry_steps[rid]
 
         # Update contact steps
         for (a, b) in ROBOT_PAIRS:
@@ -267,6 +312,8 @@ class OverrideEnv:
             pre_empty_dist, post_empty_dist,
             flips_fired, score_attempted,
             pre_positions,
+            pre_carry_steps=pre_step_carry,
+            pre_element_nearest_rid=pre_element_nearest_rid,
             post_obs=obs,
         )
 
@@ -311,10 +358,16 @@ class OverrideEnv:
         pre_empty_dist, post_empty_dist,
         flips_fired, score_attempted,
         pre_positions,
+        pre_carry_steps: Dict[str, int] = None,
+        pre_element_nearest_rid: Dict[int, str] = None,
         post_obs: Dict[str, np.ndarray] = None,
     ) -> Dict[str, float]:
         rw      = REWARD_WEIGHTS
         rewards = {rid: 0.0 for rid in AGENT_IDS}
+        if pre_carry_steps is None:
+            pre_carry_steps = dict(self._carry_steps)
+        if pre_element_nearest_rid is None:
+            pre_element_nearest_rid = {}
 
         # v7 per-component tracking: snapshot total reward at each section
         # boundary so we can attribute the delta to that section's signal.
@@ -337,12 +390,12 @@ class OverrideEnv:
         rc["score_delta_red"]  = rc.get("score_delta_red",  0.0) + rw["score_delta"] * (red_delta  - blue_delta) * 2
         rc["score_delta_blue"] = rc.get("score_delta_blue", 0.0) + rw["score_delta"] * (blue_delta - red_delta)  * 2
 
-        # 2. Intake / drop  (+ v7 time-to-score bonus)
-        # Time-to-score: when scored == True for a robot, dispatch a bonus
-        # inversely proportional to how long they had been carrying.  The
-        # _carry_steps counter is incremented AFTER this function returns,
-        # so it currently reflects steps-of-carry up to (but not including)
-        # this step — a fair "time-to-score" measurement.
+        # 2. Intake / drop  (+ v7 time-to-score bonus, v8.1 resource denial)
+        # v8.1 FIX: time_to_score_bonus reads from pre_carry_steps, NOT
+        # self._carry_steps.  The latter is reset to 0 in step() before we
+        # run if the robot just scored (carrying_pin became None during
+        # sim.step()).  Reading the post-update value gave full bonus
+        # every score regardless of actual carry duration.
         for rid in AGENT_IDS:
             r       = robot_map[rid]
             had_pin = pre_carrying_pin[rid] is not None
@@ -350,8 +403,19 @@ class OverrideEnv:
             now_pin = r.carrying_pin is not None
             now_cup = r.carrying_cup is not None
 
-            if (now_pin and not had_pin) or (now_cup and not had_cup):
+            new_pin_in = now_pin and not had_pin
+            new_cup_in = now_cup and not had_cup
+
+            if new_pin_in or new_cup_in:
                 rewards[rid] += rw["intake_success"]
+                # v8.1 resource denial bonus: did we beat an opponent to it?
+                newly_carried = r.carrying_pin if new_pin_in else r.carrying_cup
+                if newly_carried is not None:
+                    nearest_rid = pre_element_nearest_rid.get(id(newly_carried))
+                    if nearest_rid is not None and nearest_rid != rid:
+                        nearest_robot = robot_map.get(nearest_rid)
+                        if nearest_robot is not None and nearest_robot.alliance != r.alliance:
+                            rewards[rid] += rw["resource_denial_bonus"]
 
             scored = r.successful_scores > self._prev_scores.get(rid, 0)
             if (had_pin and not now_pin and not scored) or \
@@ -359,7 +423,9 @@ class OverrideEnv:
                 rewards[rid] += rw["drop_penalty"]
 
             if scored:
-                carry_steps = self._carry_steps.get(rid, 0)
+                # v8.1 FIX: use PRE-step carry counter — post-update value
+                # is 0 because the score caused carrying_pin/cup to become None.
+                carry_steps = pre_carry_steps.get(rid, 0)
                 ratio = max(0.0, 1.0 - carry_steps / float(TIME_TO_SCORE_TARGET))
                 rewards[rid] += rw["time_to_score_bonus"] * ratio
 
@@ -496,28 +562,29 @@ class OverrideEnv:
                 rewards[b.robot_id] += rw["ally_separation_bonus"]
         _track("ally_separation")
 
-        # 3f. v7 — Yellow-pin approach reward.
-        # When an empty-handed robot's alliance currently owns the toggle
-        # for a yellow pin, reward approaching that pin so the policy
-        # learns to prioritise yellow pickups EARLY, not just at score time.
-        # We attribute yellow ownership goal-side: a yellow pin "belongs"
-        # to whichever alliance owns the toggle currently associated with
-        # the closest goal that pin could be scored at.
-        any_red_yellow_owner  = any(t.owner == "red"  for t in self.sim.toggles)
-        any_blue_yellow_owner = any(t.owner == "blue" for t in self.sim.toggles)
-        if any_red_yellow_owner or any_blue_yellow_owner:
+        # 3f. Yellow-pin approach reward (v7 + v8.1 strategic extension).
+        # v7: empty-handed robot whose alliance owns ANY toggle gets a
+        # pull toward the nearest yellow-sided pin (so pickup priority
+        # exists BEFORE the score moment, not just at it).
+        # v8.1: also fires at reduced scale when the alliance owns NO
+        # toggle, encouraging the "grab yellow → flip toggle → score"
+        # strategic chain.
+        any_yellow_pin = any(
+            (not p.scored and p.carried_by is None) and
+            (p.get_up_color() == C_YELLOW or p.get_down_color() == C_YELLOW)
+            for p in self.sim.pins
+        )
+        if any_yellow_pin:
             for rid in AGENT_IDS:
                 r = robot_map[rid]
                 if r.carrying_pin is not None or r.carrying_cup is not None:
                     continue
-                # Does this robot's alliance own ANY toggle? (cheap proxy for
-                # "yellow currently valuable to me")
-                my_owns_toggle = (any_red_yellow_owner if r.alliance == "red"
-                                  else any_blue_yellow_owner)
-                if not my_owns_toggle:
+                my_owns_toggle = any(t.owner == r.alliance for t in self.sim.toggles)
+                scale = (rw["yellow_approach_scale"] if my_owns_toggle
+                         else rw["yellow_approach_unowned"])
+                if scale <= 0.0:
                     continue
                 rx, ry = float(r.body.position.x), float(r.body.position.y)
-                # Find nearest yellow-sided unscored pin
                 best_d = None
                 for p in self.sim.pins:
                     if p.scored or p.carried_by is not None:
@@ -529,8 +596,7 @@ class OverrideEnv:
                     if best_d is None or d < best_d:
                         best_d = d
                 if best_d is not None:
-                    rewards[rid] += rw["yellow_approach_scale"] / (
-                        1.0 + best_d / GOAL_PROXIMITY_NORM)
+                    rewards[rid] += scale / (1.0 + best_d / GOAL_PROXIMITY_NORM)
         _track("yellow_approach")
 
         # 4. Score attempt reward — only fires when the attempt is actually legal
@@ -611,6 +677,9 @@ class OverrideEnv:
         _track("pinning")
 
         # 10. Goal-level causal scoring events
+        # v8.1: scale causal scoring events during endgame so last-minute
+        # scoring is worth substantially more.
+        endgame_mult = rw["endgame_score_multiplier"] if self.sim.rules_engine.endgame_active else 1.0
         for goal in self.sim.goals:
             pre_stack  = pre_goal_stacks.get(goal.goal_id, [])
             post_stack = list(goal.stack)
@@ -672,8 +741,8 @@ class OverrideEnv:
                             b_val = rw["score_yellow_neutral"]
                     else:
                         r_val = b_val = 0.0
-                    for rid in ["red1", "red2"]: rewards[rid] += r_val
-                    for rid in ["blue1", "blue2"]: rewards[rid] += b_val
+                    for rid in ["red1", "red2"]: rewards[rid] += r_val * endgame_mult
+                    for rid in ["blue1", "blue2"]: rewards[rid] += b_val * endgame_mult
             else:
                 # Cup placed on top of a pin.
                 # Visibility rule (mirrors game_objects.py get_score):
@@ -690,15 +759,15 @@ class OverrideEnv:
                         if eff_clear:
                             # Dark bottom faces pin — pin's UP half is BLOCKED (denied).
                             if _is_opponent_color(pin_up_col, scorer_alliance):
-                                for rid in ally_rids: rewards[rid] += rw["denial_success"]
+                                for rid in ally_rids: rewards[rid] += rw["denial_success"] * endgame_mult
                             elif _is_own_color(pin_up_col, scorer_alliance):
-                                for rid in ally_rids: rewards[rid] += rw["denial_own"]
+                                for rid in ally_rids: rewards[rid] += rw["denial_own"] * endgame_mult
                         else:
                             # Clear bottom faces pin — pin's UP half stays VISIBLE.
                             if _is_opponent_color(pin_up_col, scorer_alliance):
-                                for rid in ally_rids: rewards[rid] += rw["denial_preserved_opp"]
+                                for rid in ally_rids: rewards[rid] += rw["denial_preserved_opp"] * endgame_mult
                 if cup_idx >= 1:
-                    for rid in ally_rids: rewards[rid] += rw["stack_bonus"]
+                    for rid in ally_rids: rewards[rid] += rw["stack_bonus"] * endgame_mult
         _track("causal_scoring")
 
         # 11. Toggle events
@@ -831,6 +900,61 @@ class OverrideEnv:
             if dot > 0.0:
                 rewards[rid] += rw["forward_speed_scale"] * dot
         _track("forward_speed")
+
+        # 13d. v8.1 — Defensive position bonus.
+        # Reward empty-handed robots for positioning themselves on the line
+        # between a carrying enemy and that enemy's nearest scorable goal.
+        # Encourages defensive blocking play without requiring contact,
+        # giving robots a positive (vs purely penalty-driven) reason to play
+        # defense.
+        for rid in AGENT_IDS:
+            r = robot_map[rid]
+            if r.carrying_pin is not None or r.carrying_cup is not None:
+                continue   # only empty-handed robots play defense
+            rx = float(r.body.position.x); ry = float(r.body.position.y)
+            blocked = False
+            for opp_id in AGENT_IDS:
+                if blocked:
+                    break
+                opp = robot_map[opp_id]
+                if opp.alliance == r.alliance:
+                    continue
+                if opp.carrying_pin is None and opp.carrying_cup is None:
+                    continue
+                ox = float(opp.body.position.x); oy = float(opp.body.position.y)
+                # opp's nearest scorable goal
+                best_g = None; best_d = None
+                for g in self.sim.goals:
+                    if g.alliance not in ("neutral", opp.alliance):
+                        continue
+                    can_pin = opp.carrying_pin is not None and not _stack_top_is_pin(g.stack)
+                    can_cup = opp.carrying_cup is not None and     _stack_top_is_pin(g.stack)
+                    if not (can_pin or can_cup):
+                        continue
+                    d = math.hypot(ox - g.x, oy - g.y)
+                    if best_d is None or d < best_d:
+                        best_d, best_g = d, g
+                if best_g is None:
+                    continue
+                gx, gy = best_g.x, best_g.y
+                dx, dy = gx - ox, gy - oy
+                L2 = dx * dx + dy * dy
+                if L2 < 1.0:
+                    continue
+                # Parameter t: 0 at opp, 1 at goal.  Only count if defender
+                # is between them (0.1 ≤ t ≤ 0.9).
+                t_param = ((rx - ox) * dx + (ry - oy) * dy) / L2
+                if t_param < 0.1 or t_param > 0.9:
+                    continue
+                # Perpendicular distance from (rx,ry) to line opp→goal
+                px_on_line = ox + t_param * dx
+                py_on_line = oy + t_param * dy
+                perp_d = math.hypot(rx - px_on_line, ry - py_on_line)
+                if perp_d > DEFENSIVE_LINE_PERP_DIST:
+                    continue
+                rewards[rid] += rw["defensive_position_bonus"]
+                blocked = True
+        _track("defensive_position")
 
         # 14. RND Intrinsic Reward — use pre-built post_obs to avoid redundant builds
         if self.rnd is not None:

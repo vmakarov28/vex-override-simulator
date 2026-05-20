@@ -169,12 +169,49 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
 
   PROBLEM 39 (v8): Self-play pool too homogeneous (90% old checkpoints).
     FIX: POOL_SAMPLE_PROB 0.90→0.75.
+
+  PROBLEM 40 (v8.1): time_to_score_bonus paid full bonus every score.
+    BUG: _carry_steps was reset to 0 in step() before _compute_rewards
+    ran (robot's carrying_pin became None during sim.step()).  Section 2
+    read the reset value, ratio was always 1.0, fast-cycle signal
+    completely absent.  FIX: step() captures pre_step_carry BEFORE the
+    counter update and passes it to _compute_rewards.
+
+  PROBLEM 41 (v8.1): No reward differentiation for endgame scoring.
+    FIX: endgame_score_multiplier (1.5×) on all causal scoring events
+    (pin scoring, denial, stack_bonus) while rules_engine.endgame_active.
+
+  PROBLEM 42 (v8.1): No positive reward for defensive play.
+    FIX: defensive_position_bonus (+0.05/step) when an empty-handed
+    robot is positioned on the line between a carrying enemy and that
+    enemy's nearest scorable goal.  Encourages blocking without contact.
+
+  PROBLEM 43 (v8.1): No reward for grabbing elements before opponents.
+    FIX: resource_denial_bonus (+0.5 one-time) when a robot intakes an
+    element that an opponent was the nearest robot to at the start of
+    the step.  Rewards proactive resource control.
+
+  PROBLEM 44 (v8.1): Yellow approach only fired when alliance owned a
+    toggle, missing the strategic "go grab yellow then flip toggle" path.
+    FIX: Yellow approach now also fires at reduced scale
+    (yellow_approach_unowned = 0.03) when alliance owns no toggles.
+
+  PROBLEM 45 (v8.1): Observation lacked self-carry-duration awareness,
+    holding-penalty anticipation, opponent carrying colour, and global
+    cycle/resource state, blocking strategic reasoning.
+    FIX: 10 new observation features appended after the v7 globals
+    (OBS_DIM 554 → 564):
+      - own carry_step normalised (1)
+      - own holding-overshoot ratio (1)
+      - opp1, opp2 carrying pin UP colour one-hot (3 + 3)
+      - yellow pins remaining normalised (1)
+      - can-score-anywhere bit (1)
 """
 
 # -------------------------------------------------------------------------
 # OBSERVATION / ACTION SPACE
 # -------------------------------------------------------------------------
-OBS_DIM     = 554   # v6: 551 base + 3 v7 features (score_delta_my, heading-vel align, endgame urgency)
+OBS_DIM     = 564   # v8.1: 554 base + 10 v8.1 features (own carry_step, overshoot, opp1/opp2 carrying colors, yellow_left, can_score_anywhere)
 ACTION_CONT = 2
 ACTION_DISC = 7
 
@@ -304,6 +341,12 @@ REWARD_WEIGHTS = {
     "yellow_approach_scale":     0.06,  # per-step: bonus when empty robot approaches yellow pin & alliance owns toggle
     "ally_separation_bonus":     0.02,  # per-step: bonus when teammates >= ALLY_SEPARATION_TARGET apart
 
+    # --- v8.1: Strategy & defensive shaping ------------------------------
+    "endgame_score_multiplier":  1.5,    # multiplier on causal scoring events during endgame
+    "resource_denial_bonus":     0.5,    # one-time bonus when intaking an element an opponent was closer to
+    "defensive_position_bonus":  0.05,   # per-step: empty-handed robot between a carrying enemy and their nearest scorable goal
+    "yellow_approach_unowned":   0.03,   # yellow_approach scale when alliance doesn't yet own a toggle (encourages flip-first strategy)
+
     # --- Endgame ---------------------------------------------------------
     "midfield_endgame":        0.08,   # base per-step reward; multiplied by 1..ENDGAME_RAMP_MAX_MULT in final seconds
 }
@@ -372,6 +415,10 @@ PROX_CARRY_DECAY_STEPS  = 35
 # Grace window after a toggle flip: robots are NOT penalised for toggle_camping
 # during this window, giving them time to physically leave the toggle zone.
 TOGGLE_LEAVE_GRACE_STEPS = 20
+
+# Defensive blocking: max perpendicular distance from the (opp → opp_goal) line
+# at which a defender counts as "in the way".  ~1 robot width.
+DEFENSIVE_LINE_PERP_DIST = 18.0
 
 # -------------------------------------------------------------------------
 # CURRICULUM STAGES

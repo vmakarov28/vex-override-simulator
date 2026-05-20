@@ -159,6 +159,9 @@ class OverrideEnv(ParallelEnv):
                     self._carry_steps[rid] += 1
                 else:
                     self._carry_steps[rid] = 0
+                # v8.1: expose to observation_builder
+                if r is not None:
+                    r._carry_steps = self._carry_steps[rid]
 
             # Update contact-step counters — deterministic order from ROBOT_PAIRS
             for (a_id, b_id) in ROBOT_PAIRS:

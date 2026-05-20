@@ -1,29 +1,26 @@
 """
 utils/observation_builder.py
 ────────────────────────────────────────────────────────────────────────────
-Builds the fixed-size 554-dimensional observation vector for one agent.
+Builds the fixed-size 564-dimensional observation vector for one agent.
 
 Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
   [  0: 24]  Self state
   [ 24: 36]  Teammate state
   [ 36: 56]  Opponents (2 × 10)
   [ 56:209]  Goals (9 × 17 = 153)
-               +3 bits vs. v4: top-pin UP color one-hot [red, blue, yellow]
-               This lets robots decide flip/cup-orientation before scoring.
   [209:409]  K-nearest pins (20 × 10 = 200)
   [409:514]  K-nearest cups (15 × 7 = 105)
   [514:534]  Toggles (4 × 5 = 20)
-  [534:554]  Global match state (20)
-               + v7: alliance-relative score delta, heading-velocity
-                     alignment, endgame urgency ramp
+  [534:554]  Global match state (20)  [v7]
+  [554:564]  v8.1 self-awareness + defensive intel (10)
+               - own carry_steps / TIME_TO_SCORE_TARGET (1)
+               - own holding-overshoot ratio (1)
+               - opp1 carrying pin UP colour one-hot (3)
+               - opp2 carrying pin UP colour one-hot (3)
+               - yellow pins remaining / 12 (1)
+               - can-score-anywhere bit (1)
   ──────────
-  Total: 554
-
-v7 confirmed: time_remaining is already in this obs at index 534
-(obs[ptr + 0] = max(0.0, tr) / full), so robots CAN distinguish second 5
-from second 100.  The new endgame_urgency feature (index 553) gives an
-explicit 0→1 ramp inside the final ENDGAME_RAMP_SECONDS so the policy can
-easily latch onto last-second parking strategies.
+  Total: 564
 """
 
 import math
@@ -37,7 +34,10 @@ from config.game_rules import (
     ENDGAME_SECONDS, TOTAL_SECONDS, AUTONOMOUS_SECONDS,
     CENTER_GOAL_ID, ENDGAME_CENTER_MAX_STACK,
 )
-from config.hyperparameters import ENDGAME_RAMP_SECONDS
+from config.hyperparameters import (
+    ENDGAME_RAMP_SECONDS, TIME_TO_SCORE_TARGET,
+    HOLDING_TIMEOUT_STEPS, HOLDING_RAMP_STEPS,
+)
 from simulation.game_objects import (
     GamePin, GameCup, FieldGoal, FieldToggle,
     C_RED, C_BLUE, C_YELLOW,
@@ -53,7 +53,7 @@ MAX_ANG_VEL = 10.0
 K_PINS = 20   # nearest pins to encode
 K_CUPS = 15   # nearest cups to encode
 
-OBS_DIM = 554
+OBS_DIM = 564
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color → one-hot helper  (3 bits: [red, blue, yellow])
@@ -104,7 +104,7 @@ def build_observation(
     simulator,
 ) -> np.ndarray:
     """
-    Build the 554-dim observation vector for `robot`.
+    Build the 564-dim observation vector for `robot`.
 
     Parameters
     ----------
@@ -119,7 +119,7 @@ def build_observation(
 
     Returns
     -------
-    np.ndarray of shape (554,), dtype float32
+    np.ndarray of shape (564,), dtype float32
     """
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     ptr = 0
@@ -410,6 +410,59 @@ def build_observation(
         obs[ptr + 19] = 0.0
     ptr += 20
 
+    # ── v8.1 self-awareness + defensive intel (10) ──────────────────────
+    # (a) Own carry-step counter normalized to TIME_TO_SCORE_TARGET — lets
+    # the policy reason about "I've been carrying too long, score now or
+    # cycle".  Reads `robot._carry_steps` set by env_wrapper.step();
+    # defaults to 0 when not set (e.g. PettingZoo wrapper).
+    own_carry = float(getattr(robot, "_carry_steps", 0))
+    obs[ptr + 0] = min(1.0, own_carry / float(TIME_TO_SCORE_TARGET))
+
+    # (b) Holding-penalty overshoot ratio: 0 below HOLDING_TIMEOUT_STEPS,
+    # rising linearly to 1 over the next HOLDING_RAMP_STEPS.  Anticipates
+    # the quadratic timeout penalty before it bites hard.
+    overshoot = max(0.0, own_carry - float(HOLDING_TIMEOUT_STEPS))
+    obs[ptr + 1] = min(1.0, overshoot / float(HOLDING_RAMP_STEPS))
+
+    # (c–d) Per-opponent carrying pin UP-colour one-hot.  Defensive intel:
+    # if the nearest opponent has a yellow pin, blocking their goal is
+    # high-value.  Empty pin slot → all zeros.
+    opp_color_slots = [0.0] * 6   # [r1,b1,y1, r2,b2,y2]
+    for i, opp in enumerate(opponents[:2]):
+        if opp.carrying_pin is not None:
+            up_oh = _color_onehot(opp.carrying_pin.get_up_color())
+            opp_color_slots[i * 3 + 0] = up_oh[0]
+            opp_color_slots[i * 3 + 1] = up_oh[1]
+            opp_color_slots[i * 3 + 2] = up_oh[2]
+    for j in range(6):
+        obs[ptr + 2 + j] = opp_color_slots[j]
+
+    # (e) Yellow pins remaining (unscored, not carried) normalised by /12.
+    # Resource-awareness signal for "should I commit to yellow strategy".
+    yellow_left = sum(
+        1 for p in pins
+        if not p.scored and p.carried_by is None and
+        (p.get_up_color() == C_YELLOW or p.get_down_color() == C_YELLOW)
+    )
+    obs[ptr + 8] = min(1.0, yellow_left / 12.0)
+
+    # (f) Can-score-anywhere bit: 1 if this robot can legally extend the
+    # stack at any reachable goal right now, else 0.  Makes the legality
+    # signal explicit rather than requiring inference across goal slots.
+    can_anywhere = 0.0
+    if robot.carrying_pin is not None or robot.carrying_cup is not None:
+        for g in goals:
+            if g.alliance not in ("neutral", robot.alliance):
+                continue
+            top_is_pin = bool(g.stack) and bool(g.stack[-1][1])
+            can_pin = robot.carrying_pin is not None and not top_is_pin
+            can_cup = robot.carrying_cup is not None and     top_is_pin
+            if can_pin or can_cup:
+                can_anywhere = 1.0
+                break
+    obs[ptr + 9] = can_anywhere
+    ptr += 10
+
     assert ptr == OBS_DIM, f"Obs dim mismatch: {ptr} != {OBS_DIM}"
     return obs
 
@@ -417,7 +470,7 @@ def build_observation(
 def build_all_observations(simulator) -> dict:
     """
     Build observations for all four robots at once.
-    Returns {robot_id: np.ndarray(554,)} dict.
+    Returns {robot_id: np.ndarray(564,)} dict.
     """
     return {
         robot.robot_id: build_observation(
