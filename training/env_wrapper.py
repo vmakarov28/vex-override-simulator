@@ -1,5 +1,5 @@
 """
-training/env_wrapper.py  (v6)
+training/env_wrapper.py  (v7)
 ==========================================================================
 Reward shaping history:
   v4 — Holding ramp, anti-reward-hacking baseline
@@ -10,6 +10,12 @@ Reward shaping history:
         forward-speed reward (velocity toward target), strengthened
         wrong_element_loiter (-0.15) and fetch_needed_scale (0.15),
         tighter intake/scoring radii (game_rules.py: 10/12 in)
+  v7 — Teammate-goal overlap penalty (division of labour),
+        time-to-score bonus (positive cycle-time signal),
+        yellow-pin approach (early toggle-aware prioritisation),
+        ally separation bonus (anti-crowding), ramping midfield_endgame
+        (1×→4× across final 10 s).  +3 obs features (554-dim) and
+        per-component reward tracking exposed via drain_reward_components().
 """
 
 import math
@@ -30,6 +36,8 @@ from config.hyperparameters import (
     PINNING_STEPS_LIMIT, PINNING_CONTACT_DIST,
     GOAL_PROXIMITY_NORM,
     SPIN_ANG_VEL_THRESHOLD, SPIN_TRANS_THRESHOLD, TOGGLE_CAMP_RADIUS,
+    ALLY_SEPARATION_TARGET, TIME_TO_SCORE_TARGET,
+    ENDGAME_RAMP_SECONDS, ENDGAME_RAMP_MAX_MULT,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
@@ -73,6 +81,12 @@ class OverrideEnv:
         self._prev_target_dist: Dict[str, float]    = {rid: 0.0 for rid in AGENT_IDS}
         self._prev_scores: Dict[str, int]           = {rid: 0 for rid in AGENT_IDS}
 
+        # v7: per-component reward sum tracker (summed across all robots and
+        # all steps since last drain).  drain_reward_components() returns the
+        # current dict and resets it — used by training loops for TB-style
+        # per-signal logging.
+        self._reward_components: Dict[str, float]   = {}
+
         self.rnd = RNDModule(obs_dim=OBS_DIM, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")) if RND_ENABLED else None
 
     # -------------------------------------------------------------------------
@@ -87,6 +101,9 @@ class OverrideEnv:
         self._carry_steps        = {rid: 0 for rid in AGENT_IDS}
         self._contact_steps      = {p: 0 for p in ROBOT_PAIRS}
         self._prev_scores        = {rid: 0 for rid in AGENT_IDS}
+        # NOTE: do NOT clear self._reward_components here.  Per-component
+        # sums persist across episodes within a rollout so the training loop
+        # can drain them once per update cycle for logging.
 
         self._start_positions = {
             rid: (float(ROBOT_STARTS[rid]["pos"][0]),
@@ -265,7 +282,7 @@ class OverrideEnv:
         return obs, rewards, done, info
 
     # =========================================================================
-    # REWARD COMPUTATION (v4 - Upgraded)
+    # REWARD COMPUTATION (v7)
     # =========================================================================
     def _compute_rewards(
         self,
@@ -281,13 +298,29 @@ class OverrideEnv:
         rw      = REWARD_WEIGHTS
         rewards = {rid: 0.0 for rid in AGENT_IDS}
 
+        # v7 per-component tracking: snapshot total reward at each section
+        # boundary so we can attribute the delta to that section's signal.
+        rc = self._reward_components
+        _prev_total = 0.0
+        def _track(name):
+            nonlocal _prev_total
+            cur = sum(rewards.values())
+            rc[name] = rc.get(name, 0.0) + (cur - _prev_total)
+            _prev_total = cur
+
         # 1. Score delta
         red_delta  = post_red  - pre_red
         blue_delta = post_blue - pre_blue
         for rid in ["red1",  "red2"]:  rewards[rid] += rw["score_delta"] * (red_delta  - blue_delta)
         for rid in ["blue1", "blue2"]: rewards[rid] += rw["score_delta"] * (blue_delta - red_delta)
+        _track("score_delta")
 
-        # 2. Intake / drop
+        # 2. Intake / drop  (+ v7 time-to-score bonus)
+        # Time-to-score: when scored == True for a robot, dispatch a bonus
+        # inversely proportional to how long they had been carrying.  The
+        # _carry_steps counter is incremented AFTER this function returns,
+        # so it currently reflects steps-of-carry up to (but not including)
+        # this step — a fair "time-to-score" measurement.
         for rid in AGENT_IDS:
             r       = robot_map[rid]
             had_pin = pre_carrying_pin[rid] is not None
@@ -303,8 +336,14 @@ class OverrideEnv:
                (had_cup and not now_cup and not scored):
                 rewards[rid] += rw["drop_penalty"]
 
+            if scored:
+                carry_steps = self._carry_steps.get(rid, 0)
+                ratio = max(0.0, 1.0 - carry_steps / float(TIME_TO_SCORE_TARGET))
+                rewards[rid] += rw["time_to_score_bonus"] * ratio
+
         for r in self.sim.robots:
             self._prev_scores[r.robot_id] = r.successful_scores
+        _track("intake_drop_and_time_to_score")
 
         # 3. Carrying proximity reward — only when a legal score exists at a nearby goal.
         # A robot holding the wrong element for every reachable goal earns nothing here,
@@ -327,6 +366,7 @@ class OverrideEnv:
             if best is not None:
                 prox = rw["carrying_proximity_scale"] / (1.0 + best / GOAL_PROXIMITY_NORM)
                 rewards[rid] += prox
+        _track("carrying_proximity")
 
         # 3b. Fetch-needed-element redirect reward.
         # When a robot holds an element it cannot currently score anywhere, reward it
@@ -368,6 +408,7 @@ class OverrideEnv:
                         best = d
             if best is not None:
                 rewards[rid] += rw["fetch_needed_scale"] / (1.0 + best / GOAL_PROXIMITY_NORM)
+        _track("fetch_needed")
 
         # 3c. Wrong-element loitering penalty.
         # Small per-step cost when a robot lingers within scoring radius of a goal
@@ -388,6 +429,84 @@ class OverrideEnv:
                 if not can_pin and not can_cup:
                     rewards[rid] += rw["wrong_element_loiter"]
                     break
+        _track("wrong_element_loiter")
+
+        # 3d. v7 — Teammate-goal overlap penalty.
+        # Penalise the situation where both alliance robots are inside
+        # SCORING_RADIUS of the same goal.  Encourages division of labour:
+        # one robot scores, the other goes back to fetch the next element.
+        for alliance in ("red", "blue"):
+            allies = [robot_map[r] for r in AGENT_IDS if robot_map[r].alliance == alliance]
+            if len(allies) < 2:
+                continue
+            a, b = allies[0], allies[1]
+            ax, ay = float(a.body.position.x), float(a.body.position.y)
+            bx, by = float(b.body.position.x), float(b.body.position.y)
+            for g in self.sim.goals:
+                if g.alliance not in ("neutral", alliance):
+                    continue
+                a_in = math.hypot(ax - g.x, ay - g.y) < SCORING_RADIUS
+                b_in = math.hypot(bx - g.x, by - g.y) < SCORING_RADIUS
+                if a_in and b_in:
+                    # Split the penalty between both crowders so we don't
+                    # arbitrarily blame one robot.
+                    rewards[a.robot_id] += 0.5 * rw["teammate_overlap_penalty"]
+                    rewards[b.robot_id] += 0.5 * rw["teammate_overlap_penalty"]
+                    break  # one penalty per pair per step
+        _track("teammate_overlap")
+
+        # 3e. v7 — Ally separation bonus.
+        # Small per-step reward when the two alliance robots are at least
+        # ALLY_SEPARATION_TARGET inches apart.  Pulls them out of "share one
+        # element" loops without explicitly assigning roles.
+        for alliance in ("red", "blue"):
+            allies = [robot_map[r] for r in AGENT_IDS if robot_map[r].alliance == alliance]
+            if len(allies) < 2:
+                continue
+            a, b = allies[0], allies[1]
+            d = math.hypot(float(a.body.position.x) - float(b.body.position.x),
+                           float(a.body.position.y) - float(b.body.position.y))
+            if d >= ALLY_SEPARATION_TARGET:
+                rewards[a.robot_id] += rw["ally_separation_bonus"]
+                rewards[b.robot_id] += rw["ally_separation_bonus"]
+        _track("ally_separation")
+
+        # 3f. v7 — Yellow-pin approach reward.
+        # When an empty-handed robot's alliance currently owns the toggle
+        # for a yellow pin, reward approaching that pin so the policy
+        # learns to prioritise yellow pickups EARLY, not just at score time.
+        # We attribute yellow ownership goal-side: a yellow pin "belongs"
+        # to whichever alliance owns the toggle currently associated with
+        # the closest goal that pin could be scored at.
+        any_red_yellow_owner  = any(t.owner == "red"  for t in self.sim.toggles)
+        any_blue_yellow_owner = any(t.owner == "blue" for t in self.sim.toggles)
+        if any_red_yellow_owner or any_blue_yellow_owner:
+            for rid in AGENT_IDS:
+                r = robot_map[rid]
+                if r.carrying_pin is not None or r.carrying_cup is not None:
+                    continue
+                # Does this robot's alliance own ANY toggle? (cheap proxy for
+                # "yellow currently valuable to me")
+                my_owns_toggle = (any_red_yellow_owner if r.alliance == "red"
+                                  else any_blue_yellow_owner)
+                if not my_owns_toggle:
+                    continue
+                rx, ry = float(r.body.position.x), float(r.body.position.y)
+                # Find nearest yellow-sided unscored pin
+                best_d = None
+                for p in self.sim.pins:
+                    if p.scored or p.carried_by is not None:
+                        continue
+                    if not (p.get_up_color() == C_YELLOW or p.get_down_color() == C_YELLOW):
+                        continue
+                    d = math.hypot(rx - float(p.body.position.x),
+                                   ry - float(p.body.position.y))
+                    if best_d is None or d < best_d:
+                        best_d = d
+                if best_d is not None:
+                    rewards[rid] += rw["yellow_approach_scale"] / (
+                        1.0 + best_d / GOAL_PROXIMITY_NORM)
+        _track("yellow_approach")
 
         # 4. Score attempt reward — only fires when the attempt is actually legal
         # (correct element for the goal's current stack state).  Prevents rewarding
@@ -407,6 +526,7 @@ class OverrideEnv:
                 if can_pin or can_cup:
                     rewards[rid] += rw["score_attempt_in_zone"]
                     break
+        _track("score_attempt")
 
         # 5. Holding timeout penalty — ramps up after HOLDING_TIMEOUT_STEPS
         for rid in AGENT_IDS:
@@ -415,6 +535,7 @@ class OverrideEnv:
                 overshoot = cs - HOLDING_TIMEOUT_STEPS
                 penalty   = rw["holding_penalty_rate"] * (overshoot / HOLDING_RAMP_STEPS)
                 rewards[rid] += penalty
+        _track("holding_timeout")
 
         # 6. Empty-hand approach delta
         for rid in AGENT_IDS:
@@ -423,11 +544,13 @@ class OverrideEnv:
                 delta_d = pre_empty_dist[rid] - post_empty_dist[rid]
                 if delta_d > 0:
                     rewards[rid] += rw["approach_scale"] * delta_d / FIELD_DIAGONAL
+        _track("approach_delta")
 
         # 7. Flip penalty (neutral — no reward or punishment)
         for rid in AGENT_IDS:
             if flips_fired[rid]:
                 rewards[rid] += rw["flip_penalty"]
+        _track("flip_penalty")
 
         # 8. Idle + start-zone penalty
         for rid in AGENT_IDS:
@@ -443,6 +566,7 @@ class OverrideEnv:
             rx, ry = float(r.body.position.x), float(r.body.position.y)
             if math.hypot(rx - sx, ry - sy) < START_ZONE_RADIUS:
                 rewards[rid] += rw["start_zone_penalty"]
+        _track("idle_start_zone")
 
         # 9. Pinning violation
         for (a, b) in ROBOT_PAIRS:
@@ -457,6 +581,7 @@ class OverrideEnv:
                 rewards[a] += rw["pinning_violation"]
             else:
                 rewards[b] += rw["pinning_violation"]
+        _track("pinning")
 
         # 10. Goal-level causal scoring events
         for goal in self.sim.goals:
@@ -547,6 +672,7 @@ class OverrideEnv:
                                 for rid in ally_rids: rewards[rid] += rw["denial_preserved_opp"]
                 if cup_idx >= 1:
                     for rid in ally_rids: rewards[rid] += rw["stack_bonus"]
+        _track("causal_scoring")
 
         # 11. Toggle events
         for toggle in self.sim.toggles:
@@ -559,15 +685,30 @@ class OverrideEnv:
                 elif curr_owner == "blue":
                     for rid in ["blue1", "blue2"]: rewards[rid] += rw["toggle_gain"]
                     for rid in ["red1", "red2"]: rewards[rid] += rw["toggle_loss"]
+        _track("toggle_events")
 
-        # 12. Midfield endgame bonus
+        # 12. Midfield endgame bonus  (v7: ramping multiplier)
+        # Base rate `midfield_endgame` is paid every step in endgame.  In the
+        # final ENDGAME_RAMP_SECONDS, multiply by a linear ramp 1 → ENDGAME_RAMP_MAX_MULT
+        # so robots only get the BIG reward by parking very late.  Earlier parking
+        # still earns the base rate (so it isn't punished), but the marginal
+        # gain from staying until the buzzer is much larger.
         if self.sim.rules_engine.endgame_active:
+            tr = float(self.sim.time_remaining)
+            if tr <= ENDGAME_RAMP_SECONDS:
+                # Linear ramp: tr=ENDGAME_RAMP_SECONDS → mult=1
+                #              tr=0                   → mult=ENDGAME_RAMP_MAX_MULT
+                ramp = 1.0 + (ENDGAME_RAMP_MAX_MULT - 1.0) * (
+                    (ENDGAME_RAMP_SECONDS - tr) / ENDGAME_RAMP_SECONDS)
+            else:
+                ramp = 1.0
             mc_x = mc_y = 72.0
             for r in self.sim.robots:
                 rx = float(r.body.position.x)
                 ry = float(r.body.position.y)
                 if abs(rx - mc_x) + abs(ry - mc_y) <= MIDFIELD_HALF + 10.0:
-                    rewards[r.robot_id] += rw["midfield_endgame"]
+                    rewards[r.robot_id] += rw["midfield_endgame"] * ramp
+        _track("midfield_endgame")
 
         # 13a. Spin penalty — penalise in-place spinning.
         # Fires when angular velocity is high AND translational speed is low,
@@ -580,6 +721,7 @@ class OverrideEnv:
                                      float(r.body.velocity.y))
             if ang_vel > SPIN_ANG_VEL_THRESHOLD and trans_speed < SPIN_TRANS_THRESHOLD:
                 rewards[rid] += rw["spin_penalty"]
+        _track("spin_penalty")
 
         # 13b. Toggle-camping penalty — penalise lingering near a toggle the
         # robot's own alliance already owns.  A robot should claim the toggle
@@ -594,6 +736,7 @@ class OverrideEnv:
                         and t.owner == r.alliance):
                     rewards[rid] += rw["toggle_camping"]
                     break   # only penalise once per robot per step
+        _track("toggle_camping")
 
         # 13c. Forward-speed reward — reward the component of velocity directed
         # toward the robot's current target.  Empty-handed: nearest uncollected
@@ -653,6 +796,7 @@ class OverrideEnv:
             dot = (vx * ux + vy * uy) / spd
             if dot > 0.0:
                 rewards[rid] += rw["forward_speed_scale"] * dot
+        _track("forward_speed")
 
         # 14. RND Intrinsic Reward — use pre-built post_obs to avoid redundant builds
         if self.rnd is not None:
@@ -665,6 +809,7 @@ class OverrideEnv:
                 rewards[rid] += intrinsic
                 if do_update:
                     self.rnd.update(obs_t.unsqueeze(0))
+            _track("rnd_intrinsic")
 
         return rewards
 
@@ -721,6 +866,17 @@ class OverrideEnv:
     # =========================================================================
     # PUBLIC API
     # =========================================================================
+    def drain_reward_components(self) -> Dict[str, float]:
+        """Return the running per-component reward sums and reset the tracker.
+
+        Sums are aggregated across all four robots and every step since the
+        last drain.  Use the returned dict to populate per-signal TensorBoard
+        (or text-log) metrics in the training loop.
+        """
+        out = dict(self._reward_components)
+        self._reward_components.clear()
+        return out
+
     def get_action_masks(self) -> Dict[str, np.ndarray]:
         return {
             r.robot_id: get_action_mask(r, self.sim.goals, self.sim.rules_engine)

@@ -1,7 +1,7 @@
 """
-config/hyperparameters.py  (v6)
+config/hyperparameters.py  (v7)
 =================================
-REWARD REDESIGN v6
+REWARD REDESIGN v7
 ------------------
 Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
 
@@ -86,12 +86,57 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
   PROBLEM 20 (v6): Intake/scoring radii too generous (16/14 in).
     FIX: SCORING_RADIUS 16→12, INTAKE_RADIUS 14→10 in game_rules.py so
     robots must approach precisely before interacting.
+
+  PROBLEM 21 (v7): Both alliance robots crowd the same goal.
+    FIX: teammate_overlap_penalty fires when both alliance robots sit
+    within scoring radius of the same goal simultaneously, encouraging
+    division of labour.
+
+  PROBLEM 22 (v7): No positive feedback for fast cycles.
+    FIX: time_to_score_bonus pays out at the scoring moment, scaled
+    inversely by how long the robot had been carrying — short carries
+    earn more than long ones.
+
+  PROBLEM 23 (v7): Yellow-pin priority only kicks in at score time.
+    FIX: yellow_approach_scale gives extra approach reward to empty-handed
+    robots heading toward yellow-sided pins when their alliance currently
+    owns the relevant toggle, biasing pickup choices earlier.
+
+  PROBLEM 24 (v7): Robots park in midfield the entire endgame.
+    FIX: midfield_endgame ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT
+    over the last ENDGAME_RAMP_SECONDS so late-second parking is
+    strongly preferred over second-19 parking.
+
+  PROBLEM 25 (v7): Robots couldn't reason about score deficit or
+    spinning behaviour at the policy level.
+    FIX: Observation gains 3 new global features —
+      (a) alliance-relative score delta  (my − opp) / 80
+      (b) heading-vs-velocity cosine alignment for self
+      (c) endgame urgency ramp (0 outside endgame, 0→1 inside).
+    OBS_DIM updated from 551 → 554.
+
+  PROBLEM 26 (v7): Robots couldn't selectively attend to relevant goals.
+    FIX: Policy/Critic now use a per-goal embedding + dot-product
+    attention pooling over the 9 goal slots, with the non-goal context
+    serving as the query.  Replaces blind MLP flattening.
+
+  PROBLEM 27 (v7): No visibility into which reward signals were firing.
+    FIX: env_wrapper now tracks running per-component reward sums.
+    drain_reward_components() exposes them; training loops log them.
+
+  PROBLEM 28 (v7): Robots crowded the same element / goal.
+    FIX: ally_separation_bonus pays a small per-step reward when the two
+    alliance robots are at least ALLY_SEPARATION_TARGET inches apart.
+
+  PROBLEM 29 (v7): Visualisation cadence too sparse during early learning.
+    FIX: First 2 M env steps record a vis video every 100 updates rather
+    than every 500.  Also: a final result video is recorded at end of run.
 """
 
 # -------------------------------------------------------------------------
 # OBSERVATION / ACTION SPACE
 # -------------------------------------------------------------------------
-OBS_DIM     = 551   # 524 base + 3 bits × 9 goals for top-pin UP color
+OBS_DIM     = 554   # v6: 551 base + 3 v7 features (score_delta_my, heading-vel align, endgame urgency)
 ACTION_CONT = 2
 ACTION_DISC = 7
 
@@ -215,8 +260,14 @@ REWARD_WEIGHTS = {
     "toggle_camping":         -0.08,   # per-step: loitering near a toggle your alliance already owns
     "forward_speed_scale":     0.03,   # per-step: velocity component pointing toward current target
 
+    # --- v7: division of labour & cycle efficiency -----------------------
+    "teammate_overlap_penalty": -0.12,  # per-step: both alliance robots inside SCORING_RADIUS of same goal
+    "time_to_score_bonus":       1.5,   # one-time at score moment: bonus × max(0, 1 - carry_steps/TARGET)
+    "yellow_approach_scale":     0.06,  # per-step: bonus when empty robot approaches yellow pin & alliance owns toggle
+    "ally_separation_bonus":     0.02,  # per-step: bonus when teammates >= ALLY_SEPARATION_TARGET apart
+
     # --- Endgame ---------------------------------------------------------
-    "midfield_endgame":        0.08,
+    "midfield_endgame":        0.08,   # base per-step reward; multiplied by 1..ENDGAME_RAMP_MAX_MULT in final seconds
 }
 
 # -------------------------------------------------------------------------
@@ -249,6 +300,28 @@ SPIN_TRANS_THRESHOLD    = 20.0   # inches/s — below this = not meaningfully mo
 # Set slightly wider than TOGGLE_INTERACTION_RANGE (18 in) so a robot just sitting
 # adjacent to an owned toggle also gets penalised.
 TOGGLE_CAMP_RADIUS      = 24.0   # inches
+
+# -------------------------------------------------------------------------
+# v7: Division-of-labour / endgame ramp constants
+# -------------------------------------------------------------------------
+# Two alliance robots are penalised if both end up inside SCORING_RADIUS of
+# the same goal (camping/crowding behaviour).  Detection uses SCORING_RADIUS
+# from game_rules directly — no extra constant needed here.
+
+# Ally separation target — minimum distance (inches) between teammates that
+# earns the per-step `ally_separation_bonus`.  ~3 robot lengths apart.
+ALLY_SEPARATION_TARGET  = 45.0
+
+# Time-to-score: a robot that scores within TIME_TO_SCORE_TARGET steps of
+# picking up earns close-to-full bonus; longer carries fade to zero linearly.
+# 80 steps at 20 Hz = 4 seconds of carrying.
+TIME_TO_SCORE_TARGET    = 80
+
+# Endgame midfield ramp: in the final ENDGAME_RAMP_SECONDS of the match the
+# midfield_endgame reward multiplier ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT.
+# This makes second-1 parking >> second-19 parking, teaching last-second commit.
+ENDGAME_RAMP_SECONDS    = 10.0
+ENDGAME_RAMP_MAX_MULT   = 4.0
 
 # -------------------------------------------------------------------------
 # CURRICULUM STAGES
