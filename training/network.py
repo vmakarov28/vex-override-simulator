@@ -1,22 +1,37 @@
 """
-training/network.py
+training/network.py  (v7 — goal attention)
 ────────────────────────────────────────────────────────────────────────────
 Neural network architecture for the VEX Override MAPPO system.
 
+v7 change
+---------
+A shared ObsEncoder is now used by both Policy and Critic.  Rather than
+flattening all 9 goal slots into one big MLP input, the encoder:
+  1. Splits the 554-dim observation into (non-goal, goal-slots).
+  2. Embeds each goal slot (17 dims) into a small vector via a shared MLP.
+  3. Projects the non-goal context to a query vector.
+  4. Uses dot-product attention over the 9 embedded goal slots, with
+     softmax weights and weighted pooling.
+  5. Concatenates [non-goal features, attended goals] and runs the result
+     through the main MLP backbone.
+
+This lets the policy *selectively focus* on the goal(s) most relevant to
+the current situation (e.g. the goal it's about to score on, or the goal
+it's trying to deny) rather than blindly attending to all nine equally.
+
 Components
 ----------
+ObsEncoder
+  - obs_dim (=554) → feat_dim (=128) per observation
+  - Used internally by Policy (1× per obs) and Critic (2× then merged).
+
 Policy (actor)
-  - Shared MLP backbone: 551 → [512, 256, 128]
-  - Continuous head: 128 → 2  (mean + log_std for left/right motors)
-  - Discrete head:   128 → 7  (Bernoulli logit per button action)
+  - Decentralised: sees only one robot's 554-dim observation.
+  - Heads: continuous (mean + log_std for left/right motors) + discrete (7).
 
 CentralizedCritic
-  - Takes concatenated obs from both robots on the same alliance: 1102 → 1
-  - Hidden: [512, 256, 128] → 1
-  - Used ONLY during training; discarded at inference.
-
-Both networks use LayerNorm for training stability (no batch-norm artefacts
-with small minibatches).
+  - Sees both teammates' observations independently (via ObsEncoder),
+    concatenates their encoded features, then maps to a scalar value.
 """
 
 import math
@@ -30,6 +45,17 @@ from config.hyperparameters import (
     ACTOR_HIDDEN, CRITIC_HIDDEN,
     LOG_STD_MIN, LOG_STD_MAX,
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Observation layout constants — must match utils/observation_builder.py
+# ─────────────────────────────────────────────────────────────────────────────
+GOAL_OFFSET     = 56                          # start of goal slots
+N_GOALS         = 9
+GOAL_FEATS      = 17                          # features per goal slot
+GOAL_BLOCK_END  = GOAL_OFFSET + N_GOALS * GOAL_FEATS   # 209
+GOAL_EMBED_DIM  = 32                          # per-goal embedding size
+GOAL_HIDDEN_DIM = 64                          # internal width of the per-goal MLP
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,11 +83,89 @@ def _init_weights(module, gain=1.0):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Observation encoder with goal attention (v7)
+# ─────────────────────────────────────────────────────────────────────────────
+class ObsEncoder(nn.Module):
+    """
+    Encodes a single (B, OBS_DIM) observation into a (B, feat_dim) feature vector.
+
+    Architecture
+    ------------
+      non_goal  = obs[:, :56] ++ obs[:, 209:]              # (B, OBS_DIM - 153)
+      goals     = obs[:, 56:209].view(B, 9, 17)             # (B, 9, 17)
+
+      goal_emb  = goal_embed_mlp(goals)                     # (B, 9, GOAL_EMBED_DIM)
+      query     = query_proj(non_goal)                      # (B, GOAL_EMBED_DIM)
+      scores    = <goal_emb, query> / sqrt(d)               # (B, 9)
+      weights   = softmax(scores, dim=-1)                   # (B, 9)
+      attended  = sum_g weights[g] * goal_emb[g]            # (B, GOAL_EMBED_DIM)
+
+      feats     = backbone( cat[non_goal, attended] )       # (B, feat_dim)
+    """
+
+    def __init__(self, obs_dim: int = OBS_DIM, hidden: list = None):
+        super().__init__()
+        if hidden is None:
+            hidden = ACTOR_HIDDEN
+        self.obs_dim     = obs_dim
+        self.non_goal_dim = obs_dim - N_GOALS * GOAL_FEATS    # 554 - 153 = 401
+
+        # Per-goal embedding (shared across the 9 slots).
+        self.goal_embed = nn.Sequential(
+            nn.Linear(GOAL_FEATS, GOAL_HIDDEN_DIM),
+            nn.LayerNorm(GOAL_HIDDEN_DIM),
+            nn.ELU(),
+            nn.Linear(GOAL_HIDDEN_DIM, GOAL_EMBED_DIM),
+        )
+
+        # Query projection from non-goal context.
+        self.query_proj = nn.Linear(self.non_goal_dim, GOAL_EMBED_DIM)
+
+        # Main backbone consumes [non_goal, attended_goals].
+        self.backbone = _mlp([self.non_goal_dim + GOAL_EMBED_DIM] + hidden)
+        self.feat_dim = hidden[-1]
+
+        # Init
+        self.goal_embed.apply(lambda m: _init_weights(m, gain=math.sqrt(2)))
+        _init_weights(self.query_proj, gain=math.sqrt(2))
+        self.backbone.apply(lambda m: _init_weights(m, gain=math.sqrt(2)))
+
+        self._inv_sqrt_d = 1.0 / math.sqrt(GOAL_EMBED_DIM)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """obs : (B, OBS_DIM)  →  (B, feat_dim)"""
+        # Slice goal block out of the observation.
+        pre  = obs[:, :GOAL_OFFSET]                          # (B, 56)
+        gflat = obs[:, GOAL_OFFSET:GOAL_BLOCK_END]            # (B, 153)
+        post = obs[:, GOAL_BLOCK_END:]                        # (B, 554 - 209 = 345)
+        non_goal = torch.cat([pre, post], dim=-1)             # (B, non_goal_dim)
+
+        # Per-goal embedding.
+        goals = gflat.view(-1, N_GOALS, GOAL_FEATS)           # (B, 9, 17)
+        goal_emb = self.goal_embed(goals)                     # (B, 9, GOAL_EMBED_DIM)
+
+        # Query vector from the non-goal context.
+        query = self.query_proj(non_goal)                     # (B, GOAL_EMBED_DIM)
+
+        # Dot-product attention scores.
+        # scores[b, g] = <goal_emb[b, g, :], query[b, :]> / sqrt(d)
+        scores = torch.einsum("bgd,bd->bg", goal_emb, query) * self._inv_sqrt_d
+        weights = F.softmax(scores, dim=-1)                   # (B, 9)
+
+        # Weighted pool of goal embeddings.
+        attended = torch.einsum("bg,bgd->bd", weights, goal_emb)   # (B, GOAL_EMBED_DIM)
+
+        # Concatenate non-goal context with attended goal features.
+        feats = self.backbone(torch.cat([non_goal, attended], dim=-1))
+        return feats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Policy (actor)
 # ─────────────────────────────────────────────────────────────────────────────
 class Policy(nn.Module):
     """
-    Decentralised actor — uses only local 551-dim observation.
+    Decentralised actor — uses only local 554-dim observation.
 
     Forward returns
     ---------------
@@ -79,24 +183,22 @@ class Policy(nn.Module):
         if hidden is None:
             hidden = ACTOR_HIDDEN
 
-        self.backbone = _mlp([obs_dim] + hidden)
+        self.encoder = ObsEncoder(obs_dim=obs_dim, hidden=hidden)
+        feat_dim = self.encoder.feat_dim
 
-        feat_dim = hidden[-1]
         # Continuous: mean and log_std
         self.cont_mean    = nn.Linear(feat_dim, cont_dim)
         self.cont_log_std = nn.Linear(feat_dim, cont_dim)
         # Discrete: one logit per button
         self.disc_head    = nn.Linear(feat_dim, disc_dim)
 
-        # Init: small gain for output layers (standard PPO recipe)
-        self.backbone.apply(lambda m: _init_weights(m, gain=math.sqrt(2)))
         _init_weights(self.cont_mean,    gain=0.01)
         _init_weights(self.cont_log_std, gain=0.01)
         _init_weights(self.disc_head,    gain=0.01)
 
     def forward(self, obs: torch.Tensor):
-        """obs : (B, 551)  →  cont_mean, cont_log_std, disc_logits"""
-        feats = self.backbone(obs)
+        """obs : (B, OBS_DIM)  →  cont_mean, cont_log_std, disc_logits"""
+        feats   = self.encoder(obs)
         mean    = self.cont_mean(feats)
         log_std = self.cont_log_std(feats).clamp(LOG_STD_MIN, LOG_STD_MAX)
         logits  = self.disc_head(feats)
@@ -109,7 +211,7 @@ class Policy(nn.Module):
 
         Parameters
         ----------
-        obs          : (B, 551) or (551,) — current observation(s)
+        obs          : (B, OBS_DIM) or (OBS_DIM,) — current observation(s)
         action_mask  : (B, 7) or (7,) bool tensor — True = action legal
         deterministic: bool — if True, use mode instead of sampling
 
@@ -204,7 +306,12 @@ class Policy(nn.Module):
 class CentralizedCritic(nn.Module):
     """
     Centralised value function.
-    Input  : concatenated observations of both alliance robots → (B, 1102)
+
+    v7: each robot's observation is independently encoded with goal attention
+    (using a critic-private ObsEncoder), then the two feature vectors are
+    concatenated and mapped to a scalar value through a small head MLP.
+
+    Input  : two observations (B, OBS_DIM) each
     Output : scalar value estimate → (B, 1)
     """
 
@@ -212,16 +319,29 @@ class CentralizedCritic(nn.Module):
         super().__init__()
         if hidden is None:
             hidden = CRITIC_HIDDEN
-        joint_dim = obs_dim * 2   # both robots
-        self.net = _mlp([joint_dim] + hidden + [1])
-        self.net.apply(lambda m: _init_weights(m, gain=math.sqrt(2)))
+
+        self.encoder = ObsEncoder(obs_dim=obs_dim, hidden=hidden)
+        feat_dim = self.encoder.feat_dim
+
+        # Joint head: takes 2× encoder output → 1
+        head_hidden = max(64, feat_dim // 2)
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim * 2, head_hidden),
+            nn.LayerNorm(head_hidden),
+            nn.ELU(),
+            nn.Linear(head_hidden, 1),
+        )
+
+        self.head.apply(lambda m: _init_weights(m, gain=math.sqrt(2)))
         # Last layer: small init for stable early value estimates
-        _init_weights(list(self.net.children())[-1], gain=1.0)
+        _init_weights(list(self.head.children())[-1], gain=1.0)
 
     def forward(self, obs1: torch.Tensor, obs2: torch.Tensor) -> torch.Tensor:
         """
-        obs1, obs2 : (B, 551) — observations of robot 0 and robot 1 (same alliance)
-        Returns    : (B, 1)   — value estimates
+        obs1, obs2 : (B, OBS_DIM) — observations of robot 0 and robot 1 (same alliance)
+        Returns    : (B, 1)       — value estimates
         """
-        joint = torch.cat([obs1, obs2], dim=-1)
-        return self.net(joint)
+        f1 = self.encoder(obs1)
+        f2 = self.encoder(obs2)
+        joint = torch.cat([f1, f2], dim=-1)
+        return self.head(joint)

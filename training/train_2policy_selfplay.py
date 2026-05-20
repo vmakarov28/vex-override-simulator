@@ -34,7 +34,7 @@ from config.hyperparameters import (
     ROLLOUT_STEPS, TOTAL_ENV_STEPS,
     CHECKPOINT_EVERY, EVAL_EVERY_UPDATES, EVAL_NUM_MATCHES,
     LOG_EVERY_UPDATES, RECORD_VIDEO,
-    MODELS_DIR, LOGS_DIR,
+    MODELS_DIR, LOGS_DIR, VIDEOS_DIR,
     CURRICULUM_STAGES, POOL_SAMPLE_PROB,
 )
 
@@ -159,9 +159,12 @@ def main():
         print("[Train] Starting from scratch.")
 
     log_file = os.path.join(LOGS_DIR, "train_log.txt")
+    comp_log_file = os.path.join(LOGS_DIR, "reward_components_log.txt")
     best_red_score = 0.0
     last_eval_stats = None
     accumulated_stats = {}
+    accumulated_components = {}      # v7: per-signal reward sums
+    n_component_rollouts = 0
 
     obs   = env.reset()
     masks = env.get_action_masks()
@@ -227,6 +230,12 @@ def main():
         for k, v in update_stats.items():
             accumulated_stats[k] = accumulated_stats.get(k, 0) + v
 
+        # v7: drain per-component reward sums for this rollout
+        for cname, cval in env.drain_reward_components().items():
+            accumulated_components[cname] = (
+                accumulated_components.get(cname, 0.0) + cval)
+        n_component_rollouts += 1
+
         # ── Logging ────────────────────────────────────────────────────────
         n_updates = trainer.total_updates
         if n_updates % LOG_EVERY_UPDATES == 0:
@@ -235,6 +244,21 @@ def main():
             log_stats(trainer.total_env_steps, avg_stats, last_eval_stats,
                       log_file)
             accumulated_stats = {}
+
+            # v7: per-component reward signal logging
+            if accumulated_components and n_component_rollouts > 0:
+                avg_comp = {k: v / float(n_component_rollouts)
+                            for k, v in accumulated_components.items()}
+                sorted_comp = sorted(avg_comp.items(),
+                                     key=lambda kv: abs(kv[1]),
+                                     reverse=True)
+                comp_line = f"Step {trainer.total_env_steps:,} | " + \
+                    " ".join(f"{k}={v:+.3f}" for k, v in sorted_comp)
+                print("[Rwd] " + comp_line)
+                with open(comp_log_file, "a") as f:
+                    f.write(comp_line + "\n")
+                accumulated_components = {}
+                n_component_rollouts   = 0
 
         # ── Checkpoint + pool ──────────────────────────────────────────────
         if n_updates % CHECKPOINT_EVERY == 0:
@@ -272,6 +296,22 @@ def main():
     print(f"\n[Train] Training complete in {elapsed/3600:.1f} h — "
           f"{trainer.total_env_steps:,} steps, {trainer.total_updates} updates.")
     env.close()
+
+    # v7: record one final full-match video using the trained policies.
+    try:
+        os.makedirs(VIDEOS_DIR, exist_ok=True)
+        from evaluation.evaluate import run_match_headless
+        final_video = os.path.join(VIDEOS_DIR, "final_result.mp4")
+        print(f"[Train] Recording final result video → {final_video}")
+        run_match_headless(
+            red_policy=trainer.red_policy,
+            blue_policy=trainer.blue_policy,
+            device=trainer.device,
+            record=True,
+            video_path=final_video,
+        )
+    except Exception as e:
+        print(f"[Train] Final-video recording failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":

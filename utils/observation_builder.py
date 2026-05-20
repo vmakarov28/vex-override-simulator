@@ -1,7 +1,7 @@
 """
 utils/observation_builder.py
 ────────────────────────────────────────────────────────────────────────────
-Builds the fixed-size 551-dimensional observation vector for one agent.
+Builds the fixed-size 554-dimensional observation vector for one agent.
 
 Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
   [  0: 24]  Self state
@@ -13,9 +13,17 @@ Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
   [209:409]  K-nearest pins (20 × 10 = 200)
   [409:514]  K-nearest cups (15 × 7 = 105)
   [514:534]  Toggles (4 × 5 = 20)
-  [534:551]  Global match state (17)
+  [534:554]  Global match state (20)
+               + v7: alliance-relative score delta, heading-velocity
+                     alignment, endgame urgency ramp
   ──────────
-  Total: 551
+  Total: 554
+
+v7 confirmed: time_remaining is already in this obs at index 534
+(obs[ptr + 0] = max(0.0, tr) / full), so robots CAN distinguish second 5
+from second 100.  The new endgame_urgency feature (index 553) gives an
+explicit 0→1 ramp inside the final ENDGAME_RAMP_SECONDS so the policy can
+easily latch onto last-second parking strategies.
 """
 
 import math
@@ -29,6 +37,7 @@ from config.game_rules import (
     ENDGAME_SECONDS, TOTAL_SECONDS, AUTONOMOUS_SECONDS,
     CENTER_GOAL_ID, ENDGAME_CENTER_MAX_STACK,
 )
+from config.hyperparameters import ENDGAME_RAMP_SECONDS
 from simulation.game_objects import (
     GamePin, GameCup, FieldGoal, FieldToggle,
     C_RED, C_BLUE, C_YELLOW,
@@ -44,7 +53,7 @@ MAX_ANG_VEL = 10.0
 K_PINS = 20   # nearest pins to encode
 K_CUPS = 15   # nearest cups to encode
 
-OBS_DIM = 551
+OBS_DIM = 554
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color → one-hot helper  (3 bits: [red, blue, yellow])
@@ -95,7 +104,7 @@ def build_observation(
     simulator,
 ) -> np.ndarray:
     """
-    Build the 551-dim observation vector for `robot`.
+    Build the 554-dim observation vector for `robot`.
 
     Parameters
     ----------
@@ -110,7 +119,7 @@ def build_observation(
 
     Returns
     -------
-    np.ndarray of shape (551,), dtype float32
+    np.ndarray of shape (554,), dtype float32
     """
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     ptr = 0
@@ -346,7 +355,7 @@ def build_observation(
         obs[ptr + 4] = 1.0 if tog.owner == opp else 0.0
         ptr += 5
 
-    # ── [534:551] Global match state (17) ────────────────────────────────────
+    # ── [534:554] Global match state (20) ────────────────────────────────────
     tr = float(simulator.time_remaining)
     te = float(simulator.time_elapsed)
     full = float(TOTAL_SECONDS)
@@ -374,7 +383,32 @@ def build_observation(
     time_to_endgame = max(0.0, drv_remaining - ENDGAME_SECONDS) / 105.0
     obs[ptr + 15] = time_to_endgame
     obs[ptr + 16] = 1.0 if simulator.timer_started else 0.0
-    ptr += 17
+
+    # ── v7 features (3) ─────────────────────────────────────────────────
+    # (a) Alliance-relative score delta in [-1, 1].  80-pt swing saturates.
+    my_score  = rules_engine.red_score  if robot.alliance == "red" else rules_engine.blue_score
+    opp_score = rules_engine.blue_score if robot.alliance == "red" else rules_engine.red_score
+    obs[ptr + 17] = max(-1.0, min(1.0, (my_score - opp_score) / 80.0))
+
+    # (b) Heading-vs-velocity cosine alignment for self in [-1, 1].
+    # Robots spinning in place have low |speed|, returning 0 here.  Robots
+    # driving forward along their heading return ~1; backing along heading: ~-1.
+    speed = math.hypot(rvx, rvy)
+    if speed > 1.0:
+        # heading unit vector
+        hx, hy = math.cos(ra), math.sin(ra)
+        obs[ptr + 18] = (rvx * hx + rvy * hy) / speed
+    else:
+        obs[ptr + 18] = 0.0
+
+    # (c) Endgame urgency ramp: 0 outside endgame; rises 0→1 linearly across
+    # the final ENDGAME_RAMP_SECONDS of the match.  Lets the policy condition
+    # on "park NOW" vs "park later" without inferring it from raw time_remaining.
+    if is_end and tr <= ENDGAME_RAMP_SECONDS:
+        obs[ptr + 19] = max(0.0, min(1.0, (ENDGAME_RAMP_SECONDS - tr) / ENDGAME_RAMP_SECONDS))
+    else:
+        obs[ptr + 19] = 0.0
+    ptr += 20
 
     assert ptr == OBS_DIM, f"Obs dim mismatch: {ptr} != {OBS_DIM}"
     return obs
@@ -383,7 +417,7 @@ def build_observation(
 def build_all_observations(simulator) -> dict:
     """
     Build observations for all four robots at once.
-    Returns {robot_id: np.ndarray(551,)} dict.
+    Returns {robot_id: np.ndarray(554,)} dict.
     """
     return {
         robot.robot_id: build_observation(

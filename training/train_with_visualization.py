@@ -41,6 +41,13 @@ NUM_ENVS = 16
 # Set to 0 to disable entirely once training is confirmed stable.
 DIAG_TIMING_UPDATES = 10
 
+# v7: during the first EARLY_VIS_STEPS env steps, record a video every
+# EARLY_VIS_INTERVAL updates (rather than args.vis_every).  Once past that
+# cutoff we revert to the normal cadence.  Catches early behavioural
+# regressions cheaply during the fast-learning phase.
+EARLY_VIS_INTERVAL = 100
+EARLY_VIS_STEPS    = 2_000_000
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
@@ -161,7 +168,10 @@ def main():
     blue_bufs = [RolloutBuffer(ROLLOUT_STEPS, device) for _ in range(NUM_ENVS)]
 
     log_file         = os.path.join(LOGS_DIR, "train_parallel_log.txt")
+    comp_log_file    = os.path.join(LOGS_DIR, "reward_components_log.txt")
     accumulated_stats: dict = {}
+    accumulated_components: dict = {}      # v7: per-signal reward sums
+    n_component_rollouts: int = 0          # rollouts contributing to that sum
     episode_red:  list = []
     episode_blue: list = []
 
@@ -218,6 +228,12 @@ def main():
                     episode_red.append(rs)
                     episode_blue.append(bs)
 
+                # v7: aggregate per-component reward sums across workers
+                for cname, cval in result.get("reward_components", {}).items():
+                    accumulated_components[cname] = (
+                        accumulated_components.get(cname, 0.0) + cval)
+            n_component_rollouts += NUM_ENVS
+
             trainer.total_env_steps += ROLLOUT_STEPS * NUM_ENVS
 
             _t2 = time.time()
@@ -260,9 +276,28 @@ def main():
                 print(msg)
                 with open(log_file, "a") as f:
                     f.write(msg + "\n")
-                accumulated_stats = {}
-                episode_red       = []
-                episode_blue      = []
+
+                # v7: per-component reward signal logging.  Each value is
+                # the *average reward delta per rollout* contributed by that
+                # signal across all 4 robots and ROLLOUT_STEPS steps.  Quick
+                # diagnostic for which signals are firing and at what magnitude.
+                if accumulated_components and n_component_rollouts > 0:
+                    avg_comp = {k: v / float(n_component_rollouts)
+                                for k, v in accumulated_components.items()}
+                    sorted_comp = sorted(avg_comp.items(),
+                                         key=lambda kv: abs(kv[1]),
+                                         reverse=True)
+                    comp_line = f"Step {trainer.total_env_steps:,} | " + \
+                        " ".join(f"{k}={v:+.3f}" for k, v in sorted_comp)
+                    print("[Rwd] " + comp_line)
+                    with open(comp_log_file, "a") as f:
+                        f.write(comp_line + "\n")
+
+                accumulated_stats      = {}
+                accumulated_components = {}
+                n_component_rollouts   = 0
+                episode_red            = []
+                episode_blue           = []
 
             # ── Checkpoint ────────────────────────────────────────────────────
             if n_up % CHECKPOINT_EVERY == 0 and n_up > 0:
@@ -271,7 +306,14 @@ def main():
                                           f"checkpoint_{n_up:06d}.pt"))
 
             # ── Visualization ─────────────────────────────────────────────────
-            if n_up % args.vis_every == 0 and n_up > 0:
+            # v7: adaptive cadence — during the first EARLY_VIS_STEPS env
+            # steps, record every EARLY_VIS_INTERVAL updates.  After that,
+            # fall back to args.vis_every.
+            if trainer.total_env_steps < EARLY_VIS_STEPS:
+                vis_period = EARLY_VIS_INTERVAL
+            else:
+                vis_period = args.vis_every
+            if n_up % vis_period == 0 and n_up > 0:
                 video_path = os.path.join(VIDEOS_DIR, f"vis_{n_up:06d}.mp4")
                 try:
                     run_rendered_match(trainer,
@@ -286,6 +328,16 @@ def main():
     trainer.save(os.path.join(MODELS_DIR, "final.pt"))
     print(f"\n[Train] Done. {trainer.total_env_steps:,} steps, "
           f"{trainer.total_updates} updates.")
+
+    # v7: record one final full-match video using the trained policies.
+    final_video = os.path.join(VIDEOS_DIR, "final_result.mp4")
+    print(f"[Train] Recording final result video → {final_video}")
+    try:
+        run_rendered_match(trainer,
+                           duration_secs=float(args.vis_duration),
+                           video_path=final_video)
+    except Exception as e:
+        print(f"[Train] Final-video recording failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":
