@@ -116,7 +116,7 @@ def build_observation(
     simulator,
 ) -> np.ndarray:
     """
-    Build the 564-dim observation vector for `robot`.
+    Build the 592-dim observation vector for `robot`.
 
     Parameters
     ----------
@@ -131,7 +131,7 @@ def build_observation(
 
     Returns
     -------
-    np.ndarray of shape (564,), dtype float32
+    np.ndarray of shape (592,), dtype float32
     """
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     ptr = 0
@@ -342,7 +342,7 @@ def build_observation(
             obs[ptr + 10] = min(pin_g_dists) / FIELD_DIAG if pin_g_dists else 0.0
         ptr += 11
 
-    # ── [409:514] K-nearest cups (15 × 7) ────────────────────────────────────
+    # ── [429:534] K-nearest cups (15 × 7) ────────────────────────────────────
     live_cups = [c for c in cups if not c.scored]
     live_cups.sort(key=lambda c: math.hypot(float(c.body.position.x) - rx,
                                              float(c.body.position.y) - ry))

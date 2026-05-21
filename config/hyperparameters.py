@@ -388,6 +388,26 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     FIX: POOL_SAMPLE_PROB 0.75 → 0.85 — historical opponents (including
     pre-collapse cycling policies) sampled more often, preventing the
     current-policy pair from settling into a mutual local optimum.
+
+  PROBLEM 65 (v9.1): INTAKE_CYCLE_TARGET = 30 (1.5 s) is physically impossible
+    on the 144×144-inch field.  After scoring at a goal, the nearest available
+    element is typically 40-80+ inches away; at max speed (~20 in/s) that is
+    2-4 seconds of travel = 40-80 steps.  At a realistic 60-step return:
+    cycle_ratio = max(0, 1 - 60/30) = 0 → the bonus NEVER fires.  The
+    entire intake_cycle_bonus signal is wasted at this setting.
+    FIX: INTAKE_CYCLE_TARGET 30 → 60 (3 s).  A robot returning in 30 s earns
+    50% of the bonus; in 60 s earns 0%.  This spans the realistic field-
+    geometry range and creates a meaningful gradient across all cycle times.
+
+  PROBLEM 66 (v9.1): TIME_TO_SCORE_TARGET = 20 == HOLDING_TIMEOUT_STEPS = 20.
+    The time_to_score bonus fades to 0 at exactly step 20, which is also
+    the first step the holding penalty starts (overshoot=0, penalty≈0).
+    There is NO step where both a positive bonus AND a positive penalty
+    overlap — the gradient has a cliff instead of a smooth handoff.
+    FIX: TIME_TO_SCORE_TARGET 20 → 30 (1.5 s).  Bonus fades from 10.0 at
+    step 0 to 0 at step 30.  Steps 20-30 are in an overlap zone where the
+    fading bonus and rising penalty both guide the robot — smooth continuous
+    gradient instead of abrupt cutoff.
 """
 
 # -------------------------------------------------------------------------
@@ -594,8 +614,10 @@ ALLY_SEPARATION_TARGET  = 45.0
 
 # Time-to-score: a robot that scores within TIME_TO_SCORE_TARGET steps of
 # picking up earns close-to-full bonus; longer carries fade to zero linearly.
-# v9: 35 -> 20 (1.0 s) — tighter cycle target to enforce fast scoring.
-TIME_TO_SCORE_TARGET    = 20
+# v9.1: 20 → 30 (1.5 s) — creates a bonus/penalty overlap zone (steps 20-30)
+# where the fading bonus and rising holding_penalty both fire, giving a smooth
+# gradient instead of the cliff that existed when target == timeout (both = 20).
+TIME_TO_SCORE_TARGET    = 30
 
 # Endgame midfield ramp: in the final ENDGAME_RAMP_SECONDS of the match the
 # midfield_endgame reward multiplier ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT.
@@ -612,8 +634,11 @@ PARK_WINDOW_SECONDS     = 3.0
 # Intake cycle bonus target: a robot that returns from its last score and
 # picks up the next element within this many steps earns the full bonus;
 # bonus scales to 0 at >= INTAKE_CYCLE_TARGET steps.
-# v9: 50 -> 30 (1.5 s) — tighter return-from-score target.
-INTAKE_CYCLE_TARGET     = 30
+# v9.1: 30 → 60 (3.0 s) — 30 was physically impossible; the nearest element
+# after scoring is typically 40-80 steps away at max speed.  60 spans the
+# realistic 2-4 s return range so the bonus gradient covers all achievable
+# cycle times.  At 30 steps return: +50% bonus.  At 60 steps: 0%.
+INTAKE_CYCLE_TARGET     = 60
 
 # -------------------------------------------------------------------------
 # v8: Cycle-efficiency / toggle-leave constants

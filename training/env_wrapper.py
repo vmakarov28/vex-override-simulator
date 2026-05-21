@@ -364,12 +364,18 @@ class OverrideEnv:
                 if diff >= WIN_MARGIN_THRESHOLD:
                     for rid in ["red1",  "red2"]:  rewards[rid] += wtb
                     for rid in ["blue1", "blue2"]: rewards[rid] -= wtb
+                    self._reward_components["win_threshold_bonus"] = (
+                        self._reward_components.get("win_threshold_bonus", 0.0) + wtb * 2
+                    )
             elif diff < 0:
                 for rid in ["blue1", "blue2"]: rewards[rid] += wt * (-diff / 80.0)
                 for rid in ["red1",  "red2"]:  rewards[rid] -= wt * (-diff / 80.0)
                 if -diff >= WIN_MARGIN_THRESHOLD:
                     for rid in ["blue1", "blue2"]: rewards[rid] += wtb
                     for rid in ["red1",  "red2"]:  rewards[rid] -= wtb
+                    self._reward_components["win_threshold_bonus"] = (
+                        self._reward_components.get("win_threshold_bonus", 0.0) + wtb * 2
+                    )
 
         info = {
             "red_score":   post_red,
@@ -406,6 +412,7 @@ class OverrideEnv:
         # boundary so we can attribute the delta to that section's signal.
         rc = self._reward_components
         _prev_total = 0.0
+        _pressure_bonus_total = 0.0  # v9.1: tracked separately after section 2
         def _track(name):
             nonlocal _prev_total
             cur = sum(rewards.values())
@@ -502,11 +509,21 @@ class OverrideEnv:
                     opp_ry = pre_positions[opp_id][1]
                     if math.hypot(rx_s - opp_rx, ry_s - opp_ry) < PINNING_CONTACT_DIST:
                         rewards[rid] += rw["score_under_pressure_bonus"]
+                        _pressure_bonus_total += rw["score_under_pressure_bonus"]
                         break  # one bonus per score regardless of # of pinners
 
         for r in self.sim.robots:
             self._prev_scores[r.robot_id] = r.successful_scores
         _track("intake_drop_and_time_to_score")
+        # Reclassify pressure bonus into its own diagnostic bucket so it's
+        # visible separately from time_to_score_bonus in [Rwd] logs.
+        if _pressure_bonus_total > 0.0:
+            rc["intake_drop_and_time_to_score"] = (
+                rc.get("intake_drop_and_time_to_score", 0.0) - _pressure_bonus_total
+            )
+            rc["score_under_pressure"] = (
+                rc.get("score_under_pressure", 0.0) + _pressure_bonus_total
+            )
 
         # 3. Carrying proximity reward — only when a legal score exists at a nearby goal.
         # A robot holding the wrong element for every reachable goal earns nothing here,
