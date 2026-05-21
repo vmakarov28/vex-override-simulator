@@ -1,5 +1,5 @@
 """
-config/hyperparameters.py  (v8)
+config/hyperparameters.py  (v9)
 =================================
 REWARD REDESIGN v7
 ------------------
@@ -308,12 +308,64 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     could cause the evaluation policy to over-value parking vs. scoring.
     FIX: Added `tr <= PARK_WINDOW_SECONDS` gate to PettingZoo wrapper
     section 12, matching training/env_wrapper.py v8.2 behaviour exactly.
+
+  PROBLEM 57 (v9): Drop-cycle exploit at 16 M steps.
+    With drop_penalty=-1.0 and intake_success=+0.8, robots learned to
+    pick up an element and drop it every ~35 steps rather than carry it to
+    a goal.  Net cycle cost: +0.8 - 1.0 = -0.2/cycle, far cheaper than the
+    holding_timeout penalty ramp for stationary robots.  Additionally, the
+    holding_timeout penalty fired on ANY carrier regardless of speed, so
+    actively moving carriers were also penalized, discouraging carries.
+    FIX 1: drop_penalty -1.0 → -2.0 (closes drop-cycle loop: +0.8 - 2.0 = -1.2).
+    FIX 2: holding_timeout now speed-gated — only fires when robot speed
+    < IDLE_SPEED_THRESHOLD.  Actively moving carriers are exempt; the penalty
+    exclusively targets stationary/parked holds.
+
+  PROBLEM 58 (v9): Pinning exploit never self-corrected (25× escalation).
+    pinning_violation=-0.8 was ~11× weaker than score_delta=7.0.  A pinning
+    robot could deny 1 score per 8.75 steps of pinning and still come out
+    ahead.  Log shows pinning_violation went from -8.6 at 81k steps to
+    -205 at 13 M steps, never reversing.
+    FIX: pinning_violation -0.8 → -4.0 (5× increase).  A pinning robot
+    now has to deny >1 score per 1.75 steps to break even — not feasible.
+    Also: PINNING_STEPS_LIMIT 60 → 40 (2 s threshold instead of 3 s).
+
+  PROBLEM 59 (v9): No absolute own-score signal — score_delta (my − opp)
+    cancels to near-zero in symmetric self-play, giving no unambiguous
+    "put points on the board" gradient.
+    FIX: own_score_abs = 5.0 fires on my alliance's score increase alone
+    (unconditional, same direction for both robots on the scoring team).
+
+  PROBLEM 60 (v9): No reward for scoring while under defensive pressure.
+    Robots near goals would retreat when an opponent approached rather than
+    completing the score — defensive harassment trivially stopped scoring.
+    FIX: score_under_pressure = 5.0 one-time bonus at score moment when any
+    opponent is within PINNING_CONTACT_DIST.  Also: win_threshold_bonus = 10.0
+    fires once when lead first crosses +15 pts, giving a clear "win state"
+    signal not present in step-level score_delta.
+
+  PROBLEM 61 (v9): SC5b violation — center goal yellow halves scored live
+    via toggle ownership.  Per the VEX Override manual, yellow halves placed
+    in the center (midfield) goal are NOT owned by toggles; ownership is
+    decided at match end by midfield robot majority (strict majority wins
+    them all, ties leave them unclaimed at 0 pts).  The previous code
+    awarded toggle-based yellow points for the center goal LIVE, leading
+    to videos where both alliances banked yellow points in the center goal
+    during play despite neither having midfield majority.  Regular red/blue
+    halves in the center goal are unaffected — they continue to score live.
+    FIX (game scoring):  FieldGoal.get_score now zeroes center-goal yellow
+    halves when midfield_majority is None (live) or "tie".  RulesEngine
+    .calculate_final_score recounts robots in the Midfield at the exact
+    match-end instant and applies the SC5b majority (or "tie" → 0).
+    FIX (reward shaping):  env_wrapper section 10 skips center-goal yellow
+    halves at placement; the count is tallied and paid out in the terminal
+    block based on the same midfield-majority rule.
 """
 
 # -------------------------------------------------------------------------
 # OBSERVATION / ACTION SPACE
 # -------------------------------------------------------------------------
-OBS_DIM     = 588   # v8.3: 564 base + 20 (per-pin goal dist) + 4 (v8.2 block: speed, tm_carry, opp speeds)
+OBS_DIM     = 592   # v9: 588 base + 4 (v9 pressure features: in_scoring_range, being_pinned_frac, score_lead_tight, dist_to_nearest_scorable)
 ACTION_CONT = 2
 ACTION_DISC = 7
 
@@ -354,7 +406,7 @@ NUM_PARALLEL_ENVS = 32
 ROLLOUT_STEPS     = 512
 MINIBATCH_SIZE    = 256
 PPO_EPOCHS        = 10
-TOTAL_ENV_STEPS   = 24_000_000   # ~15 h at 16 envs × 512 steps/update, 19 s/update
+TOTAL_ENV_STEPS   = 200_000      # v9 smoke test (set to 24_000_000 for full run)
 
 # -------------------------------------------------------------------------
 # NETWORK ARCHITECTURE
@@ -392,7 +444,8 @@ REWARD_WEIGHTS = {
     "win_terminal":           10.0,   # x (score_diff / 80)
 
     # --- Step-level score signal -----------------------------------------
-    "score_delta":             7.0,   # (my_delta - opp_delta) per step
+    "score_delta":             3.5,   # (my_delta - opp_delta) per step — v9: 7.0→3.5 to reduce symmetric cancellation
+    "own_score_abs":           5.0,   # v9: unconditional own-alliance score increase (always positive gradient)
 
     # --- Causal scoring events -------------------------------------------
     "score_own_pin":          15.0,
@@ -424,14 +477,14 @@ REWARD_WEIGHTS = {
 
     # --- Object interaction ----------------------------------------------
     "intake_success":          0.8,
-    "drop_penalty":           -1.0,   # v8.2: -0.5 -> -1.0 to close drop+recarry exploit (PROBLEM 50)
+    "drop_penalty":           -2.0,   # v9: -1.0 → -2.0 to close drop-cycle exploit (PROBLEM 57); +0.8-2.0=-1.2 net
 
     # --- Penalties -------------------------------------------------------
     "holding_penalty_rate":   -0.20,   # grows to this after HOLDING_RAMP_STEPS
     "flip_penalty":           -0.15,   # small cost per flip; only flip when pin/cup color justifies it
     "idle_penalty":           -0.05,
     "start_zone_penalty":     -0.05,
-    "pinning_violation":      -0.8,
+    "pinning_violation":      -4.0,   # v9: -0.8 → -4.0 (5×) to make pinning unprofitable vs score_delta (PROBLEM 58)
     "wrong_element_loiter":   -0.15,   # per-step: carrying wrong element within scoring radius of goal
     "spin_penalty":           -0.10,   # per-step: high angular velocity + low translational speed
     "toggle_camping":         -0.15,   # per-step: loitering near a toggle your alliance already owns
@@ -451,6 +504,10 @@ REWARD_WEIGHTS = {
     "defensive_position_bonus":  0.05,   # per-step: empty-handed robot between a carrying enemy and their nearest scorable goal
     "yellow_approach_unowned":   0.03,   # yellow_approach scale when alliance doesn't yet own a toggle (encourages flip-first strategy)
 
+    # --- v9: Anti-hijack / pressure-scoring rewards ----------------------
+    "score_under_pressure":      5.0,    # one-time at score moment when any opponent is within PINNING_CONTACT_DIST
+    "win_threshold_bonus":      10.0,    # one-time when lead first crosses +15 pts
+
     # --- Endgame ---------------------------------------------------------
     "midfield_endgame":        1.0,    # per-step reward; only fires in final PARK_WINDOW_SECONDS (3 s); no ramp
 }
@@ -465,7 +522,7 @@ HOLDING_RAMP_STEPS    = 60     # one "ramp unit" for the quadratic formula
 # Engages at overshoot = 3 × HOLDING_RAMP_STEPS = 180 steps (~9 s of carry).
 HOLDING_RAMP_SQ_CAP   = 9.0
 
-PINNING_STEPS_LIMIT   = 60     # 3 seconds at 20 Hz
+PINNING_STEPS_LIMIT   = 40     # v9: 3 s → 2 s at 20 Hz (tighter limit alongside 5× penalty increase)
 PINNING_CONTACT_DIST  = 22.0   # inches (robot width + margin)
 
 START_ZONE_RADIUS     = 20.0   # inches from spawn point
@@ -504,7 +561,7 @@ ALLY_SEPARATION_TARGET  = 45.0
 # Time-to-score: a robot that scores within TIME_TO_SCORE_TARGET steps of
 # picking up earns close-to-full bonus; longer carries fade to zero linearly.
 # 35 steps at 20 Hz = 1.75 seconds of carrying.
-TIME_TO_SCORE_TARGET    = 35
+TIME_TO_SCORE_TARGET    = 30     # v9: 35→30 steps (1.5 s); tighter fast-cycle window
 
 # Endgame midfield ramp: in the final ENDGAME_RAMP_SECONDS of the match the
 # midfield_endgame reward multiplier ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT.
@@ -521,7 +578,7 @@ PARK_WINDOW_SECONDS     = 3.0
 # Intake cycle bonus target: a robot that returns from its last score and
 # picks up the next element within this many steps earns the full bonus;
 # bonus scales to 0 at >= INTAKE_CYCLE_TARGET steps.  50 steps = 2.5 s.
-INTAKE_CYCLE_TARGET     = 50
+INTAKE_CYCLE_TARGET     = 60     # v9: 50→60 steps (3 s window); easier for robots to earn full cycle bonus
 
 # -------------------------------------------------------------------------
 # v8: Cycle-efficiency / toggle-leave constants

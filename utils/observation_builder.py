@@ -1,7 +1,7 @@
 """
 utils/observation_builder.py
 ────────────────────────────────────────────────────────────────────────────
-Builds the fixed-size 588-dimensional observation vector for one agent.
+Builds the fixed-size 592-dimensional observation vector for one agent.
 
 Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
   [  0: 24]  Self state
@@ -24,8 +24,13 @@ Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
                - teammate carry_steps / TIME_TO_SCORE_TARGET (1)
                - opp1 speed magnitude / MAX_SPEED (1)
                - opp2 speed magnitude / MAX_SPEED (1)
+  [588:592]  v9 pressure features (4)
+               - in_scoring_range: 1 if within SCORING_RADIUS of a legal scorable goal while carrying (1)
+               - being_pinned_frac: opponents within PINNING_CONTACT_DIST / 2.0 (1)
+               - score_lead_tight: (my - opp) / 15.0 clamped [-1, 1] (1)
+               - dist_to_nearest_scorable_goal / FIELD_DIAG; 1.0 if not carrying (1)
   ──────────
-  Total: 588
+  Total: 592
 """
 
 import math
@@ -42,6 +47,7 @@ from config.game_rules import (
 from config.hyperparameters import (
     ENDGAME_RAMP_SECONDS, TIME_TO_SCORE_TARGET,
     HOLDING_TIMEOUT_STEPS, HOLDING_RAMP_STEPS,
+    PINNING_CONTACT_DIST,
 )
 from simulation.game_objects import (
     GamePin, GameCup, FieldGoal, FieldToggle,
@@ -58,7 +64,7 @@ MAX_ANG_VEL = 10.0
 K_PINS = 20   # nearest pins to encode
 K_CUPS = 15   # nearest cups to encode
 
-OBS_DIM = 588
+OBS_DIM = 592
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color → one-hot helper  (3 bits: [red, blue, yellow])
@@ -494,6 +500,48 @@ def build_observation(
         ovx_ = float(opp.body.velocity.x)
         ovy_ = float(opp.body.velocity.y)
         obs[ptr + 2 + i] = min(1.0, math.hypot(ovx_, ovy_) / MAX_SPEED)
+    ptr += 4
+
+    # ── v9 pressure features (4) ─────────────────────────────────────────────
+    # (a) in_scoring_range: 1 if within SCORING_RADIUS of a legal scorable goal while carrying
+    in_range = 0.0
+    if robot.carrying_pin is not None or robot.carrying_cup is not None:
+        for g in goals:
+            if g.alliance not in ("neutral", robot.alliance):
+                continue
+            top_is_pin = bool(g.stack) and bool(g.stack[-1][1])
+            can_pin = robot.carrying_pin is not None and not top_is_pin
+            can_cup = robot.carrying_cup is not None and top_is_pin
+            if (can_pin or can_cup) and math.hypot(rx - g.x, ry - g.y) <= SCORING_RADIUS:
+                in_range = 1.0
+                break
+    obs[ptr + 0] = in_range
+
+    # (b) being_pinned_frac: opponents within PINNING_CONTACT_DIST / 2.0
+    n_pinners = sum(
+        1 for opp in opponents
+        if math.hypot(float(opp.body.position.x) - rx,
+                      float(opp.body.position.y) - ry) < PINNING_CONTACT_DIST
+    )
+    obs[ptr + 1] = min(1.0, n_pinners / 2.0)
+
+    # (c) score_lead_tight: (my - opp) / 15.0 clamped [-1, 1]
+    obs[ptr + 2] = max(-1.0, min(1.0, (my_score - opp_score) / 15.0))
+
+    # (d) dist_to_nearest_scorable_goal / FIELD_DIAG (1.0 if not carrying)
+    best_sd = None
+    if robot.carrying_pin is not None or robot.carrying_cup is not None:
+        for g in goals:
+            if g.alliance not in ("neutral", robot.alliance):
+                continue
+            top_is_pin = bool(g.stack) and bool(g.stack[-1][1])
+            can_pin = robot.carrying_pin is not None and not top_is_pin
+            can_cup = robot.carrying_cup is not None and top_is_pin
+            if can_pin or can_cup:
+                d = math.hypot(rx - g.x, ry - g.y)
+                if best_sd is None or d < best_sd:
+                    best_sd = d
+    obs[ptr + 3] = (best_sd / FIELD_DIAG) if best_sd is not None else 1.0
     ptr += 4
 
     assert ptr == OBS_DIM, f"Obs dim mismatch: {ptr} != {OBS_DIM}"

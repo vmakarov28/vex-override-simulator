@@ -182,32 +182,51 @@ class RulesEngine:
     # ── Final score (match end) ───────────────────────────────────────
     def calculate_final_score(self, goals: list, toggles: list,
                               robots: list) -> Dict:
-        """Freeze the final score.
+        """Freeze the final score, applying SC5b at the end-of-match instant.
 
-        At match end we apply SC5b: yellow pins in the center goal are
-        owned by whichever alliance has STRICTLY more robots in the Midfield.
-        This is done as a one-time adjustment on top of the already-computed
-        toggle-based score, so it can't cause live swings.
+        SC5b — Center goal yellow halves:
+          During live play the center goal's yellow halves contribute 0
+          (see FieldGoal.get_score with midfield_majority=None).  Here, at
+          match end, we count robots inside the Midfield right now and:
+            - strict majority → all visible yellow halves in the center
+              goal score 10 pts each to that alliance
+            - tie  (0-0, 1-1, 2-2) → yellow halves remain 0 (unclaimed)
+          Regular red/blue halves in the center goal were already scored
+          live and are not affected.
         """
-        # The live score already includes: goal stacks + parking bonus.
-        # Apply SC5b adjustment for center goal yellow pins.
+        # Recount robots in midfield at the exact moment the match ends.
+        # We do NOT rely on self.midfield_*_count because those are reset to
+        # 0 outside the endgame window in recompute_all_scores; reading them
+        # here would misclassify the majority if the endgame flag was not
+        # active on the final frame.
+        self._update_midfield_counts(robots)
+        r_count = self.midfield_red_count
+        b_count = self.midfield_blue_count
+        if r_count > b_count:
+            majority = "red"
+        elif b_count > r_count:
+            majority = "blue"
+        else:
+            majority = "tie"
+
+        # Recompute the center goal score using the SC5b majority, regardless
+        # of whether the live score already had yellows credited (it shouldn't,
+        # since live yellows are deferred — but recomputing is the canonical
+        # source of truth).
         center_goal = next((g for g in goals if g.goal_id == CENTER_GOAL_ID), None)
         if center_goal:
-            r_count = self.midfield_red_count
-            b_count = self.midfield_blue_count
-            if r_count != b_count:
-                majority = "red" if r_count > b_count else "blue"
-                # Recompute center goal score with SC5b majority
-                old_r = center_goal.red_score
-                old_b = center_goal.blue_score
-                center_goal.get_score(toggles, midfield_majority=majority)
-                # Replace the toggle-based center goal score with SC5b score
-                self.red_score  += center_goal.red_score  - old_r
-                self.blue_score += center_goal.blue_score - old_b
+            old_r = center_goal.red_score
+            old_b = center_goal.blue_score
+            center_goal.get_score(toggles, midfield_majority=majority)
+            self.red_score  += center_goal.red_score  - old_r
+            self.blue_score += center_goal.blue_score - old_b
 
         return {
             "red":  self.red_score,
             "blue": self.blue_score,
             "winner": "red"  if self.red_score  > self.blue_score else
                       "blue" if self.blue_score > self.red_score  else "tie",
+            "midfield_majority":    majority,
+            "midfield_red_count":   r_count,
+            "midfield_blue_count":  b_count,
         }

@@ -1,5 +1,5 @@
 """
-training/env_wrapper.py  (v8.3)
+training/env_wrapper.py  (v9)
 ==========================================================================
 Reward shaping history:
   v4 — Holding ramp, anti-reward-hacking baseline
@@ -26,6 +26,14 @@ Reward shaping history:
         intake_cycle_bonus (1.5 one-time at pickup based on return speed
         from last score; drop-exploit guarded).  +20 per-pin obs dims,
         +4 movement-intelligence obs dims (588-dim total).
+  v9   — Drop-cycle exploit fix: drop_penalty -1.0→-2.0; holding_timeout
+        speed-gated (only fires when robot speed < IDLE_SPEED_THRESHOLD,
+        exempting actively-moving carriers).  Pinning: penalty -0.8→-4.0,
+        PINNING_STEPS_LIMIT 60→40.  New rewards: own_score_abs (absolute
+        own-alliance scoring), score_under_pressure (scoring while being
+        contested), win_threshold_bonus (one-time +15-pt lead crossing).
+        +4 obs dims (592-dim total): in_scoring_range, being_pinned_frac,
+        score_lead_tight, dist_to_nearest_scorable.
 """
 
 import math
@@ -54,7 +62,7 @@ from config.hyperparameters import (
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
     AUTONOMOUS_SECONDS, MIDFIELD_HALF, ROBOT_STARTS,
-    ROBOT_MAX_SPEED,
+    ROBOT_MAX_SPEED, CENTER_GOAL_ID,
 )
 from simulation.game_objects import C_RED, C_BLUE, C_YELLOW
 from training.rnd import RNDModule
@@ -109,6 +117,11 @@ class OverrideEnv:
         # per-signal logging.
         self._reward_components: Dict[str, float]   = {}
 
+        # v9 SC5b: visible yellow halves placed in the CENTER goal this episode.
+        # Live reward is suppressed; payout occurs in the terminal block
+        # based on midfield robot majority at match end.
+        self._pending_center_yellow_halves: int = 0
+
         # v8: toggle grace tracker — {toggle_id: steps_remaining} so camping
         # penalty doesn't fire immediately after a successful flip.
         self._toggle_grace: Dict[int, int] = {}
@@ -130,6 +143,7 @@ class OverrideEnv:
         self._prev_scores        = {rid: 0 for rid in AGENT_IDS}
         self._steps_since_last_score = {rid: MAX_EPISODE_STEPS + 1 for rid in AGENT_IDS}
         self._last_drop_step         = {rid: -1 for rid in AGENT_IDS}
+        self._pending_center_yellow_halves = 0  # v9 SC5b deferred-yellow counter
         # NOTE: do NOT clear self._reward_components here.  Per-component
         # sums persist across episodes within a rollout so the training loop
         # can drain them once per update cycle for logging.
@@ -351,6 +365,30 @@ class OverrideEnv:
         done = self.sim.match_over or self._step_count >= MAX_EPISODE_STEPS
 
         if done:
+            # v9 SC5b: deferred payout for yellow halves placed in the center
+            # goal.  Count robots in the Midfield right now; alliance with
+            # strict majority claims all visible yellow halves; ties (0-0,
+            # 1-1, 2-2) leave them unclaimed.  Use the same shaping weight
+            # the live non-center yellow path uses so reward magnitude is
+            # comparable across goal types.
+            n_yellow = self._pending_center_yellow_halves
+            if n_yellow > 0:
+                rc_mid = sum(1 for r in self.sim.robots
+                             if r.alliance == "red" and
+                             self.sim.rules_engine.is_robot_in_midfield(r))
+                bc_mid = sum(1 for r in self.sim.robots
+                             if r.alliance == "blue" and
+                             self.sim.rules_engine.is_robot_in_midfield(r))
+                yval = REWARD_WEIGHTS["score_yellow_owned"] * n_yellow
+                if rc_mid > bc_mid:
+                    for rid in ["red1",  "red2"]: rewards[rid] += yval
+                    for rid in ["blue1", "blue2"]: rewards[rid] += REWARD_WEIGHTS["score_opp_half"] * n_yellow
+                elif bc_mid > rc_mid:
+                    for rid in ["blue1", "blue2"]: rewards[rid] += yval
+                    for rid in ["red1",  "red2"]: rewards[rid] += REWARD_WEIGHTS["score_opp_half"] * n_yellow
+                # tie → 0 reward (yellows unclaimed)
+            self._pending_center_yellow_halves = 0
+
             diff = post_red - post_blue
             wt   = REWARD_WEIGHTS["win_terminal"]
             if diff > 0:
@@ -412,6 +450,25 @@ class OverrideEnv:
         rc["score_delta_red"]  = rc.get("score_delta_red",  0.0) + rw["score_delta"] * (red_delta  - blue_delta) * 2
         rc["score_delta_blue"] = rc.get("score_delta_blue", 0.0) + rw["score_delta"] * (blue_delta - red_delta)  * 2
 
+        # 1b. Absolute own-score reward (v9) — unconditional own-alliance score
+        # increase signal so there is always a positive gradient for "put points on
+        # the board", regardless of opponent score and self-play symmetry.
+        for rid in ["red1",  "red2"]:  rewards[rid] += rw["own_score_abs"] * red_delta
+        for rid in ["blue1", "blue2"]: rewards[rid] += rw["own_score_abs"] * blue_delta
+        _track("own_score_abs")
+
+        # 1c. Win-threshold bonus (v9): one-time reward when lead first crosses +15 pts.
+        # Gives the policy a discrete "win state" target beyond incremental score_delta.
+        pre_r_lead  = pre_red  - pre_blue
+        post_r_lead = post_red - post_blue
+        if post_r_lead >= 15 and pre_r_lead < 15:
+            for rid in ["red1", "red2"]:  rewards[rid] += rw["win_threshold_bonus"]
+        pre_b_lead  = pre_blue  - pre_red
+        post_b_lead = post_blue - post_red
+        if post_b_lead >= 15 and pre_b_lead < 15:
+            for rid in ["blue1", "blue2"]: rewards[rid] += rw["win_threshold_bonus"]
+        _track("win_threshold")
+
         # 2. Intake / drop  (+ v7 time-to-score bonus, v8.1 resource denial,
         #                    v8.3 intake_cycle_bonus)
         # v8.1 FIX: time_to_score_bonus reads from pre_carry_steps, NOT
@@ -467,6 +524,17 @@ class OverrideEnv:
                 rewards[rid] += rw["time_to_score_bonus"] * ratio
                 # v8.3: reset cycle counter so next intake measures return speed
                 self._steps_since_last_score[rid] = 0
+                # v9: score-under-pressure bonus — reward scoring while being contested
+                srx = float(robot_map[rid].body.position.x)
+                sry = float(robot_map[rid].body.position.y)
+                under_pressure = any(
+                    robot_map[oid].alliance != robot_map[rid].alliance and
+                    math.hypot(float(robot_map[oid].body.position.x) - srx,
+                               float(robot_map[oid].body.position.y) - sry) < PINNING_CONTACT_DIST
+                    for oid in AGENT_IDS
+                )
+                if under_pressure:
+                    rewards[rid] += rw["score_under_pressure"]
 
         for r in self.sim.robots:
             self._prev_scores[r.robot_id] = r.successful_scores
@@ -659,17 +727,21 @@ class OverrideEnv:
         _track("score_attempt")
 
         # 5. Holding timeout penalty — quadratic ramp after HOLDING_TIMEOUT_STEPS.
-        # Quadratic means each extra HOLDING_RAMP_STEPS of overshoot squares the cost,
-        # making prolonged carrying catastrophic rather than merely annoying.
-        # Cap at HOLDING_RAMP_SQ_CAP (9.0) → max -1.8/step to prevent gradient spikes
-        # for robots stuck in a carry loop (PROBLEM 47).
+        # v9: Speed-gated — only fires when robot speed < IDLE_SPEED_THRESHOLD.
+        # Actively-moving carriers are exempt; the penalty exclusively targets
+        # stationary/parked carries.  Fixes the drop-cycle exploit where moving
+        # carriers were penalised identically to parked ones, making dropping
+        # cheaper than continuing to the goal (PROBLEM 57).
         for rid in AGENT_IDS:
             cs = self._carry_steps[rid]
             if cs > HOLDING_TIMEOUT_STEPS:
-                overshoot = cs - HOLDING_TIMEOUT_STEPS
-                ratio     = min((overshoot / HOLDING_RAMP_STEPS) ** 2,
-                                HOLDING_RAMP_SQ_CAP)
-                rewards[rid] += rw["holding_penalty_rate"] * ratio
+                r   = robot_map[rid]
+                spd = math.hypot(float(r.body.velocity.x), float(r.body.velocity.y))
+                if spd < IDLE_SPEED_THRESHOLD:
+                    overshoot = cs - HOLDING_TIMEOUT_STEPS
+                    ratio     = min((overshoot / HOLDING_RAMP_STEPS) ** 2,
+                                    HOLDING_RAMP_SQ_CAP)
+                    rewards[rid] += rw["holding_penalty_rate"] * ratio
         _track("holding_timeout")
 
         # 6. Empty-hand approach delta
@@ -757,6 +829,7 @@ class OverrideEnv:
                     down_vis = _eff_clear_up(prev_obj) if not prev_is_pin else True
 
                 towner = _get_toggle_for_goal(goal, list(self.sim.toggles))
+                is_center_goal = (goal.goal_id == CENTER_GOAL_ID)
 
                 for visible, col in ((up_vis, new_obj.get_up_color()),
                                      (down_vis, new_obj.get_down_color())):
@@ -769,9 +842,15 @@ class OverrideEnv:
                         r_val = rw["score_opp_half"] if scorer_alliance == "red" else rw["score_own_pin"]
                         b_val = rw["score_own_pin"] if scorer_alliance == "blue" else rw["score_opp_half"]
                     elif col == C_YELLOW:
-                        # Yellow reward belongs to whichever alliance owns the toggle,
-                        # regardless of who placed the pin.  The opposing alliance
-                        # effectively gifted points, so they receive score_opp_half.
+                        # SC5b: yellow halves placed in the CENTER goal do not
+                        # award live reward — their ownership is decided by
+                        # midfield robot majority at match end.  Track the
+                        # visible half count for deferred payout in the
+                        # terminal block below; skip the live reward here.
+                        if is_center_goal:
+                            self._pending_center_yellow_halves += 1
+                            continue
+                        # Non-center yellow: toggle-based reward (live).
                         if towner == "red":
                             r_val = rw["score_yellow_owned"]
                             b_val = rw["score_opp_half"]
@@ -1020,9 +1099,14 @@ class OverrideEnv:
                     self.rnd.update(obs_t.unsqueeze(0))
             _track("rnd_intrinsic")
 
-        # Diagnostic: average carry steps across robots (tracks cycle speed improvement)
-        rc["avg_carry_steps"] = rc.get("avg_carry_steps", 0.0) + (
-            sum(self._carry_steps.values()) / len(AGENT_IDS)
+        # Diagnostic: fraction of robots currently over the holding timeout.
+        # 0 = all robots scoring fast; 1 = every robot is timed out.
+        # Reported as per-rollout average (same units as other signals after
+        # the training loop divides by n_component_rollouts).
+        n_over = sum(1 for cs in self._carry_steps.values()
+                     if cs > HOLDING_TIMEOUT_STEPS)
+        rc["frac_over_timeout"] = rc.get("frac_over_timeout", 0.0) + (
+            n_over / float(len(AGENT_IDS))
         )
 
         return rewards
