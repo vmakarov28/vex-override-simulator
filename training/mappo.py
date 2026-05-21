@@ -243,14 +243,23 @@ class MAPPOTrainer:
         self.red_critic  = CentralizedCritic().to(device)
         self.blue_critic = CentralizedCritic().to(device)
 
-        self.red_optimizer = optim.Adam(
-            list(self.red_policy.parameters()) +
-            list(self.red_critic.parameters()),
-            lr=LEARNING_RATE, eps=1e-5)
-        self.blue_optimizer = optim.Adam(
-            list(self.blue_policy.parameters()) +
-            list(self.blue_critic.parameters()),
-            lr=LEARNING_RATE, eps=1e-5)
+        # Separate optimizers for policy (LEARNING_RATE) and critic (CRITIC_LR).
+        # A higher critic LR drives faster value-function convergence, which
+        # improves advantage estimates and stabilises the policy update —
+        # especially important in the early phase when value estimates are noisy.
+        self.red_policy_optimizer  = optim.Adam(
+            self.red_policy.parameters(),  lr=LEARNING_RATE, eps=1e-5)
+        self.red_critic_optimizer  = optim.Adam(
+            self.red_critic.parameters(),  lr=CRITIC_LR,     eps=1e-5)
+        self.blue_policy_optimizer = optim.Adam(
+            self.blue_policy.parameters(), lr=LEARNING_RATE, eps=1e-5)
+        self.blue_critic_optimizer = optim.Adam(
+            self.blue_critic.parameters(), lr=CRITIC_LR,     eps=1e-5)
+
+        # Legacy alias kept for code that passes a single optimizer reference
+        # to _run_ppo_epochs; will be removed once call sites are updated.
+        self.red_optimizer  = self.red_policy_optimizer
+        self.blue_optimizer = self.blue_policy_optimizer
 
         self.red_buf  = RolloutBuffer(ROLLOUT_STEPS, device)
         self.blue_buf = RolloutBuffer(ROLLOUT_STEPS, device)
@@ -392,12 +401,20 @@ class MAPPOTrainer:
         buf: RolloutBuffer,
         policy: Policy,
         critic: CentralizedCritic,
-        optimizer: optim.Optimizer,
+        policy_optimizer: optim.Optimizer,
+        critic_optimizer: optim.Optimizer,
         ent_coef: float,
         stats: Dict,
         prefix: str,
     ):
-        """Run PPO_EPOCHS update passes on a pre-filled buffer. Mutates stats."""
+        """Run PPO_EPOCHS update passes on a pre-filled buffer. Mutates stats.
+
+        Policy and critic are updated with separate optimizers (PROBLEM 48):
+          policy_optimizer uses LEARNING_RATE (2.5e-4) — conservative updates.
+          critic_optimizer uses CRITIC_LR     (8e-4)   — faster value convergence.
+        Gradients are clipped independently so a large value-loss spike can't
+        corrupt the policy parameters.
+        """
         p_losses, v_losses, entropies = [], [], []
 
         for _ in range(PPO_EPOCHS):
@@ -427,31 +444,32 @@ class MAPPOTrainer:
                 ratio = (lp_new - lp_old).exp()
                 clip  = ratio.clamp(1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
 
-                policy_loss = -torch.min(
-                    ratio * adv_mb, clip * adv_mb).mean()
+                # KL regularization to prevent policy collapse
+                kl_loss = 0.5 * ((lp_old - lp_new).pow(2)).mean()
 
+                policy_loss = (-torch.min(ratio * adv_mb, clip * adv_mb).mean()
+                               - ent_coef * entropy.mean()
+                               + 0.01 * kl_loss)
+
+                # ── Policy update ─────────────────────────────────────────
+                policy_optimizer.zero_grad()
+                policy_loss.backward()
+                nn.utils.clip_grad_norm_(policy.parameters(), MAX_GRAD_NORM)
+                policy_optimizer.step()
+
+                # ── Critic update (independent pass) ─────────────────────
                 values_mb = critic(obs0_mb, obs1_mb).squeeze(-1)
                 old_vals  = buf.value[mb_idx]
                 v_clipped = old_vals + (values_mb - old_vals).clamp(
                     -CLIP_EPS, CLIP_EPS)
-                v_loss = torch.max(
+                v_loss = (VALUE_LOSS_COEF * torch.max(
                     (values_mb - ret_mb).pow(2),
-                    (v_clipped  - ret_mb).pow(2)).mean()
+                    (v_clipped  - ret_mb).pow(2)).mean())
 
-                # KL regularization to prevent policy collapse
-                kl_loss = 0.5 * ((lp_old - lp_new).pow(2)).mean()
-
-                loss = (policy_loss
-                        + VALUE_LOSS_COEF * v_loss
-                        - ent_coef * entropy.mean()
-                        + 0.01 * kl_loss)
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(
-                    list(policy.parameters()) + list(critic.parameters()),
-                    MAX_GRAD_NORM)
-                optimizer.step()
+                critic_optimizer.zero_grad()
+                v_loss.backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD_NORM)
+                critic_optimizer.step()
 
                 p_losses.append(policy_loss.item())
                 v_losses.append(v_loss.item())
@@ -471,11 +489,13 @@ class MAPPOTrainer:
 
         self.red_buf.compute_gae()
         self._run_ppo_epochs(self.red_buf, self.red_policy, self.red_critic,
-                             self.red_optimizer, ent_coef, stats, "red")
+                             self.red_policy_optimizer, self.red_critic_optimizer,
+                             ent_coef, stats, "red")
 
         self.blue_buf.compute_gae()
         self._run_ppo_epochs(self.blue_buf, self.blue_policy, self.blue_critic,
-                             self.blue_optimizer, ent_coef, stats, "blue")
+                             self.blue_policy_optimizer, self.blue_critic_optimizer,
+                             ent_coef, stats, "blue")
 
         self.total_updates += 1
         return stats
@@ -501,9 +521,11 @@ class MAPPOTrainer:
         merged_blue = RolloutBuffer.merge_buffers(blue_bufs)
 
         self._run_ppo_epochs(merged_red,  self.red_policy,  self.red_critic,
-                             self.red_optimizer,  ent_coef, stats, "red")
+                             self.red_policy_optimizer,  self.red_critic_optimizer,
+                             ent_coef, stats, "red")
         self._run_ppo_epochs(merged_blue, self.blue_policy, self.blue_critic,
-                             self.blue_optimizer, ent_coef, stats, "blue")
+                             self.blue_policy_optimizer, self.blue_critic_optimizer,
+                             ent_coef, stats, "blue")
 
         self.total_updates += 1
         return stats
@@ -514,14 +536,21 @@ class MAPPOTrainer:
         if dir_:
             os.makedirs(dir_, exist_ok=True)
         checkpoint = {
-            "red_policy":      self.red_policy.state_dict(),
-            "blue_policy":     self.blue_policy.state_dict(),
-            "red_critic":      self.red_critic.state_dict(),
-            "blue_critic":     self.blue_critic.state_dict(),
-            "red_opt":         self.red_optimizer.state_dict(),
-            "blue_opt":        self.blue_optimizer.state_dict(),
-            "total_updates":   self.total_updates,
-            "total_env_steps": self.total_env_steps,
+            # Network weights
+            "red_policy":        self.red_policy.state_dict(),
+            "blue_policy":       self.blue_policy.state_dict(),
+            "red_critic":        self.red_critic.state_dict(),
+            "blue_critic":       self.blue_critic.state_dict(),
+            # Separate policy/critic optimizers (PROBLEM 48)
+            "red_policy_opt":    self.red_policy_optimizer.state_dict(),
+            "red_critic_opt":    self.red_critic_optimizer.state_dict(),
+            "blue_policy_opt":   self.blue_policy_optimizer.state_dict(),
+            "blue_critic_opt":   self.blue_critic_optimizer.state_dict(),
+            # Training counters
+            "total_updates":     self.total_updates,
+            "total_env_steps":   self.total_env_steps,
+            # Architecture fingerprint — catches OBS_DIM mismatch at load time
+            "obs_dim":           OBS_DIM,
         }
         if extra:
             checkpoint.update(extra)
@@ -530,14 +559,40 @@ class MAPPOTrainer:
 
     def load(self, path: str):
         ck = torch.load(path, map_location=self.device, weights_only=False)
+
+        # ── Architecture guard (PROBLEM 48) ──────────────────────────────
+        ck_obs_dim = ck.get("obs_dim", None)
+        if ck_obs_dim is not None and ck_obs_dim != OBS_DIM:
+            raise ValueError(
+                f"[MAPPO] Checkpoint obs_dim={ck_obs_dim} does not match "
+                f"current OBS_DIM={OBS_DIM}.  Cannot resume — start fresh "
+                f"or use the matching branch."
+            )
+        if ck_obs_dim is None:
+            print(f"[MAPPO] WARNING: checkpoint predates obs_dim tracking "
+                  f"(current OBS_DIM={OBS_DIM}).  Proceeding, but a "
+                  f"dimension mismatch will raise below if the network changed.")
+
         self.red_policy.load_state_dict(ck["red_policy"])
         self.blue_policy.load_state_dict(ck["blue_policy"])
         self.red_critic.load_state_dict(ck["red_critic"])
         self.blue_critic.load_state_dict(ck["blue_critic"])
-        self.red_optimizer.load_state_dict(ck["red_opt"])
-        self.blue_optimizer.load_state_dict(ck["blue_opt"])
+
+        # Support both old (single combined) and new (separate) optimizer keys
+        if "red_policy_opt" in ck:
+            self.red_policy_optimizer.load_state_dict(ck["red_policy_opt"])
+            self.red_critic_optimizer.load_state_dict(ck["red_critic_opt"])
+            self.blue_policy_optimizer.load_state_dict(ck["blue_policy_opt"])
+            self.blue_critic_optimizer.load_state_dict(ck["blue_critic_opt"])
+        elif "red_opt" in ck:
+            # Legacy single-optimizer checkpoint: load into policy optimizer only
+            print("[MAPPO] WARNING: loading legacy single-optimizer checkpoint; "
+                  "critic optimizers start fresh (first few updates may be noisy).")
+            self.red_policy_optimizer.load_state_dict(ck["red_opt"])
+            self.blue_policy_optimizer.load_state_dict(ck["blue_opt"])
+
         self.total_updates   = ck.get("total_updates", 0)
         self.total_env_steps = ck.get("total_env_steps", 0)
         print(f"[MAPPO] Loaded checkpoint ← {path} "
-              f"(step {self.total_env_steps:,})")
+              f"(step {self.total_env_steps:,}, obs_dim={ck_obs_dim})")
         return ck

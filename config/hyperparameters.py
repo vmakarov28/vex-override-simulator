@@ -1,5 +1,5 @@
 """
-config/hyperparameters.py  (v7)
+config/hyperparameters.py  (v8)
 =================================
 REWARD REDESIGN v7
 ------------------
@@ -131,12 +131,189 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
   PROBLEM 29 (v7): Visualisation cadence too sparse during early learning.
     FIX: First 2 M env steps record a vis video every 100 updates rather
     than every 500.  Also: a final result video is recorded at end of run.
+
+  PROBLEM 30 (v8): Proximity reward dominated causal scoring 10:1.
+    FIX: carrying_proximity_scale 0.15→0.05; score_own_pin 6→15;
+    score_yellow_owned 8→20; score_yellow_neutral 3→8; denial_success
+    5→12; score_delta weight 5→7.  Causal events now dominate shaping.
+
+  PROBLEM 31 (v8): Score attempt rate near zero across all training.
+    FIX: score_attempt_in_zone 0.8→4.0.  Pressing the score button
+    at a legal goal is now worth ~80 steps of proximity reward.
+
+  PROBLEM 32 (v8): Linear holding-timeout ramp too weak vs proximity.
+    FIX: Ramp formula changed to quadratic in env_wrapper so penalty
+    becomes catastrophic after 2×HOLDING_TIMEOUT_STEPS.
+
+  PROBLEM 33 (v8): Proximity reward fires for indefinitely parked robots.
+    FIX: Proximity cuts to zero after PROX_CARRY_DECAY_STEPS (35 steps
+    = 1.75 s) carry time, creating a hard deadline to score or lose pull.
+
+  PROBLEM 34 (v8): score_delta always logs 0.000 (red+blue cancel).
+    FIX: Added score_delta_red / score_delta_blue per-alliance keys to
+    the reward-component tracker so the signal is visible in [Rwd] logs.
+
+  PROBLEM 35 (v8): Toggle camping persists immediately after capture.
+    FIX: TOGGLE_LEAVE_GRACE_STEPS (20) grace window after any toggle
+    flip; toggle_camping -0.08→-0.15 to push robots away faster.
+
+  PROBLEM 36 (v8): Fast cycle not rewarded enough.
+    FIX: time_to_score_bonus 1.5→4.0; TIME_TO_SCORE_TARGET 80→35 steps
+    (1.75 s).  A robot scoring in under 1.75 s earns the full bonus.
+
+  PROBLEM 37 (v8): Entropy collapsing too fast onto suboptimal policy.
+    FIX: ENTROPY_ANNEAL_STEPS 12M→30M; ENTROPY_COEF_MIN 0.005→0.008.
+
+  PROBLEM 38 (v8): RND intrinsic reward near-zero (0.002 / update).
+    FIX: RND_REWARD_SCALE 0.02→0.10.
+
+  PROBLEM 39 (v8): Self-play pool too homogeneous (90% old checkpoints).
+    FIX: POOL_SAMPLE_PROB 0.90→0.75.
+
+  PROBLEM 40 (v8.1): time_to_score_bonus paid full bonus every score.
+    BUG: _carry_steps was reset to 0 in step() before _compute_rewards
+    ran (robot's carrying_pin became None during sim.step()).  Section 2
+    read the reset value, ratio was always 1.0, fast-cycle signal
+    completely absent.  FIX: step() captures pre_step_carry BEFORE the
+    counter update and passes it to _compute_rewards.
+
+  PROBLEM 41 (v8.1): No reward differentiation for endgame scoring.
+    FIX: endgame_score_multiplier (1.5×) on all causal scoring events
+    (pin scoring, denial, stack_bonus) while rules_engine.endgame_active.
+
+  PROBLEM 42 (v8.1): No positive reward for defensive play.
+    FIX: defensive_position_bonus (+0.05/step) when an empty-handed
+    robot is positioned on the line between a carrying enemy and that
+    enemy's nearest scorable goal.  Encourages blocking without contact.
+
+  PROBLEM 43 (v8.1): No reward for grabbing elements before opponents.
+    FIX: resource_denial_bonus (+0.5 one-time) when a robot intakes an
+    element that an opponent was the nearest robot to at the start of
+    the step.  Rewards proactive resource control.
+
+  PROBLEM 44 (v8.1): Yellow approach only fired when alliance owned a
+    toggle, missing the strategic "go grab yellow then flip toggle" path.
+    FIX: Yellow approach now also fires at reduced scale
+    (yellow_approach_unowned = 0.03) when alliance owns no toggles.
+
+  PROBLEM 45 (v8.1): Observation lacked self-carry-duration awareness,
+    holding-penalty anticipation, opponent carrying colour, and global
+    cycle/resource state, blocking strategic reasoning.
+    FIX: 10 new observation features appended after the v7 globals
+    (OBS_DIM 554 → 564):
+      - own carry_step normalised (1)
+      - own holding-overshoot ratio (1)
+      - opp1, opp2 carrying pin UP colour one-hot (3 + 3)
+      - yellow pins remaining normalised (1)
+      - can-score-anywhere bit (1)
+
+  PROBLEM 46 (v8.2): Midfield parking reward fired for the entire 20-second
+    endgame at a negligible rate (0.08/step × ramp), so robots never learned
+    to treat parking as a discrete last-second commitment — it was just a
+    weak always-on trickle.
+    FIX: Reward now ONLY fires in the final PARK_WINDOW_SECONDS (3 s) of
+    the match at a strong flat rate (midfield_endgame 0.08 → 1.0, no ramp).
+    90 total reward for perfect 3-second parking ≈ 6 pin scores — meaningful
+    but not so dominant that scoring robots abandon their last elements.
+    ENDGAME_RAMP_SECONDS aligned to 3 s so obs[ptr+19] urgency ramp rises
+    0→1 over exactly the same window, giving the policy a clean park-now cue.
+
+  PROBLEM 47 (v8.2): Quadratic holding-timeout had no ceiling — at 400
+    carry-steps overshoot=360, ratio=36, penalty=-7.2/step, causing
+    catastrophic gradient spikes for any robot stuck in a carry loop.
+    FIX: Ratio capped at HOLDING_RAMP_SQ_CAP (9.0), so the maximum
+    per-step penalty is -0.20 × 9 = -1.8/step.  The cap engages at
+    overshoot = 3 × HOLDING_RAMP_STEPS (~11 s of carrying) — by that
+    point the penalty is already catastrophic; further escalation only
+    destabilises training without changing the robot's optimal action.
+
+  PROBLEM 48 (v8.2): CRITIC_LR (8e-4) was imported in mappo.py but
+    both policy and critic used LEARNING_RATE (2.5e-4).  Slower critic
+    convergence delayed value estimates, slowing policy improvement.
+    FIX: Separate policy_optimizer (LEARNING_RATE) and critic_optimizer
+    (CRITIC_LR) per alliance, with independent grad-norm clips.  Checkpoint
+    format updated to store four optimizer state-dicts.  obs_dim also stored
+    in checkpoint so mismatched architecture is detected at load time.
+
+  PROBLEM 49 (v8.2): environment/override_env.py (PettingZoo wrapper) still
+    used the old linear uncapped holding-timeout and had no PROX_CARRY_DECAY
+    cut-off — evaluation rewards diverged from training rewards, making
+    evaluation scores meaningless as a training signal proxy.
+    FIX: PettingZoo wrapper section 3 and 5 updated to match v8 training
+    wrapper (quadratic + capped timeout; proximity cut at PROX_CARRY_DECAY).
+
+  PROBLEM 50 (v8.2): Drop+recarry exploit introduced by PROX_CARRY_DECAY.
+    With v8's 35-step proximity cut-off, a robot near a goal could:
+      drop (-0.5)  +  re-intake (+0.8)  =  +0.3 net, AND reset carry_steps
+      to 0, granting another 35 steps × 0.05 = 1.75 of proximity reward.
+    Total: ~+2.05 per drop-recarry cycle.  Not exploitable in v7 (no decay)
+    but a real attack surface in v8.  COOLDOWN_INTAKE=5 only delays the cycle.
+    FIX: drop_penalty -0.5 -> -1.0.  Drop+intake is now -0.2 net, removing
+    the positive-feedback loop while still letting accidental drops recover.
+
+  PROBLEM 51 (v8.2): utils/opponent_pool.py had no architecture fingerprint.
+    A stale pool.pt from v7 (OBS_DIM=554) would silently load() but crash
+    later inside sample() when load_state_dict() hit shape mismatches —
+    cryptic failure deep inside CUDA at first opponent sample.
+    FIX: Store OBS_DIM in pool file; raise ValueError on load() if it
+    differs from current OBS_DIM, with instructions to delete the file.
+
+  PROBLEM 52 (v8.2): get_action_mask() took an unused rules_engine
+    parameter, suggesting legality depends on rules state when it does not.
+    FIX: Removed the parameter; updated env_wrapper.py call site.
+
+  PROBLEM 53 (v8.3): Observation was missing explicit speed-magnitude features.
+    Policy had rvx/rvy for self and opponents but had to rediscover
+    sqrt(rvx²+rvy²) — a nonlinear operation — slowing spin-avoidance and
+    speed-reward learning.  Teammate carry_steps was also absent, preventing
+    per-robot carry-duration awareness needed for goal-assignment coordination.
+    FIX: 4-dim v8.2 obs block appended after v8.1:
+      - own speed magnitude / MAX_SPEED (1)
+      - teammate carry_steps / TIME_TO_SCORE_TARGET (1)
+      - opp1 speed magnitude / MAX_SPEED (1)
+      - opp2 speed magnitude / MAX_SPEED (1)
+    Also: per-pin nearest-goal distance added to each pin slot (matches what
+    cups already had), giving robots directional guidance on which pin to
+    fetch based on proximity to the intended goal.  Pins 20×10→20×11 dims.
+    OBS_DIM 564 → 588.
+
+  PROBLEM 54 (v8.3): forward_speed_scale (0.03/step) was only 30% the
+    strength of spin_penalty (-0.10/step).  Policy learned "don't spin" but
+    had weak incentive to go fast — the positive signal wasn't worth changing
+    locomotion patterns.  Also: no reward for raw speed magnitude while
+    carrying (only heading-aligned component).
+    FIX 1: forward_speed_scale 0.03 → 0.06 (doubles direction-aligned
+    speed reward, now balanced against spin_penalty).
+    FIX 2: carrying_speed_scale = 0.015/step fires on raw |v|/MAX_SPEED
+    while carrying, creating a direction-agnostic "go fast with the goods"
+    layer.  Max total from both signals: 0.075/step; holding_timeout cap
+    at -1.8/step dominates after step ~45, preventing circling exploit.
+
+  PROBLEM 55 (v8.3): time_to_score_bonus rewards the carry phase (pickup →
+    score) but the fetch phase (score → next pickup) was shaped only by the
+    delta-based approach_scale, which saturates at zero once near the target.
+    No positive one-time signal motivated urgency in the return-fetch phase.
+    FIX: intake_cycle_bonus = 1.5 fires at pickup: bonus × max(0, 1 −
+    steps_since_last_score / INTAKE_CYCLE_TARGET).  A robot returning
+    quickly from its last score earns up to 1.5; a slow robot earns
+    progressively less.  Drop-exploit guard: bonus only fires when the
+    most recent relevant event (score or drop) was a score, preventing the
+    drop→re-intake cycle from collecting the bonus twice.
+
+  PROBLEM 56 (v8.3): environment/override_env.py (PettingZoo wrapper)
+    midfield_endgame section fired for the entire 20-second endgame at
+    1.0/step → 400 reward per robot per game.  Training wrapper correctly
+    gates it to the final PARK_WINDOW_SECONDS (3 s) → 60 reward per robot.
+    The 27× inflation made evaluation scores incomparable to training, and
+    could cause the evaluation policy to over-value parking vs. scoring.
+    FIX: Added `tr <= PARK_WINDOW_SECONDS` gate to PettingZoo wrapper
+    section 12, matching training/env_wrapper.py v8.2 behaviour exactly.
 """
 
 # -------------------------------------------------------------------------
 # OBSERVATION / ACTION SPACE
 # -------------------------------------------------------------------------
-OBS_DIM     = 554   # v6: 551 base + 3 v7 features (score_delta_my, heading-vel align, endgame urgency)
+OBS_DIM     = 588   # v8.3: 564 base + 20 (per-pin goal dist) + 4 (v8.2 block: speed, tm_carry, opp speeds)
 ACTION_CONT = 2
 ACTION_DISC = 7
 
@@ -166,8 +343,8 @@ GAE_LAMBDA           = 0.95
 CLIP_EPS             = 0.25          # More conservative updates
 VALUE_LOSS_COEF      = 0.5
 ENTROPY_COEF             = 0.025       # Higher initial entropy
-ENTROPY_COEF_MIN         = 0.005
-ENTROPY_ANNEAL_STEPS     = 12_000_000  # Keep exploration longer
+ENTROPY_COEF_MIN         = 0.008
+ENTROPY_ANNEAL_STEPS     = 30_000_000  # Keep exploration longer
 MAX_GRAD_NORM            = 0.5
 
 # -------------------------------------------------------------------------
@@ -177,7 +354,7 @@ NUM_PARALLEL_ENVS = 32
 ROLLOUT_STEPS     = 512
 MINIBATCH_SIZE    = 256
 PPO_EPOCHS        = 10
-TOTAL_ENV_STEPS   = 40_000_000
+TOTAL_ENV_STEPS   = 24_000_000   # ~15 h at 16 envs × 512 steps/update, 19 s/update
 
 # -------------------------------------------------------------------------
 # NETWORK ARCHITECTURE
@@ -191,12 +368,12 @@ LOG_STD_MAX   = 0.0
 # SELF-PLAY / POLICY POOL (Anti-Collapse Settings)
 # -------------------------------------------------------------------------
 POOL_SIZE              = 16          # Increased for better diversity
-POOL_SAMPLE_PROB       = 0.90        # Sample historical opponents 90% of time
+POOL_SAMPLE_PROB       = 0.75        # Sample historical opponents 75% of time
 CHECKPOINT_EVERY       = 500
 SELF_PLAY_OPPONENT_MIX = 0.65        # 65% pool + 35% latest policy
 
 # -------------------------------------------------------------------------
-# REWARD WEIGHTS  (v3)
+# REWARD WEIGHTS  (v8)
 #
 # Hierarchy:
 #   1. Terminal win/loss          -> game outcome matters most
@@ -215,16 +392,16 @@ REWARD_WEIGHTS = {
     "win_terminal":           10.0,   # x (score_diff / 80)
 
     # --- Step-level score signal -----------------------------------------
-    "score_delta":             5.0,   # (my_delta - opp_delta) per step
+    "score_delta":             7.0,   # (my_delta - opp_delta) per step
 
     # --- Causal scoring events -------------------------------------------
-    "score_own_pin":           6.0,
-    "score_yellow_owned":      8.0,
-    "score_yellow_neutral":    3.0,
+    "score_own_pin":          15.0,
+    "score_yellow_owned":     20.0,
+    "score_yellow_neutral":    8.0,
     "score_opp_half":         -4.0,
 
     # --- Cup denial ------------------------------------------------------
-    "denial_success":          5.0,
+    "denial_success":         12.0,
     "denial_own":             -4.0,
     "denial_preserved_opp":   -1.0,
 
@@ -236,18 +413,18 @@ REWARD_WEIGHTS = {
     "toggle_loss":            -2.0,
 
     # --- Carrying proximity (continuous, every step) ---------------------
-    "carrying_proximity_scale": 0.15,   # max per step when at goal with correct element
-    "fetch_needed_scale":        0.15,   # approach reward toward the element type needed to continue stack
+    "carrying_proximity_scale": 0.05,   # max per step when at goal with correct element
+    "fetch_needed_scale":        0.08,   # approach reward toward the element type needed to continue stack
 
     # --- Score attempt (explicit reinforcement for pressing the button) --
-    "score_attempt_in_zone":   0.8,
+    "score_attempt_in_zone":   4.0,
 
     # --- Empty-hand approach shaping -------------------------------------
     "approach_scale":          8.0,
 
     # --- Object interaction ----------------------------------------------
     "intake_success":          0.8,
-    "drop_penalty":           -0.5,
+    "drop_penalty":           -1.0,   # v8.2: -0.5 -> -1.0 to close drop+recarry exploit (PROBLEM 50)
 
     # --- Penalties -------------------------------------------------------
     "holding_penalty_rate":   -0.20,   # grows to this after HOLDING_RAMP_STEPS
@@ -257,24 +434,36 @@ REWARD_WEIGHTS = {
     "pinning_violation":      -0.8,
     "wrong_element_loiter":   -0.15,   # per-step: carrying wrong element within scoring radius of goal
     "spin_penalty":           -0.10,   # per-step: high angular velocity + low translational speed
-    "toggle_camping":         -0.08,   # per-step: loitering near a toggle your alliance already owns
-    "forward_speed_scale":     0.03,   # per-step: velocity component pointing toward current target
+    "toggle_camping":         -0.15,   # per-step: loitering near a toggle your alliance already owns
+    "forward_speed_scale":     0.06,   # per-step: velocity component pointing toward current target (v8.3: 0.03→0.06)
+    "carrying_speed_scale":    0.015,  # per-step: raw speed bonus when carrying — direction-agnostic "go fast" layer
+    "intake_cycle_bonus":      1.5,    # one-time at intake: bonus × max(0, 1 - steps_since_last_score/INTAKE_CYCLE_TARGET)
 
     # --- v7: division of labour & cycle efficiency -----------------------
     "teammate_overlap_penalty": -0.12,  # per-step: both alliance robots inside SCORING_RADIUS of same goal
-    "time_to_score_bonus":       1.5,   # one-time at score moment: bonus × max(0, 1 - carry_steps/TARGET)
+    "time_to_score_bonus":       4.0,   # one-time at score moment: bonus × max(0, 1 - carry_steps/TARGET)
     "yellow_approach_scale":     0.06,  # per-step: bonus when empty robot approaches yellow pin & alliance owns toggle
     "ally_separation_bonus":     0.02,  # per-step: bonus when teammates >= ALLY_SEPARATION_TARGET apart
 
+    # --- v8.1: Strategy & defensive shaping ------------------------------
+    "endgame_score_multiplier":  1.5,    # multiplier on causal scoring events during endgame
+    "resource_denial_bonus":     0.5,    # one-time bonus when intaking an element an opponent was closer to
+    "defensive_position_bonus":  0.05,   # per-step: empty-handed robot between a carrying enemy and their nearest scorable goal
+    "yellow_approach_unowned":   0.03,   # yellow_approach scale when alliance doesn't yet own a toggle (encourages flip-first strategy)
+
     # --- Endgame ---------------------------------------------------------
-    "midfield_endgame":        0.08,   # base per-step reward; multiplied by 1..ENDGAME_RAMP_MAX_MULT in final seconds
+    "midfield_endgame":        1.0,    # per-step reward; only fires in final PARK_WINDOW_SECONDS (3 s); no ramp
 }
 
 # -------------------------------------------------------------------------
 # NEW v3 CONSTANTS (holding timeout, pinning, start zone, etc.)
 # -------------------------------------------------------------------------
 HOLDING_TIMEOUT_STEPS = 40     # after this many steps carrying, penalty starts
-HOLDING_RAMP_STEPS    = 60     # penalty reaches full strength after this many more steps
+HOLDING_RAMP_STEPS    = 60     # one "ramp unit" for the quadratic formula
+# Quadratic cap: ratio = min((overshoot/HOLDING_RAMP_STEPS)^2, CAP)
+# Cap = 9.0  →  max penalty = |holding_penalty_rate| × 9 = 1.8/step.
+# Engages at overshoot = 3 × HOLDING_RAMP_STEPS = 180 steps (~9 s of carry).
+HOLDING_RAMP_SQ_CAP   = 9.0
 
 PINNING_STEPS_LIMIT   = 60     # 3 seconds at 20 Hz
 PINNING_CONTACT_DIST  = 22.0   # inches (robot width + margin)
@@ -314,14 +503,41 @@ ALLY_SEPARATION_TARGET  = 45.0
 
 # Time-to-score: a robot that scores within TIME_TO_SCORE_TARGET steps of
 # picking up earns close-to-full bonus; longer carries fade to zero linearly.
-# 80 steps at 20 Hz = 4 seconds of carrying.
-TIME_TO_SCORE_TARGET    = 80
+# 35 steps at 20 Hz = 1.75 seconds of carrying.
+TIME_TO_SCORE_TARGET    = 35
 
 # Endgame midfield ramp: in the final ENDGAME_RAMP_SECONDS of the match the
 # midfield_endgame reward multiplier ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT.
 # This makes second-1 parking >> second-19 parking, teaching last-second commit.
-ENDGAME_RAMP_SECONDS    = 10.0
-ENDGAME_RAMP_MAX_MULT   = 4.0
+ENDGAME_RAMP_SECONDS    = 3.0    # v8.2: narrowed to match PARK_WINDOW_SECONDS so obs urgency ramp aligns with reward window
+ENDGAME_RAMP_MAX_MULT   = 4.0   # unused by section 12 since v8.2 (no ramp); kept for reference
+
+# v8.2: parking reward only fires this many seconds before match end.
+PARK_WINDOW_SECONDS     = 3.0
+
+# -------------------------------------------------------------------------
+# v8.3: Cycle-speed / carrying-drive constants
+# -------------------------------------------------------------------------
+# Intake cycle bonus target: a robot that returns from its last score and
+# picks up the next element within this many steps earns the full bonus;
+# bonus scales to 0 at >= INTAKE_CYCLE_TARGET steps.  50 steps = 2.5 s.
+INTAKE_CYCLE_TARGET     = 50
+
+# -------------------------------------------------------------------------
+# v8: Cycle-efficiency / toggle-leave constants
+# -------------------------------------------------------------------------
+# Proximity reward hard cut-off: after carrying for this many steps without
+# scoring, carrying_proximity_scale drops to zero.  Creates a 1.75-second
+# deadline before the carrot disappears (then holding timeout stick starts).
+PROX_CARRY_DECAY_STEPS  = 35
+
+# Grace window after a toggle flip: robots are NOT penalised for toggle_camping
+# during this window, giving them time to physically leave the toggle zone.
+TOGGLE_LEAVE_GRACE_STEPS = 20
+
+# Defensive blocking: max perpendicular distance from the (opp → opp_goal) line
+# at which a defender counts as "in the way".  ~1 robot width.
+DEFENSIVE_LINE_PERP_DIST = 18.0
 
 # -------------------------------------------------------------------------
 # CURRICULUM STAGES
@@ -405,7 +621,7 @@ CURRICULUM_STAGES = [
 # -------------------------------------------------------------------------
 # LOGGING / CHECKPOINTING
 # -------------------------------------------------------------------------
-LOG_EVERY_UPDATES  = 50
+LOG_EVERY_UPDATES  = 10
 SAVE_EVERY_UPDATES = 500
 EVAL_EVERY_UPDATES = 500
 EVAL_NUM_MATCHES   = 5
@@ -421,7 +637,7 @@ HEATMAPS_DIR  = "artifacts/heatmaps"
 # RANDOM NETWORK DISTILLATION (RND) - Anti-Collapse / Curiosity
 # -------------------------------------------------------------------------
 RND_ENABLED           = True
-RND_REWARD_SCALE      = 0.02          # Intrinsic reward strength
+RND_REWARD_SCALE      = 0.10          # Intrinsic reward strength
 RND_UPDATE_EVERY      = 8             # Update RND network every N steps
 RND_HIDDEN            = [512, 256]    # RND predictor network size
 RND_LR                = 1e-4          # Learning rate for RND predictor

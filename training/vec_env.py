@@ -14,6 +14,12 @@ The main process serialises policy weights → sends once → workers compute
 
 import os
 import warnings
+
+# Module-level suppression so spawn-reimported workers are clean before
+# _worker_fn (which also sets these) even runs.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+warnings.filterwarnings("ignore", message="pkg_resources", category=UserWarning)
+
 import multiprocessing as mp
 import numpy as np
 from typing import Dict, List

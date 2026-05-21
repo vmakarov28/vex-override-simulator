@@ -1,5 +1,5 @@
 """
-training/network.py  (v7 — goal attention)
+training/network.py  (v8.3 — goal attention, 588-dim obs)
 ────────────────────────────────────────────────────────────────────────────
 Neural network architecture for the VEX Override MAPPO system.
 
@@ -7,7 +7,7 @@ v7 change
 ---------
 A shared ObsEncoder is now used by both Policy and Critic.  Rather than
 flattening all 9 goal slots into one big MLP input, the encoder:
-  1. Splits the 554-dim observation into (non-goal, goal-slots).
+  1. Splits the 588-dim observation into (non-goal, goal-slots).
   2. Embeds each goal slot (17 dims) into a small vector via a shared MLP.
   3. Projects the non-goal context to a query vector.
   4. Uses dot-product attention over the 9 embedded goal slots, with
@@ -19,14 +19,30 @@ This lets the policy *selectively focus* on the goal(s) most relevant to
 the current situation (e.g. the goal it's about to score on, or the goal
 it's trying to deny) rather than blindly attending to all nine equally.
 
+v8 change
+---------
+OBS_DIM expanded from 554 → 564 (+10 self-awareness / defensive-intel
+features).  The encoder is fully dimension-agnostic — non_goal_dim is
+derived at init time from obs_dim minus the fixed goal block (153 dims),
+so no architectural change is needed beyond the updated OBS_DIM constant.
+
+v8.3 change
+-----------
+OBS_DIM expanded from 564 → 588 (+20 per-pin nearest-goal distances,
++4 movement-intelligence features: own speed, teammate carry_steps, opp
+speed magnitudes).  GOAL_OFFSET=56 and GOAL_BLOCK_END=209 are unchanged,
+so the attention mechanism requires no modification.
+non_goal_dim = 588 - 9×17 = 435 (was 411); handled dynamically at init.
+
 Components
 ----------
 ObsEncoder
-  - obs_dim (=554) → feat_dim (=128) per observation
+  - obs_dim (=588) → feat_dim (=128) per observation
+  - non_goal_dim = 588 - 9×17 = 435; goal block = obs[:, 56:209]
   - Used internally by Policy (1× per obs) and Critic (2× then merged).
 
 Policy (actor)
-  - Decentralised: sees only one robot's 554-dim observation.
+  - Decentralised: sees only one robot's 588-dim observation.
   - Heads: continuous (mean + log_std for left/right motors) + discrete (7).
 
 CentralizedCritic
@@ -101,6 +117,10 @@ class ObsEncoder(nn.Module):
       attended  = sum_g weights[g] * goal_emb[g]            # (B, GOAL_EMBED_DIM)
 
       feats     = backbone( cat[non_goal, attended] )       # (B, feat_dim)
+
+    With OBS_DIM=564: non_goal_dim = 564 - 153 = 411.
+    The goal block [56:209] is fixed; the 10 v8 features appended at [554:564]
+    land in the non_goal slice and require no architectural change.
     """
 
     def __init__(self, obs_dim: int = OBS_DIM, hidden: list = None):
@@ -108,7 +128,7 @@ class ObsEncoder(nn.Module):
         if hidden is None:
             hidden = ACTOR_HIDDEN
         self.obs_dim     = obs_dim
-        self.non_goal_dim = obs_dim - N_GOALS * GOAL_FEATS    # 554 - 153 = 401
+        self.non_goal_dim = obs_dim - N_GOALS * GOAL_FEATS    # e.g. 564 - 153 = 411
 
         # Per-goal embedding (shared across the 9 slots).
         self.goal_embed = nn.Sequential(

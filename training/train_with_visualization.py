@@ -5,11 +5,10 @@ Workers collect full ROLLOUT_STEPS-step rollouts locally (CPU policy
 inference + physics), then ship completed numpy buffers back once per update
 cycle.  IPC drops from 16 384 pipe roundtrips to 32.
 
-Expected timings (Ryzen 9 7900X + RTX 5080, 32 workers):
-  rollout  ~1.8 s   (was 29 s — 16× faster)
-  gae      ~0.3 s
-  ppo      ~10  s
-  total    ~12  s/update  →  first log in ~10 min, 20 M steps in ~4 h
+Observed timings (Ryzen 9 7900X + RTX 5080, 16 workers, v8.3):
+  rollout  ~10  s
+  ppo      ~9   s
+  total    ~19  s/update  →  first log in ~3 min, 24 M steps in ~15 h
 
 Run:
     python training/train_with_visualization.py
@@ -18,6 +17,17 @@ Run:
 
 import os
 import sys
+import warnings
+
+# Suppress pygame startup noise before any imports that transitively load pygame.
+# PYGAME_HIDE_SUPPORT_PROMPT silences "Hello from the pygame community."
+# The warnings filter silences the pkg_resources deprecation UserWarning from
+# pygame/pkgdata.py that fires on every process start (main + 16 workers).
+# These must be set here — multiprocessing "spawn" re-imports this module in
+# each child before _worker_fn runs, so worker-local suppression fires too late.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+warnings.filterwarnings("ignore", message="pkg_resources", category=UserWarning)
+
 import time
 import argparse
 import numpy as np
