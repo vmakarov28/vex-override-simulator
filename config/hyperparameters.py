@@ -308,12 +308,92 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     could cause the evaluation policy to over-value parking vs. scoring.
     FIX: Added `tr <= PARK_WINDOW_SECONDS` gate to PettingZoo wrapper
     section 12, matching training/env_wrapper.py v8.2 behaviour exactly.
+
+  PROBLEM 57 (v9): Self-play policy collapse via pinning exploit.
+    Training logs through 18M steps showed Blue alliance scoring collapsing
+    to ~0-5 from ~16M onward, with `pinning` penalty growing to -200/window.
+    Red discovered that pinning Blue was more profitable than scoring
+    (pinning_violation = -0.8/step << prevented_score_delta = +7/event).
+    Both alliances regressed to a low-scoring Nash equilibrium where
+    neither side cycled goals.
+    FIX: pinning_violation -0.8 → -4.0 (5×); PINNING_STEPS_LIMIT 60 → 40
+    (faster trigger).  Combined: pinning is no longer EV-positive.
+
+  PROBLEM 58 (v9): Zero-sum score_delta fuels score-suppression strategies.
+    `score_delta` rewards (my_delta - opp_delta) symmetrically — preventing
+    opp scoring is exactly as valuable as scoring yourself.  Combined with
+    pinning, this creates a "suppress, don't score" attractor.
+    FIX: score_delta 7.0 → 3.5 (reduced relative incentive) and NEW
+    own_score_abs = 5.0 that pays each alliance for ITS score delta only,
+    creating a strictly-positive absolute scoring incentive that is
+    independent of opponent behaviour.
+
+  PROBLEM 59 (v9): Win terminal reward is linear; narrow wins == wide wins.
+    `win_terminal × (diff / 80)` makes a 2-pt win worth almost nothing,
+    removing the marginal incentive to keep scoring once ahead.
+    FIX: NEW win_threshold_bonus = 8.0 flat bonus when winning by ≥ 15 pts.
+    Decisive wins now strictly dominate narrow ones.
+
+  PROBLEM 60 (v9): Defensive position bonus correlated with pinning spike.
+    `defensive_position_bonus = 0.05/step` rose from ~0 to +5/window in
+    parallel with the pinning penalty growth — robots learning to block
+    paths kept escalating into sustained contact.
+    FIX: 0.05 → 0.015 (3× weaker) AND gated by alliance score margin —
+    suppressed when the defender's alliance is already leading by
+    DEFENSE_GATE_LEAD_PTS (5).  When winning, score; don't defend.
+
+  PROBLEM 61 (v9): Pinning Nash equilibrium needs a Blue-side counter.
+    Increasing pinning penalty alone doesn't help Blue while being pinned.
+    FIX: NEW score_under_pressure_bonus = 3.0 fires one-time when a robot
+    scores with any opponent within PINNING_CONTACT_DIST.  Gives the
+    pinned robot a direct reward path that doesn't require escaping the
+    contact, undercutting the pinning strategy's profitability further.
+
+  PROBLEM 62 (v9): Cycle times too slow; chronic over-holding.
+    Avg `holding_timeout` = -2200/window at 18M with cap engaged → robots
+    consistently hold ~11 s before scoring.  `time_to_score_bonus` (+1-3)
+    barely visible; `intake_cycle_bonus` (+123-335) earned but dominated
+    by the holding penalty.
+    FIX cluster (cycle-time priority):
+      - HOLDING_TIMEOUT_STEPS 40 → 20 (1 s instead of 2)
+      - PROX_CARRY_DECAY_STEPS 35 → 18 (0.9 s — dies BEFORE timeout starts)
+      - TIME_TO_SCORE_TARGET 35 → 20 (1 s)
+      - INTAKE_CYCLE_TARGET 50 → 30 (1.5 s)
+      - time_to_score_bonus 4.0 → 10.0 (dominant fast-cycle signal)
+      - intake_cycle_bonus 1.5 → 4.0
+      - score_attempt_in_zone 4.0 → 6.0 (robots still rarely press score)
+      - carrying_proximity_scale 0.05 → 0.03 (less navigation reward while
+        carrying — robots should already know where to go)
+      - forward_speed_scale 0.06 → 0.04 (reduce per-step speed reward)
+
+  PROBLEM 63 (v9): Observation lacks direct "press the score button now" cue.
+    `score_attempt` reward sits at only +0.5-2.5/window despite weight 4.0.
+    Either robots aren't approaching legally scorable goals or the action
+    is never selected.  The `can_score_anywhere` bit exists but it's a
+    global signal — robots need a localised "I'm IN scoring range right
+    now" trigger to learn the score action's trigger condition.
+    FIX: NEW 4 observation features (OBS_DIM 588 → 592):
+      - obs[588]: in_scoring_range bit (1 if currently inside SCORING_RADIUS
+                  of a legally-scorable goal)
+      - obs[589]: being-pinned count normalised (# of opponents within
+                  PINNING_CONTACT_DIST, / 2.0)
+      - obs[590]: own alliance lead margin (clipped 0-1 when ahead ≥ 5 pts)
+      - obs[591]: own alliance deficit margin (clipped 0-1 when behind ≥ 5)
+
+  PROBLEM 64 (v9): Self-play pool insufficient diversity → co-adaptation collapse.
+    POOL_SAMPLE_PROB = 0.75 still allowed both sides to co-evolve into the
+    pinning equilibrium together.  Once Red shifted to pinning, Blue's
+    cycling skill atrophied because most opponents (75%) had recently
+    learned to pin.
+    FIX: POOL_SAMPLE_PROB 0.75 → 0.85 — historical opponents (including
+    pre-collapse cycling policies) sampled more often, preventing the
+    current-policy pair from settling into a mutual local optimum.
 """
 
 # -------------------------------------------------------------------------
 # OBSERVATION / ACTION SPACE
 # -------------------------------------------------------------------------
-OBS_DIM     = 588   # v8.3: 564 base + 20 (per-pin goal dist) + 4 (v8.2 block: speed, tm_carry, opp speeds)
+OBS_DIM     = 592   # v9: 588 + 4 (v9 block: in_scoring_range, being_pinned, lead_margin, deficit_margin)
 ACTION_CONT = 2
 ACTION_DISC = 7
 
@@ -368,7 +448,7 @@ LOG_STD_MAX   = 0.0
 # SELF-PLAY / POLICY POOL (Anti-Collapse Settings)
 # -------------------------------------------------------------------------
 POOL_SIZE              = 16          # Increased for better diversity
-POOL_SAMPLE_PROB       = 0.75        # Sample historical opponents 75% of time
+POOL_SAMPLE_PROB       = 0.85        # v9: 0.75 -> 0.85 — more historical diversity to break co-adaptation
 CHECKPOINT_EVERY       = 500
 SELF_PLAY_OPPONENT_MIX = 0.65        # 65% pool + 35% latest policy
 
@@ -390,9 +470,16 @@ SELF_PLAY_OPPONENT_MIX = 0.65        # 65% pool + 35% latest policy
 REWARD_WEIGHTS = {
     # --- Terminal --------------------------------------------------------
     "win_terminal":           10.0,   # x (score_diff / 80)
+    "win_threshold_bonus":     8.0,   # v9: flat bonus when winning by >= WIN_MARGIN_THRESHOLD pts
 
     # --- Step-level score signal -----------------------------------------
-    "score_delta":             7.0,   # (my_delta - opp_delta) per step
+    # v9: split into relative (score_delta) and absolute (own_score_abs).
+    # Pure score_delta creates zero-sum incentives — preventing opp scoring
+    # is equally valuable as scoring yourself, which fuels pinning exploits.
+    # own_score_abs gives each alliance an absolute "score MORE" signal
+    # independent of what the opponent does.
+    "score_delta":             3.5,   # v9: 7.0 -> 3.5 (relative; reduced)
+    "own_score_abs":           5.0,   # v9 NEW: my_delta only, no opp subtraction
 
     # --- Causal scoring events -------------------------------------------
     "score_own_pin":          15.0,
@@ -413,59 +500,63 @@ REWARD_WEIGHTS = {
     "toggle_loss":            -2.0,
 
     # --- Carrying proximity (continuous, every step) ---------------------
-    "carrying_proximity_scale": 0.05,   # max per step when at goal with correct element
-    "fetch_needed_scale":        0.08,   # approach reward toward the element type needed to continue stack
+    "carrying_proximity_scale": 0.03,   # v9: 0.05 -> 0.03 (further reduce navigation reward while carrying)
+    "fetch_needed_scale":        0.08,
 
     # --- Score attempt (explicit reinforcement for pressing the button) --
-    "score_attempt_in_zone":   4.0,
+    "score_attempt_in_zone":   6.0,    # v9: 4.0 -> 6.0 (robots still aren't pressing score)
 
     # --- Empty-hand approach shaping -------------------------------------
     "approach_scale":          8.0,
 
     # --- Object interaction ----------------------------------------------
     "intake_success":          0.8,
-    "drop_penalty":           -1.0,   # v8.2: -0.5 -> -1.0 to close drop+recarry exploit (PROBLEM 50)
+    "drop_penalty":           -1.0,
 
     # --- Penalties -------------------------------------------------------
-    "holding_penalty_rate":   -0.20,   # grows to this after HOLDING_RAMP_STEPS
-    "flip_penalty":           -0.15,   # small cost per flip; only flip when pin/cup color justifies it
+    "holding_penalty_rate":   -0.20,
+    "flip_penalty":           -0.15,
     "idle_penalty":           -0.05,
     "start_zone_penalty":     -0.05,
-    "pinning_violation":      -0.8,
-    "wrong_element_loiter":   -0.15,   # per-step: carrying wrong element within scoring radius of goal
-    "spin_penalty":           -0.10,   # per-step: high angular velocity + low translational speed
-    "toggle_camping":         -0.15,   # per-step: loitering near a toggle your alliance already owns
-    "forward_speed_scale":     0.06,   # per-step: velocity component pointing toward current target (v8.3: 0.03→0.06)
-    "carrying_speed_scale":    0.015,  # per-step: raw speed bonus when carrying — direction-agnostic "go fast" layer
-    "intake_cycle_bonus":      1.5,    # one-time at intake: bonus × max(0, 1 - steps_since_last_score/INTAKE_CYCLE_TARGET)
+    "pinning_violation":      -4.0,    # v9: -0.8 -> -4.0 (5× stronger to break pinning exploit)
+    "wrong_element_loiter":   -0.15,
+    "spin_penalty":           -0.10,
+    "toggle_camping":         -0.15,
+    "forward_speed_scale":     0.04,   # v9: 0.06 -> 0.04 (slightly reduce raw speed reward)
+    "carrying_speed_scale":    0.015,
+    "intake_cycle_bonus":      4.0,    # v9: 1.5 -> 4.0 (stronger fast-cycle return signal)
 
     # --- v7: division of labour & cycle efficiency -----------------------
-    "teammate_overlap_penalty": -0.12,  # per-step: both alliance robots inside SCORING_RADIUS of same goal
-    "time_to_score_bonus":       4.0,   # one-time at score moment: bonus × max(0, 1 - carry_steps/TARGET)
-    "yellow_approach_scale":     0.06,  # per-step: bonus when empty robot approaches yellow pin & alliance owns toggle
-    "ally_separation_bonus":     0.02,  # per-step: bonus when teammates >= ALLY_SEPARATION_TARGET apart
+    "teammate_overlap_penalty": -0.12,
+    "time_to_score_bonus":      10.0,  # v9: 4.0 -> 10.0 (dominant cycle-priority signal)
+    "yellow_approach_scale":     0.06,
+    "ally_separation_bonus":     0.02,
 
     # --- v8.1: Strategy & defensive shaping ------------------------------
-    "endgame_score_multiplier":  1.5,    # multiplier on causal scoring events during endgame
-    "resource_denial_bonus":     0.5,    # one-time bonus when intaking an element an opponent was closer to
-    "defensive_position_bonus":  0.05,   # per-step: empty-handed robot between a carrying enemy and their nearest scorable goal
-    "yellow_approach_unowned":   0.03,   # yellow_approach scale when alliance doesn't yet own a toggle (encourages flip-first strategy)
+    "endgame_score_multiplier":  1.5,
+    "resource_denial_bonus":     0.5,
+    "defensive_position_bonus":  0.015,  # v9: 0.05 -> 0.015 (reduce; correlated with pinning spike)
+    "yellow_approach_unowned":   0.03,
+
+    # --- v9: Anti-hijacking shaping --------------------------------------
+    "score_under_pressure_bonus": 3.0,   # v9 NEW: one-time when scoring with opponent within
+                                          # PINNING_CONTACT_DIST. Directly undercuts pinning
+                                          # exploit by making pinned-scores extra valuable.
 
     # --- Endgame ---------------------------------------------------------
-    "midfield_endgame":        1.0,    # per-step reward; only fires in final PARK_WINDOW_SECONDS (3 s); no ramp
+    "midfield_endgame":        1.0,
 }
 
 # -------------------------------------------------------------------------
 # NEW v3 CONSTANTS (holding timeout, pinning, start zone, etc.)
 # -------------------------------------------------------------------------
-HOLDING_TIMEOUT_STEPS = 40     # after this many steps carrying, penalty starts
+HOLDING_TIMEOUT_STEPS = 20     # v9: 40 -> 20 (1s instead of 2s — force fast cycling)
 HOLDING_RAMP_STEPS    = 60     # one "ramp unit" for the quadratic formula
 # Quadratic cap: ratio = min((overshoot/HOLDING_RAMP_STEPS)^2, CAP)
 # Cap = 9.0  →  max penalty = |holding_penalty_rate| × 9 = 1.8/step.
-# Engages at overshoot = 3 × HOLDING_RAMP_STEPS = 180 steps (~9 s of carry).
 HOLDING_RAMP_SQ_CAP   = 9.0
 
-PINNING_STEPS_LIMIT   = 60     # 3 seconds at 20 Hz
+PINNING_STEPS_LIMIT   = 40     # v9: 60 -> 40 (2s instead of 3s — faster pinning detection)
 PINNING_CONTACT_DIST  = 22.0   # inches (robot width + margin)
 
 START_ZONE_RADIUS     = 20.0   # inches from spawn point
@@ -503,8 +594,8 @@ ALLY_SEPARATION_TARGET  = 45.0
 
 # Time-to-score: a robot that scores within TIME_TO_SCORE_TARGET steps of
 # picking up earns close-to-full bonus; longer carries fade to zero linearly.
-# 35 steps at 20 Hz = 1.75 seconds of carrying.
-TIME_TO_SCORE_TARGET    = 35
+# v9: 35 -> 20 (1.0 s) — tighter cycle target to enforce fast scoring.
+TIME_TO_SCORE_TARGET    = 20
 
 # Endgame midfield ramp: in the final ENDGAME_RAMP_SECONDS of the match the
 # midfield_endgame reward multiplier ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT.
@@ -520,16 +611,18 @@ PARK_WINDOW_SECONDS     = 3.0
 # -------------------------------------------------------------------------
 # Intake cycle bonus target: a robot that returns from its last score and
 # picks up the next element within this many steps earns the full bonus;
-# bonus scales to 0 at >= INTAKE_CYCLE_TARGET steps.  50 steps = 2.5 s.
-INTAKE_CYCLE_TARGET     = 50
+# bonus scales to 0 at >= INTAKE_CYCLE_TARGET steps.
+# v9: 50 -> 30 (1.5 s) — tighter return-from-score target.
+INTAKE_CYCLE_TARGET     = 30
 
 # -------------------------------------------------------------------------
 # v8: Cycle-efficiency / toggle-leave constants
 # -------------------------------------------------------------------------
 # Proximity reward hard cut-off: after carrying for this many steps without
-# scoring, carrying_proximity_scale drops to zero.  Creates a 1.75-second
-# deadline before the carrot disappears (then holding timeout stick starts).
-PROX_CARRY_DECAY_STEPS  = 35
+# scoring, carrying_proximity_scale drops to zero.
+# v9: 35 -> 18 (0.9 s) — proximity carrot dies slightly BEFORE the holding
+# penalty starts at 20 steps, creating a 2-step "must-score" pressure point.
+PROX_CARRY_DECAY_STEPS  = 18
 
 # Grace window after a toggle flip: robots are NOT penalised for toggle_camping
 # during this window, giving them time to physically leave the toggle zone.
@@ -538,6 +631,19 @@ TOGGLE_LEAVE_GRACE_STEPS = 20
 # Defensive blocking: max perpendicular distance from the (opp → opp_goal) line
 # at which a defender counts as "in the way".  ~1 robot width.
 DEFENSIVE_LINE_PERP_DIST = 18.0
+
+# -------------------------------------------------------------------------
+# v9: Anti-hijacking constants
+# -------------------------------------------------------------------------
+# Threshold (in score points) above which the win_threshold_bonus fires.
+# Encourages decisive wins over narrow ones, breaking the score-suppression
+# Nash equilibrium where pinning a 2-point lead is as valuable as scoring more.
+WIN_MARGIN_THRESHOLD     = 15
+
+# Lead threshold (in score points) above which defensive_position_bonus is
+# suppressed.  If the alliance is already winning by this margin, there is
+# no reward for additional defensive blocking — they should be scoring instead.
+DEFENSE_GATE_LEAD_PTS    = 5
 
 # -------------------------------------------------------------------------
 # CURRICULUM STAGES

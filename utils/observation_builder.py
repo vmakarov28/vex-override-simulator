@@ -24,8 +24,14 @@ Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
                - teammate carry_steps / TIME_TO_SCORE_TARGET (1)
                - opp1 speed magnitude / MAX_SPEED (1)
                - opp2 speed magnitude / MAX_SPEED (1)
+  [588:592]  v9 anti-hijack / score-trigger intelligence (4)
+               - in_scoring_range bit (currently inside SCORING_RADIUS of a
+                 legally-scorable goal — direct trigger cue for score action)
+               - being-pinned count / 2 (opponents within PINNING_CONTACT_DIST)
+               - own alliance lead margin (clipped 0-1 when ahead ≥ 5 pts)
+               - own alliance deficit margin (clipped 0-1 when behind ≥ 5 pts)
   ──────────
-  Total: 588
+  Total: 592
 """
 
 import math
@@ -42,6 +48,7 @@ from config.game_rules import (
 from config.hyperparameters import (
     ENDGAME_RAMP_SECONDS, TIME_TO_SCORE_TARGET,
     HOLDING_TIMEOUT_STEPS, HOLDING_RAMP_STEPS,
+    PINNING_CONTACT_DIST,
 )
 from simulation.game_objects import (
     GamePin, GameCup, FieldGoal, FieldToggle,
@@ -58,7 +65,7 @@ MAX_ANG_VEL = 10.0
 K_PINS = 20   # nearest pins to encode
 K_CUPS = 15   # nearest cups to encode
 
-OBS_DIM = 588
+OBS_DIM = 592
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color → one-hot helper  (3 bits: [red, blue, yellow])
@@ -494,6 +501,53 @@ def build_observation(
         ovx_ = float(opp.body.velocity.x)
         ovy_ = float(opp.body.velocity.y)
         obs[ptr + 2 + i] = min(1.0, math.hypot(ovx_, ovy_) / MAX_SPEED)
+    ptr += 4
+
+    # ── v9 anti-hijack / score-trigger intelligence (4) ─────────────────────
+    # (a) In-scoring-range bit: 1.0 if the robot is RIGHT NOW inside
+    # SCORING_RADIUS of a goal where it can legally extend the stack with
+    # its currently-carried element.  This is the direct localised trigger
+    # cue for the score action — `can_score_anywhere` (obs[ptr-2 in v8.1
+    # block) tells the policy "I CAN score somewhere"; this tells it "I
+    # AM in range RIGHT HERE, press the button now".
+    in_range = 0.0
+    if robot.carrying_pin is not None or robot.carrying_cup is not None:
+        for g in goals:
+            if g.alliance not in ("neutral", robot.alliance):
+                continue
+            if math.hypot(rx - g.x, ry - g.y) > SCORING_RADIUS:
+                continue
+            top_is_pin = bool(g.stack) and bool(g.stack[-1][1])
+            can_pin = robot.carrying_pin is not None and not top_is_pin
+            can_cup = robot.carrying_cup is not None and     top_is_pin
+            if can_pin or can_cup:
+                in_range = 1.0
+                break
+    obs[ptr + 0] = in_range
+
+    # (b) Being-pinned count: # of opponents currently within
+    # PINNING_CONTACT_DIST, normalised by 2 (max possible is 2 opponents).
+    # Lets the policy condition on "I'm under physical pressure" and choose
+    # between escape vs. score-through-pressure behaviours.
+    pin_count = 0
+    for opp in opponents[:2]:
+        ox = float(opp.body.position.x); oy = float(opp.body.position.y)
+        if math.hypot(rx - ox, ry - oy) < PINNING_CONTACT_DIST:
+            pin_count += 1
+    obs[ptr + 1] = min(1.0, pin_count / 2.0)
+
+    # (c, d) Lead margin and deficit margin.  Already have raw score_delta
+    # in obs[ptr-some-offset+17] (v7 global state), but these capture
+    # SATURATED margin signals: 0 until alliance is ahead by ≥ 5 pts, then
+    # ramping 0→1 across the next 10 pts.  Lets the policy condition cleanly
+    # on "I'm comfortably ahead, score harder" vs "I'm losing, take risks".
+    my_score  = rules_engine.red_score  if robot.alliance == "red" else rules_engine.blue_score
+    opp_score = rules_engine.blue_score if robot.alliance == "red" else rules_engine.red_score
+    margin    = my_score - opp_score
+    # Lead margin: 0 below +5, then linear to 1 at +15
+    obs[ptr + 2] = max(0.0, min(1.0, (margin - 5.0) / 10.0))
+    # Deficit margin: 0 above -5, then linear to 1 at -15
+    obs[ptr + 3] = max(0.0, min(1.0, (-margin - 5.0) / 10.0))
     ptr += 4
 
     assert ptr == OBS_DIM, f"Obs dim mismatch: {ptr} != {OBS_DIM}"

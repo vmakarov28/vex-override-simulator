@@ -50,6 +50,7 @@ from config.hyperparameters import (
     PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
     DEFENSIVE_LINE_PERP_DIST, PARK_WINDOW_SECONDS,
     HOLDING_RAMP_SQ_CAP, INTAKE_CYCLE_TARGET,
+    WIN_MARGIN_THRESHOLD, DEFENSE_GATE_LEAD_PTS,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
@@ -353,12 +354,22 @@ class OverrideEnv:
         if done:
             diff = post_red - post_blue
             wt   = REWARD_WEIGHTS["win_terminal"]
+            # v9 PROBLEM 59: nonlinear win_threshold_bonus rewards DECISIVE wins
+            # over narrow ones, breaking the "win by 2 == win by 30" equivalence
+            # that fuels score-suppression strategies.
+            wtb  = REWARD_WEIGHTS["win_threshold_bonus"]
             if diff > 0:
                 for rid in ["red1",  "red2"]:  rewards[rid] += wt * (diff / 80.0)
                 for rid in ["blue1", "blue2"]: rewards[rid] -= wt * (diff / 80.0)
+                if diff >= WIN_MARGIN_THRESHOLD:
+                    for rid in ["red1",  "red2"]:  rewards[rid] += wtb
+                    for rid in ["blue1", "blue2"]: rewards[rid] -= wtb
             elif diff < 0:
                 for rid in ["blue1", "blue2"]: rewards[rid] += wt * (-diff / 80.0)
                 for rid in ["red1",  "red2"]:  rewards[rid] -= wt * (-diff / 80.0)
+                if -diff >= WIN_MARGIN_THRESHOLD:
+                    for rid in ["blue1", "blue2"]: rewards[rid] += wtb
+                    for rid in ["red1",  "red2"]:  rewards[rid] -= wtb
 
         info = {
             "red_score":   post_red,
@@ -401,16 +412,25 @@ class OverrideEnv:
             rc[name] = rc.get(name, 0.0) + (cur - _prev_total)
             _prev_total = cur
 
-        # 1. Score delta
+        # 1. Score delta (v9: relative component reduced) + own_score_abs (v9 new)
+        # PROBLEM 58 fix: pure score_delta creates zero-sum incentives where
+        # suppressing opponent scoring is exactly as valuable as scoring yourself.
+        # own_score_abs gives each alliance a strictly-positive absolute signal
+        # tied only to ITS score delta, decoupled from opponent behaviour.
         red_delta  = post_red  - pre_red
         blue_delta = post_blue - pre_blue
         for rid in ["red1",  "red2"]:  rewards[rid] += rw["score_delta"] * (red_delta  - blue_delta)
         for rid in ["blue1", "blue2"]: rewards[rid] += rw["score_delta"] * (blue_delta - red_delta)
         _track("score_delta")
+        for rid in ["red1",  "red2"]:  rewards[rid] += rw["own_score_abs"] * red_delta
+        for rid in ["blue1", "blue2"]: rewards[rid] += rw["own_score_abs"] * blue_delta
+        _track("own_score_abs")
 
         # Per-alliance breakdown (the combined sum is always 0; these are diagnostic)
         rc["score_delta_red"]  = rc.get("score_delta_red",  0.0) + rw["score_delta"] * (red_delta  - blue_delta) * 2
         rc["score_delta_blue"] = rc.get("score_delta_blue", 0.0) + rw["score_delta"] * (blue_delta - red_delta)  * 2
+        rc["own_score_abs_red"]  = rc.get("own_score_abs_red",  0.0) + rw["own_score_abs"] * red_delta  * 2
+        rc["own_score_abs_blue"] = rc.get("own_score_abs_blue", 0.0) + rw["own_score_abs"] * blue_delta * 2
 
         # 2. Intake / drop  (+ v7 time-to-score bonus, v8.1 resource denial,
         #                    v8.3 intake_cycle_bonus)
@@ -467,6 +487,22 @@ class OverrideEnv:
                 rewards[rid] += rw["time_to_score_bonus"] * ratio
                 # v8.3: reset cycle counter so next intake measures return speed
                 self._steps_since_last_score[rid] = 0
+
+                # v9 PROBLEM 61: score-under-pressure bonus — if any opponent
+                # was within PINNING_CONTACT_DIST at the start of this step,
+                # this score happened despite contact pressure.  Directly
+                # undercuts the pinning exploit by giving the pinned robot
+                # a reward path that doesn't require escaping the contact.
+                rx_s = pre_positions[rid][0]; ry_s = pre_positions[rid][1]
+                for opp_id in AGENT_IDS:
+                    opp = robot_map.get(opp_id)
+                    if opp is None or opp.alliance == r.alliance:
+                        continue
+                    opp_rx = pre_positions[opp_id][0]
+                    opp_ry = pre_positions[opp_id][1]
+                    if math.hypot(rx_s - opp_rx, ry_s - opp_ry) < PINNING_CONTACT_DIST:
+                        rewards[rid] += rw["score_under_pressure_bonus"]
+                        break  # one bonus per score regardless of # of pinners
 
         for r in self.sim.robots:
             self._prev_scores[r.robot_id] = r.successful_scores
@@ -952,16 +988,23 @@ class OverrideEnv:
             rewards[rid] += rw["carrying_speed_scale"] * spd_frac
         _track("carrying_speed")
 
-        # 13f. v8.1 — Defensive position bonus.
+        # 13f. v8.1 — Defensive position bonus (v9: gated by score margin).
         # Reward empty-handed robots for positioning themselves on the line
         # between a carrying enemy and that enemy's nearest scorable goal.
-        # Encourages defensive blocking play without requiring contact,
-        # giving robots a positive (vs purely penalty-driven) reason to play
-        # defense.
+        # v9 PROBLEM 60: gate by score margin — if the defender's alliance
+        # is already leading by DEFENSE_GATE_LEAD_PTS or more, suppress this
+        # bonus.  When winning, the robot should be scoring, not defending.
+        # This prevents the defensive bonus from compounding into the
+        # pinning equilibrium that collapsed Blue's scoring at ~16M steps.
+        red_lead  = post_red - post_blue
         for rid in AGENT_IDS:
             r = robot_map[rid]
             if r.carrying_pin is not None or r.carrying_cup is not None:
                 continue   # only empty-handed robots play defense
+            # v9 gate: skip if my alliance is already comfortably leading
+            my_margin = red_lead if r.alliance == "red" else -red_lead
+            if my_margin >= DEFENSE_GATE_LEAD_PTS:
+                continue
             rx = float(r.body.position.x); ry = float(r.body.position.y)
             blocked = False
             for opp_id in AGENT_IDS:
