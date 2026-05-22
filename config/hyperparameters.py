@@ -413,6 +413,21 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     would preserve own / deny opponent; −cup_orient_wrong if orientation
     would cancel own / preserve opponent.  Both scaled by proximity to goal.
 
+  PROBLEM 68 (v9.2): Policy only ever trained from clean match-start states.
+    The yellow self-cancel scenario (score yellow pin, then place cup dark-side-
+    down on it) almost never appears naturally from a fresh episode — yellow
+    pins are scattered on the field and rarely end up stacked with a cup on top
+    until mid-match.  The network had virtually no gradient signal for cup flip
+    decisions because it never encountered the state where a yellow pin is
+    already in a goal and the robot is holding a cup.
+    FIX: SCENARIO_INJECT_PROB fraction of episodes start mid-match with
+    randomly populated goal stacks (0–3 elements each), random toggle owners,
+    and random time_remaining in [SCENARIO_INJECT_TIME_MIN, TIME_MAX].  Cup
+    orientations in the injected stacks are randomised so the network trains
+    on both correct (preserve own yellow) and incorrect (cancel own yellow)
+    starting configurations.  Injection is mutually exclusive with the existing
+    late_start_prob (endgame parking) check.
+
   PROBLEM 67 (v9.2): Observation lacked explicit yellow toggle ownership per
     goal and cup placement quality signal, forcing the network to infer
     "should I flip my cup before scoring here?" by cross-referencing the
@@ -761,6 +776,19 @@ CURRICULUM_STAGES = [
         "min_steps": 1_500_000,
     },
 ]
+
+# -------------------------------------------------------------------------
+# v9.2: Mid-match scenario injection (PROBLEM 68)
+# -------------------------------------------------------------------------
+# SCENARIO_INJECT_PROB: fraction of episodes that start mid-match with random
+#   goal stacks.  0.20 = 20 % of all episodes are injected scenarios.
+# SCENARIO_INJECT_TIME_MIN/MAX: range of time_remaining (seconds) for the
+#   injected episodes.  Kept well outside endgame (> 20 s) and away from the
+#   very start of the driver period so all injected states represent genuine
+#   mid-match situations where cup-orientation decisions are critical.
+SCENARIO_INJECT_PROB     = 0.20   # 20% of episodes
+SCENARIO_INJECT_TIME_MIN = 30.0   # at least 30 s remaining (clear of endgame threshold)
+SCENARIO_INJECT_TIME_MAX = 100.0  # at most 100 s remaining (not the very start)
 
 # -------------------------------------------------------------------------
 # LOGGING / CHECKPOINTING

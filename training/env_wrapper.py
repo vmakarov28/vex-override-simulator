@@ -50,6 +50,12 @@ Reward shaping history:
         features (yellow_toggle_mine, cup_place_quality) giving the network
         direct context for cup-flip decisions (PROBLEM 67).
         Requires fresh training run.
+  v9.2 (cont.) — Scenario injection (PROBLEM 68): 20% of episodes start
+        mid-match with randomly populated goal stacks, random toggle owners,
+        and random time_remaining (30–100 s).  Cup orientations in injected
+        stacks are random so the network trains on both the self-cancel and
+        correct-placement cases from the very first episode of a run.
+        Mutually exclusive with late_start_prob (injection takes precedence).
 """
 
 import math
@@ -74,13 +80,14 @@ from config.hyperparameters import (
     PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
     DEFENSIVE_LINE_PERP_DIST, PARK_WINDOW_SECONDS,
     HOLDING_RAMP_SQ_CAP, INTAKE_CYCLE_TARGET,
+    SCENARIO_INJECT_PROB, SCENARIO_INJECT_TIME_MIN, SCENARIO_INJECT_TIME_MAX,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
     AUTONOMOUS_SECONDS, MIDFIELD_HALF, ROBOT_STARTS,
     ROBOT_MAX_SPEED, CENTER_GOAL_ID,
 )
-from simulation.game_objects import C_RED, C_BLUE, C_YELLOW
+from simulation.game_objects import C_RED, C_BLUE, C_YELLOW, CARRIED_FILTER
 from training.rnd import RNDModule
 from config.hyperparameters import RND_ENABLED, RND_UPDATE_EVERY
 
@@ -185,7 +192,22 @@ class OverrideEnv:
         for rid in AGENT_IDS:
             self._prev_target_dist[rid] = self._empty_target_dist(rid, robot_map)
 
-        if self.late_start_prob > 0 and self.rng.random() < self.late_start_prob:
+        # v9.2 (PROBLEM 68): scenario injection — must happen before
+        # late_start_prob so they are mutually exclusive (injection wins).
+        # _prev_toggle_owners and _prev_target_dist are re-synced after
+        # injection because the injected state changes both.
+        injected = self._inject_scenario()
+        if injected:
+            # Re-sync toggle tracker so first-step toggle-event rewards don't
+            # fire spuriously (toggle owners were set by injection, not by a
+            # real toggle action).
+            self._prev_toggle_owners = {t.toggle_id: t.owner
+                                        for t in self.sim.toggles}
+            # Re-compute approach distances now that some elements are scored
+            # (removed from field) by the injection.
+            for rid in AGENT_IDS:
+                self._prev_target_dist[rid] = self._empty_target_dist(rid, robot_map)
+        elif self.late_start_prob > 0 and self.rng.random() < self.late_start_prob:
             self.sim.match_phase    = "driver"
             self.sim.time_remaining = 20.0
             self.sim.time_elapsed   = TOTAL_SECONDS - 20.0
@@ -194,6 +216,125 @@ class OverrideEnv:
 
         self.sim.timer_started = True
         return build_all_observations(self.sim)
+
+    # -------------------------------------------------------------------------
+    def _inject_scenario(self) -> bool:
+        """
+        v9.2 (PROBLEM 68) — Mid-match scenario injection.
+
+        With probability SCENARIO_INJECT_PROB, populate goal stacks with
+        random elements and set a random mid-match time and toggle state.
+        This exposes the policy to cup-orientation decision points that
+        almost never appear in clean episode starts (yellow pin already in
+        a goal, robot holding a cup that needs to be oriented correctly).
+
+        Stack distribution per goal:
+          40 % empty
+          30 % one pin
+          20 % pin + cup  (cup flipped randomly → trains both orientations)
+          10 % pin + cup + pin
+
+        Returns True if injection was performed, False if skipped.
+        """
+        if self.rng.random() >= SCENARIO_INJECT_PROB:
+            return False
+
+        rng = self.rng
+
+        # 1. Set random driver-period time (outside endgame, not match start)
+        tr = float(rng.uniform(SCENARIO_INJECT_TIME_MIN, SCENARIO_INJECT_TIME_MAX))
+        self.sim.time_remaining           = tr
+        self.sim.time_elapsed             = TOTAL_SECONDS - tr
+        self.sim.match_phase              = "driver"
+        self.sim.timer_started            = True
+        self.sim.rules_engine.endgame_active = False  # stays outside endgame
+
+        # 2. Random toggle ownership
+        choices = ["red", "blue", "yellow"]
+        for t in self.sim.toggles:
+            t.owner = str(rng.choice(choices))
+
+        # 3. Build shuffled element pools from objects currently on the field
+        pin_pool = [p for p in self.sim.pins
+                    if not p.scored and p.carried_by is None]
+        cup_pool = [c for c in self.sim.cups
+                    if not c.scored and c.carried_by is None]
+        rng.shuffle(pin_pool)
+        rng.shuffle(cup_pool)
+        pin_idx = 0
+        cup_idx = 0
+
+        for goal in self.sim.goals:
+            # Weighted stack depth
+            r = rng.random()
+            if r < 0.40:
+                depth = 0   # empty
+            elif r < 0.70:
+                depth = 1   # pin only
+            elif r < 0.90:
+                depth = 2   # pin + cup
+            else:
+                depth = 3   # pin + cup + pin
+
+            if depth == 0:
+                continue
+
+            # --- First pin ---
+            if pin_idx >= len(pin_pool):
+                break
+            pin = pin_pool[pin_idx]; pin_idx += 1
+            pin.scored             = True
+            pin.carried_by         = None
+            pin.flipped            = bool(rng.random() < 0.5)
+            if pin.shape:
+                pin.shape.filter   = CARRIED_FILTER
+            pin.body.position         = (goal.x, goal.y)
+            pin.body.velocity         = (0.0, 0.0)
+            pin.body.angular_velocity = 0.0
+            goal.add_to_stack(pin)
+
+            if depth < 2:
+                continue
+
+            # --- Cup (random orientation to train both correct & wrong cases) ---
+            if cup_idx >= len(cup_pool):
+                continue
+            cup = cup_pool[cup_idx]; cup_idx += 1
+            cup.scored             = True
+            cup.carried_by         = None
+            cup.flipped            = bool(rng.random() < 0.5)
+            if cup.shape:
+                cup.shape.filter   = CARRIED_FILTER
+            cup.body.position         = (goal.x, goal.y)
+            cup.body.velocity         = (0.0, 0.0)
+            cup.body.angular_velocity = 0.0
+            goal.add_to_stack(cup)
+
+            if depth < 3:
+                continue
+
+            # --- Second pin (on top of cup) ---
+            if pin_idx >= len(pin_pool):
+                continue
+            pin2 = pin_pool[pin_idx]; pin_idx += 1
+            pin2.scored             = True
+            pin2.carried_by         = None
+            pin2.flipped            = bool(rng.random() < 0.5)
+            if pin2.shape:
+                pin2.shape.filter   = CARRIED_FILTER
+            pin2.body.position         = (goal.x, goal.y)
+            pin2.body.velocity         = (0.0, 0.0)
+            pin2.body.angular_velocity = 0.0
+            goal.add_to_stack(pin2)
+
+        # 4. Recompute live scores from the new stacks + toggle state
+        self.sim.rules_engine.recompute_all_scores(
+            self.sim.goals, self.sim.toggles, self.sim.robots
+        )
+        self.sim.red_score  = self.sim.rules_engine.red_score
+        self.sim.blue_score = self.sim.rules_engine.blue_score
+
+        return True
 
     # -------------------------------------------------------------------------
     def step(
