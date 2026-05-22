@@ -435,7 +435,7 @@ NUM_PARALLEL_ENVS = 32
 ROLLOUT_STEPS     = 512
 MINIBATCH_SIZE    = 256
 PPO_EPOCHS        = 10
-TOTAL_ENV_STEPS   = 6_500_000    # ~5 hour run (~410 steps/sec × 17,000s budget)
+TOTAL_ENV_STEPS   = 19_500_000   # resume target: 6.5M saved + ~13M new steps (~9h at 410 sps)
 
 # -------------------------------------------------------------------------
 # NETWORK ARCHITECTURE
