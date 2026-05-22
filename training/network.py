@@ -1,5 +1,5 @@
 """
-training/network.py  (v9 — goal attention, 592-dim obs)
+training/network.py  (v9.2 — goal attention, 610-dim obs)
 ────────────────────────────────────────────────────────────────────────────
 Neural network architecture for the VEX Override MAPPO system.
 
@@ -41,11 +41,20 @@ being_pinned_frac, score_lead_tight, dist_to_nearest_scorable).
 GOAL_OFFSET=56 and GOAL_BLOCK_END=209 unchanged; new dims land in the
 non-goal slice.  non_goal_dim = 592 - 9×17 = 439 (was 435).
 
+v9.2 change
+-----------
+OBS_DIM expanded from 592 → 610 (+18 = 9 goals × 2 new per-goal features:
+  [17] yellow_toggle_mine — 1 if my alliance owns the yellow-controlling toggle
+  [18] cup_place_quality  — +1/−1/0 cup orientation benefit for this goal).
+GOAL_FEATS 17→19; GOAL_BLOCK_END 209→227.
+non_goal_dim = 610 - 9×19 = 439 (unchanged — new dims absorbed into goal block).
+Fresh training run required (obs_dim mismatch with v9 checkpoints).
+
 Components
 ----------
 ObsEncoder
-  - obs_dim (=592) → feat_dim (=128) per observation
-  - non_goal_dim = 592 - 9×17 = 439; goal block = obs[:, 56:209]
+  - obs_dim (=610) → feat_dim (=128) per observation
+  - non_goal_dim = 610 - 9×19 = 439; goal block = obs[:, 56:227]
   - Used internally by Policy (1× per obs) and Critic (2× then merged).
 
 Policy (actor)
@@ -75,8 +84,8 @@ from config.hyperparameters import (
 # ─────────────────────────────────────────────────────────────────────────────
 GOAL_OFFSET     = 56                          # start of goal slots
 N_GOALS         = 9
-GOAL_FEATS      = 17                          # features per goal slot
-GOAL_BLOCK_END  = GOAL_OFFSET + N_GOALS * GOAL_FEATS   # 209
+GOAL_FEATS      = 19                          # v9.2: 17 + 2 (yellow_toggle_mine, cup_place_quality)
+GOAL_BLOCK_END  = GOAL_OFFSET + N_GOALS * GOAL_FEATS   # 56 + 9×19 = 227
 GOAL_EMBED_DIM  = 32                          # per-goal embedding size
 GOAL_HIDDEN_DIM = 64                          # internal width of the per-goal MLP
 

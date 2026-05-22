@@ -1,5 +1,5 @@
 """
-training/env_wrapper.py  (v9.1)
+training/env_wrapper.py  (v9.2)
 ==========================================================================
 Reward shaping history:
   v4 — Holding ramp, anti-reward-hacking baseline
@@ -40,6 +40,16 @@ Reward shaping history:
         ally_contact_penalty −3.0/step when allies within ALLY_CONTACT_DIST.
         ally_separation_bonus upgraded to linear gradient (0→full over
         0→ALLY_SEPARATION_TARGET).  teammate_overlap_penalty −0.12→−2.0.
+  v9.2 — Yellow self-cancel gap fixed (PROBLEM 65): section 10 cup placement
+        now handles yellow-topped pins via toggle ownership; three new causal
+        events: yellow_self_cancel (−8), yellow_deny_bonus (+12),
+        yellow_preserve_bonus (+3).  Cup orientation pre-placement shaping
+        added as section 3g (PROBLEM 66): proximity-weighted reward/penalty
+        for carrying cup in correct/wrong orientation while approaching a
+        goal with a pin on top.  OBS_DIM 592→610: two new per-goal obs
+        features (yellow_toggle_mine, cup_place_quality) giving the network
+        direct context for cup-flip decisions (PROBLEM 67).
+        Requires fresh training run.
 """
 
 import math
@@ -702,6 +712,62 @@ class OverrideEnv:
                 rewards[b.robot_id] += rw["ally_contact_penalty"]
         _track("ally_contact")
 
+        # 3g. v9.2 — Cup orientation pre-placement shaping (PROBLEM 66).
+        # Fires per-step when a robot is carrying a cup within SCORING_RADIUS×3
+        # of any legal goal whose top element is a pin.  Rewards the robot for
+        # already holding the cup in the correct orientation for that goal:
+        #   correct = eff_clear_up=False (clear side down) when preserving own pin
+        #           = eff_clear_up=True  (dark side down)  when denying opp pin
+        #           = eff_clear_up=False (clear side down) when own alliance owns the yellow toggle
+        #           = eff_clear_up=True  (dark side down)  when opp alliance owns the yellow toggle
+        # Proximity-weighted (same kernel as carrying_proximity).
+        # Shapes pre-placement behaviour so robots flip the cup BEFORE arriving
+        # at the goal, not after — by then it's too late.
+        for rid in AGENT_IDS:
+            r = robot_map[rid]
+            if r.carrying_cup is None:
+                continue
+            rx, ry = float(r.body.position.x), float(r.body.position.y)
+            cup_eff_clear = _eff_clear_up(r.carrying_cup)
+            best_goal_reward = 0.0
+            for g in self.sim.goals:
+                if g.alliance not in ("neutral", r.alliance):
+                    continue
+                if not g.stack or not g.stack[-1][1]:  # top must be a pin
+                    continue
+                d = math.hypot(rx - g.x, ry - g.y)
+                if d > SCORING_RADIUS * 3:
+                    continue
+                top_obj, _ = g.stack[-1]
+                top_up_col = top_obj.get_up_color()
+                # Determine the correct cup orientation for this goal
+                if top_up_col == C_RED or top_up_col == C_BLUE:
+                    # Solid color: deny opp (dark-down=True), preserve own (clear-down=False)
+                    top_is_own = (top_up_col == C_RED and r.alliance == "red") or \
+                                 (top_up_col == C_BLUE and r.alliance == "blue")
+                    correct_clear_up = not top_is_own
+                elif top_up_col == C_YELLOW:
+                    # Yellow: depends on toggle ownership
+                    towner = _get_toggle_for_goal(g, list(self.sim.toggles))
+                    if towner == r.alliance:
+                        correct_clear_up = False  # preserve own yellow: clear side down
+                    elif towner is not None:
+                        correct_clear_up = True   # deny opponent yellow: dark side down
+                    else:
+                        continue  # unowned toggle — no orientation preference yet
+                else:
+                    continue
+                prox = 1.0 / (1.0 + d / GOAL_PROXIMITY_NORM)
+                if cup_eff_clear == correct_clear_up:
+                    goal_r = rw["cup_orient_correct"] * prox
+                else:
+                    goal_r = rw["cup_orient_wrong"] * prox
+                # Only count the single most-relevant goal per robot
+                if abs(goal_r) > abs(best_goal_reward):
+                    best_goal_reward = goal_r
+            rewards[rid] += best_goal_reward
+        _track("cup_orientation")
+
         # 3f. Yellow-pin approach reward (v7 + v8.1 strategic extension).
         # v7: empty-handed robot whose alliance owns ANY toggle gets a
         # pull toward the nearest yellow-sided pin (so pickup priority
@@ -929,10 +995,30 @@ class OverrideEnv:
                                 for rid in ally_rids: rewards[rid] += rw["denial_success"] * endgame_mult
                             elif _is_own_color(pin_up_col, scorer_alliance):
                                 for rid in ally_rids: rewards[rid] += rw["denial_own"] * endgame_mult
+                            elif pin_up_col == C_YELLOW:
+                                # v9.2 (PROBLEM 65): yellow not caught by _is_own/opp_color.
+                                # Dark side blocks yellow UP half — evaluate via toggle.
+                                towner = _get_toggle_for_goal(goal, list(self.sim.toggles))
+                                if towner == scorer_alliance:
+                                    # Blocking OWN alliance's yellow — strong self-cancel penalty
+                                    for rid in ally_rids: rewards[rid] += rw["yellow_self_cancel"] * endgame_mult
+                                elif towner is not None:
+                                    # Blocking OPPONENT's yellow — good denial!
+                                    for rid in ally_rids: rewards[rid] += rw["yellow_deny_bonus"] * endgame_mult
+                                # towner is None (unowned toggle): no causal yellow reward
                         else:
                             # Clear bottom faces pin — pin's UP half stays VISIBLE.
                             if _is_opponent_color(pin_up_col, scorer_alliance):
                                 for rid in ally_rids: rewards[rid] += rw["denial_preserved_opp"] * endgame_mult
+                            elif pin_up_col == C_YELLOW:
+                                # v9.2 (PROBLEM 65): clear side preserves yellow UP half.
+                                towner = _get_toggle_for_goal(goal, list(self.sim.toggles))
+                                if towner == scorer_alliance:
+                                    # Correctly preserving OWN alliance's yellow — bonus!
+                                    for rid in ally_rids: rewards[rid] += rw["yellow_preserve_bonus"] * endgame_mult
+                                elif towner is not None:
+                                    # Preserving OPPONENT's yellow — same as denial_preserved_opp
+                                    for rid in ally_rids: rewards[rid] += rw["denial_preserved_opp"] * endgame_mult
                 if cup_idx >= 1:
                     for rid in ally_rids: rewards[rid] += rw["stack_bonus"] * endgame_mult
         _track("causal_scoring")

@@ -1,5 +1,5 @@
 """
-config/hyperparameters.py  (v9)
+config/hyperparameters.py  (v9.2)
 =================================
 REWARD REDESIGN v7
 ------------------
@@ -389,12 +389,51 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     FIX: separation bonus now scales linearly with distance:
     reward = ally_separation_bonus × min(1, d / ALLY_SEPARATION_TARGET).
     Gradient always pulls teammates apart, not just past a cliff edge.
+
+  PROBLEM 65 (v9.2): Yellow-pin self-cancellation reward gap.
+    _is_own_color() / _is_opponent_color() returned False for C_YELLOW, so
+    placing a cup dark-side-down on an allied yellow pin never triggered
+    the causal `denial_own` penalty.  The score_delta / own_score_abs signals
+    partially compensated (score drops → negative reward), but there was no
+    explicit causal event signal for yellow self-cancellation, and no bonus
+    for correctly denying an opponent's yellow with a dark-side-down cup.
+    FIX: section 10 of env_wrapper now handles yellow-topped pins using
+    toggle ownership to determine alliance.  Three new reward keys:
+      yellow_self_cancel  −8.0 (one-time): dark cup blocks own-alliance yellow
+      yellow_deny_bonus  +12.0 (one-time): dark cup blocks opponent yellow
+      yellow_preserve_bonus +3.0 (one-time): clear cup correctly preserves own yellow
+    Weights are stronger than the red/blue analogues (denial_own -4, denial_success
+    +12) because yellow halves are worth 10 pts vs 5 pts for red/blue.
+
+  PROBLEM 66 (v9.2): No pre-placement cup orientation guidance.
+    Robots had no shaping signal to flip their cup BEFORE reaching the goal.
+    By the time they pressed score, the wrong orientation was already chosen.
+    FIX: section 3g rewards correct cup orientation while approaching any
+    goal that has a pin on top: +cup_orient_correct per step if orientation
+    would preserve own / deny opponent; −cup_orient_wrong if orientation
+    would cancel own / preserve opponent.  Both scaled by proximity to goal.
+
+  PROBLEM 67 (v9.2): Observation lacked explicit yellow toggle ownership per
+    goal and cup placement quality signal, forcing the network to infer
+    "should I flip my cup before scoring here?" by cross-referencing the
+    toggle section (4×5) against the goal section — a non-trivial inference
+    requiring several non-linear steps.
+    FIX: Two new features added to each goal's observation slot (17→19 dims,
+    OBS_DIM 592→610):
+      [17] yellow_toggle_mine: 1 if my alliance owns the toggle controlling
+           yellow scoring for this goal (or would win SC5b majority for center).
+      [18] cup_place_quality: if carrying cup, +1 if current orientation is
+           correct for this goal's top pin (preserves own / denies opponent),
+           −1 if wrong, 0 if not carrying cup or no pin on top.
+    The goal-attention MLP in network.py sees these on every goal slot
+    automatically (GOAL_FEATS 17→19; no other architectural change needed).
+    NOTE: OBS_DIM change requires a fresh training run.
 """
 
 # -------------------------------------------------------------------------
 # OBSERVATION / ACTION SPACE
 # -------------------------------------------------------------------------
-OBS_DIM     = 592   # v9: 588 base + 4 (v9 pressure features: in_scoring_range, being_pinned_frac, score_lead_tight, dist_to_nearest_scorable)
+OBS_DIM     = 610   # v9.2: 592 base + 18 (9 goals × 2 new features: yellow_toggle_mine, cup_place_quality — PROBLEM 67)
 ACTION_CONT = 2
 ACTION_DISC = 7
 
@@ -435,7 +474,7 @@ NUM_PARALLEL_ENVS = 32
 ROLLOUT_STEPS     = 512
 MINIBATCH_SIZE    = 256
 PPO_EPOCHS        = 10
-TOTAL_ENV_STEPS   = 19_500_000   # resume target: 6.5M saved + ~13M new steps (~9h at 410 sps)
+TOTAL_ENV_STEPS   = 10_000_000   # resume target: 6.5M saved + ~13M new steps (~9h at 410 sps)
 
 # -------------------------------------------------------------------------
 # NETWORK ARCHITECTURE
@@ -538,6 +577,20 @@ REWARD_WEIGHTS = {
     "score_under_pressure":      5.0,    # one-time at score moment when any opponent is within PINNING_CONTACT_DIST
     "win_threshold_bonus":      10.0,    # one-time when lead first crosses +15 pts
     "sc5b_park_bonus":           1.5,    # per-step × progress ramp; 0 at t=8 s, 1.5/step at t=0 s (SC5b strategic shaping)
+
+    # --- v9.2: Yellow cup placement attribution (PROBLEM 65) ----------------
+    # Fired once at cup placement based on what's beneath and toggle ownership.
+    # Stronger than red/blue analogues (denial_own/denial_success) because
+    # yellow halves score 10 pts vs 5 pts for red/blue.
+    "yellow_self_cancel":      -8.0,   # dark cup blocks own-alliance yellow — heavier than denial_own (-4)
+    "yellow_deny_bonus":       12.0,   # dark cup blocks opponent's yellow — same as denial_success
+    "yellow_preserve_bonus":    3.0,   # clear cup correctly preserves own yellow
+
+    # --- v9.2: Cup orientation shaping pre-placement (PROBLEM 66) -----------
+    # Per-step, proximity-weighted.  Fires when carrying a cup within
+    # SCORING_RADIUS × 3 of a goal whose top is a pin.
+    "cup_orient_correct":       0.04,  # current orientation is right for this goal
+    "cup_orient_wrong":        -0.04,  # current orientation is wrong for this goal
 
     # --- Endgame ---------------------------------------------------------
     "midfield_endgame":          1.0,   # per-step × progress ramp (0 at window open → 1.0/step at t=0); 8-s window (PROBLEM 62)

@@ -1,36 +1,42 @@
 """
 utils/observation_builder.py
 ────────────────────────────────────────────────────────────────────────────
-Builds the fixed-size 592-dimensional observation vector for one agent.
+Builds the fixed-size 610-dimensional observation vector for one agent.
 
 Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
   [  0: 24]  Self state
   [ 24: 36]  Teammate state
   [ 36: 56]  Opponents (2 × 10)
-  [ 56:209]  Goals (9 × 17 = 153)
-  [209:429]  K-nearest pins (20 × 11 = 220)  [v8.3: +1 nearest-goal dist per pin]
-  [429:534]  K-nearest cups (15 × 7 = 105)
-  [534:554]  Toggles (4 × 5 = 20)
-  [554:574]  Global match state (20)  [v7]
-  [574:584]  v8.1 self-awareness + defensive intel (10)
+  [ 56:227]  Goals (9 × 19 = 171)  [v9.2: +2 per goal vs v9's 17]
+               Per-goal features [0..16 same as v9, +2 new]:
+               [17] yellow_toggle_mine: 1 if my alliance owns the toggle
+                    controlling yellow scoring for this goal
+               [18] cup_place_quality: if carrying cup, +1 if current
+                    orientation correctly preserves own / denies opponent,
+                    −1 if wrong, 0 if no cup or no pin on top
+  [227:447]  K-nearest pins (20 × 11 = 220)
+  [447:552]  K-nearest cups (15 × 7 = 105)
+  [552:572]  Toggles (4 × 5 = 20)
+  [572:592]  Global match state (20)
+  [592:602]  v8.1 self-awareness + defensive intel (10)
                - own carry_steps / TIME_TO_SCORE_TARGET (1)
                - own holding-overshoot ratio (1)
                - opp1 carrying pin UP colour one-hot (3)
                - opp2 carrying pin UP colour one-hot (3)
                - yellow pins remaining / 12 (1)
                - can-score-anywhere bit (1)
-  [584:588]  v8.2 movement intelligence (4)
+  [602:606]  v8.2 movement intelligence (4)
                - own speed magnitude / MAX_SPEED (1)
                - teammate carry_steps / TIME_TO_SCORE_TARGET (1)
                - opp1 speed magnitude / MAX_SPEED (1)
                - opp2 speed magnitude / MAX_SPEED (1)
-  [588:592]  v9 pressure features (4)
+  [606:610]  v9 pressure features (4)
                - in_scoring_range: 1 if within SCORING_RADIUS of a legal scorable goal while carrying (1)
                - being_pinned_frac: opponents within PINNING_CONTACT_DIST / 2.0 (1)
                - score_lead_tight: (my - opp) / 15.0 clamped [-1, 1] (1)
                - dist_to_nearest_scorable_goal / FIELD_DIAG; 1.0 if not carrying (1)
   ──────────
-  Total: 592
+  Total: 610
 """
 
 import math
@@ -64,7 +70,7 @@ MAX_ANG_VEL = 10.0
 K_PINS = 20   # nearest pins to encode
 K_CUPS = 15   # nearest cups to encode
 
-OBS_DIM = 592
+OBS_DIM = 610
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color → one-hot helper  (3 bits: [red, blue, yellow])
@@ -298,6 +304,58 @@ def build_observation(
                 elif up_col == C_YELLOW:
                     top_pin_up_yellow = 1.0
 
+        # v9.2 [17]: yellow_toggle_mine — 1 if my alliance owns the toggle
+        # controlling yellow scoring for this goal.  For the center goal,
+        # proxy on current midfield count majority (not final, but directional).
+        yellow_toggle_mine = 0.0
+        is_center = (goal.goal_id == CENTER_GOAL_ID)
+        if is_center:
+            # Use current midfield counts as a proxy for SC5b majority
+            my_mid  = rules_engine.midfield_red_count  if robot.alliance == "red" else rules_engine.midfield_blue_count
+            opp_mid = rules_engine.midfield_blue_count if robot.alliance == "red" else rules_engine.midfield_red_count
+            if my_mid > opp_mid:
+                yellow_toggle_mine = 1.0
+        else:
+            # Non-center: check which toggle controls this goal's quadrant
+            gdx_raw = goal.x - 72.0
+            gdy_raw = goal.y - 72.0
+            if abs(gdx_raw) >= abs(gdy_raw):
+                ctrl_tid = 1 if gdx_raw <= 0 else 2
+            else:
+                ctrl_tid = 3 if gdy_raw <= 0 else 4
+            for tog in toggles:
+                if tog.toggle_id == ctrl_tid and tog.owner == robot.alliance:
+                    yellow_toggle_mine = 1.0
+                    break
+
+        # v9.2 [18]: cup_place_quality — if carrying cup, +1 if current cup
+        # orientation is correct for scoring on this goal's top pin:
+        #   correct = clear-side-down (eff_clear_up=False) when preserving OWN pin
+        #           = dark-side-down  (eff_clear_up=True)  when denying OPP pin
+        # −1 if orientation is wrong, 0 if not carrying cup or no pin on top.
+        cup_place_quality = 0.0
+        if robot.carrying_cup is not None and goal.stack and goal.stack[-1][1]:
+            top_pin_obj, _ = goal.stack[-1]
+            cup_eff_clear   = (not robot.carrying_cup.clear_on_top
+                               if getattr(robot.carrying_cup, 'flipped', False)
+                               else robot.carrying_cup.clear_on_top)
+            # Determine correct orientation for this goal's top pin
+            if top_pin_up_red > 0 or top_pin_up_blue > 0:
+                # Solid color pin: correct = dark-side-down (eff_clear=True) for opponent, clear-side-down for own
+                top_is_own = (top_pin_up_red > 0 and robot.alliance == "red") or \
+                             (top_pin_up_blue > 0 and robot.alliance == "blue")
+                correct_eff_clear = not top_is_own   # deny opp=True, preserve own=False
+            elif top_pin_up_yellow > 0:
+                # Yellow: correct depends on toggle ownership
+                if yellow_toggle_mine > 0:
+                    correct_eff_clear = False  # preserve own yellow: clear-side-down
+                else:
+                    correct_eff_clear = True   # deny opponent yellow or neutral: dark-side-down
+            else:
+                correct_eff_clear = None  # unknown, skip
+            if correct_eff_clear is not None:
+                cup_place_quality = 1.0 if (cup_eff_clear == correct_eff_clear) else -1.0
+
         obs[ptr + 0]  = gdx
         obs[ptr + 1]  = gdy
         obs[ptr + 2]  = gdist
@@ -315,9 +373,11 @@ def build_observation(
         obs[ptr + 14] = top_pin_up_red
         obs[ptr + 15] = top_pin_up_blue
         obs[ptr + 16] = top_pin_up_yellow
-        ptr += 17
+        obs[ptr + 17] = yellow_toggle_mine    # v9.2
+        obs[ptr + 18] = cup_place_quality     # v9.2
+        ptr += 19
 
-    # ── [209:429] K-nearest pins (20 × 11) ───────────────────────────────────
+    # ── [227:447] K-nearest pins (20 × 11) ───────────────────────────────────
     # Slot layout per pin: [dx, dy, dist, carried, up_r, up_g, up_b, dn_r, dn_g, dn_b,
     #                       nearest_goal_dist]  (v8.3: +1 mirrors cup obs[ptr+6])
     live_pins = [p for p in pins if not p.scored]
@@ -341,7 +401,7 @@ def build_observation(
             obs[ptr + 10] = min(pin_g_dists) / FIELD_DIAG if pin_g_dists else 0.0
         ptr += 11
 
-    # ── [409:514] K-nearest cups (15 × 7) ────────────────────────────────────
+    # ── [447:552] K-nearest cups (15 × 7) ────────────────────────────────────
     live_cups = [c for c in cups if not c.scored]
     live_cups.sort(key=lambda c: math.hypot(float(c.body.position.x) - rx,
                                              float(c.body.position.y) - ry))
@@ -361,7 +421,7 @@ def build_observation(
             obs[ptr + 6] = min_cup_g
         ptr += 7
 
-    # ── [514:534] Toggles (4 × 5) ────────────────────────────────────────────
+    # ── [552:572] Toggles (4 × 5) ────────────────────────────────────────────
     for tog in toggles:
         tgx, tgy = float(tog.x), float(tog.y)
         obs[ptr + 0] = (tgx - rx) / FIELD_WIDTH
