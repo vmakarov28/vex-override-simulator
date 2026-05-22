@@ -138,7 +138,7 @@ class OverrideEnv:
         # penalty doesn't fire immediately after a successful flip.
         self._toggle_grace: Dict[int, int] = {}
 
-        self.rnd = RNDModule(obs_dim=OBS_DIM, device=torch.device("cpu")) if RND_ENABLED else None
+        self.rnd = RNDModule(obs_dim=OBS_DIM, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")) if RND_ENABLED else None
 
     # -------------------------------------------------------------------------
     def reset(self) -> Dict[str, np.ndarray]:
@@ -1182,17 +1182,16 @@ class OverrideEnv:
                 blocked = True
         _track("defensive_position")
 
-        # 14. RND Intrinsic Reward — use pre-built post_obs to avoid redundant builds
+        # 14. RND Intrinsic Reward — inference only in workers (no backward pass).
+        # Predictor training skipped here: 16 simultaneous backward+Adam steps
+        # across workers exhaust VRAM. The fixed target network still drives a
+        # meaningful novelty signal without per-step predictor updates.
         if self.rnd is not None:
-            # Update predictor once per update cadence (not once per agent)
-            do_update = self.rnd.should_update(self._step_count)
             obs_cache = post_obs if post_obs is not None else build_all_observations(self.sim)
             for rid in AGENT_IDS:
                 obs_t     = torch.FloatTensor(obs_cache[rid]).to(self.rnd.device)
                 intrinsic = self.rnd.compute_intrinsic_reward(obs_t).item()
                 rewards[rid] += intrinsic
-                if do_update:
-                    self.rnd.update(obs_t.unsqueeze(0))
             _track("rnd_intrinsic")
 
         # Diagnostic: fraction of robots currently over the holding timeout.
