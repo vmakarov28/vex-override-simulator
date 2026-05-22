@@ -138,7 +138,7 @@ class OverrideEnv:
         # penalty doesn't fire immediately after a successful flip.
         self._toggle_grace: Dict[int, int] = {}
 
-        self.rnd = RNDModule(obs_dim=OBS_DIM, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")) if RND_ENABLED else None
+        self.rnd = RNDModule(obs_dim=OBS_DIM, device=torch.device("cpu")) if RND_ENABLED else None
 
     # -------------------------------------------------------------------------
     def reset(self) -> Dict[str, np.ndarray]:
