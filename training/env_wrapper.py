@@ -1,5 +1,5 @@
 """
-training/env_wrapper.py  (v9)
+training/env_wrapper.py  (v9.1)
 ==========================================================================
 Reward shaping history:
   v4 — Holding ramp, anti-reward-hacking baseline
@@ -34,6 +34,12 @@ Reward shaping history:
         contested), win_threshold_bonus (one-time +15-pt lead crossing).
         +4 obs dims (592-dim total): in_scoring_range, being_pinned_frac,
         score_lead_tight, dist_to_nearest_scorable.
+  v9.1 — Park window 3→8 s with progress ramp (later = more reward/step).
+        midfield_exit_penalty fires on midfield exit during window, scaled
+        ×progress² so late exits cost more; anti-exploit proven.
+        ally_contact_penalty −3.0/step when allies within ALLY_CONTACT_DIST.
+        ally_separation_bonus upgraded to linear gradient (0→full over
+        0→ALLY_SEPARATION_TARGET).  teammate_overlap_penalty −0.12→−2.0.
 """
 
 import math
@@ -54,7 +60,7 @@ from config.hyperparameters import (
     PINNING_STEPS_LIMIT, PINNING_CONTACT_DIST,
     GOAL_PROXIMITY_NORM,
     SPIN_ANG_VEL_THRESHOLD, SPIN_TRANS_THRESHOLD, TOGGLE_CAMP_RADIUS,
-    ALLY_SEPARATION_TARGET, TIME_TO_SCORE_TARGET,
+    ALLY_SEPARATION_TARGET, ALLY_CONTACT_DIST, TIME_TO_SCORE_TARGET,
     PROX_CARRY_DECAY_STEPS, TOGGLE_LEAVE_GRACE_STEPS,
     DEFENSIVE_LINE_PERP_DIST, PARK_WINDOW_SECONDS,
     HOLDING_RAMP_SQ_CAP, INTAKE_CYCLE_TARGET,
@@ -122,6 +128,12 @@ class OverrideEnv:
         # based on midfield robot majority at match end.
         self._pending_center_yellow_halves: int = 0
 
+        # v9.1: per-robot midfield state from the PREVIOUS step.
+        # Used to detect exits (was_in=True, is_in=False) for the exit penalty.
+        # Updated every step (not just during the park window) so the state
+        # is accurate when the window opens.
+        self._prev_midfield: Dict[str, bool] = {rid: False for rid in AGENT_IDS}
+
         # v8: toggle grace tracker — {toggle_id: steps_remaining} so camping
         # penalty doesn't fire immediately after a successful flip.
         self._toggle_grace: Dict[int, int] = {}
@@ -144,6 +156,7 @@ class OverrideEnv:
         self._steps_since_last_score = {rid: MAX_EPISODE_STEPS + 1 for rid in AGENT_IDS}
         self._last_drop_step         = {rid: -1 for rid in AGENT_IDS}
         self._pending_center_yellow_halves = 0  # v9 SC5b deferred-yellow counter
+        self._prev_midfield = {rid: False for rid in AGENT_IDS}  # v9.1 exit-penalty tracker
         # NOTE: do NOT clear self._reward_components here.  Per-component
         # sums persist across episodes within a rollout so the training loop
         # can drain them once per update cycle for logging.
@@ -653,10 +666,12 @@ class OverrideEnv:
                     break  # one penalty per pair per step
         _track("teammate_overlap")
 
-        # 3e. v7 — Ally separation bonus.
-        # Small per-step reward when the two alliance robots are at least
-        # ALLY_SEPARATION_TARGET inches apart.  Pulls them out of "share one
-        # element" loops without explicitly assigning roles.
+        # 3e. v9.1 — Ally separation gradient bonus (PROBLEM 64).
+        # v7 used a binary threshold (>= TARGET → full bonus, else 0).
+        # v9.1 replaces this with a linear gradient:
+        #   reward = ally_separation_bonus × min(1, d / ALLY_SEPARATION_TARGET)
+        # This provides a smooth pull away from the teammate at all distances
+        # (0 when touching, full bonus at TARGET, capped beyond TARGET).
         for alliance in ("red", "blue"):
             allies = [robot_map[r] for r in AGENT_IDS if robot_map[r].alliance == alliance]
             if len(allies) < 2:
@@ -664,10 +679,28 @@ class OverrideEnv:
             a, b = allies[0], allies[1]
             d = math.hypot(float(a.body.position.x) - float(b.body.position.x),
                            float(a.body.position.y) - float(b.body.position.y))
-            if d >= ALLY_SEPARATION_TARGET:
-                rewards[a.robot_id] += rw["ally_separation_bonus"]
-                rewards[b.robot_id] += rw["ally_separation_bonus"]
+            ratio = min(1.0, d / ALLY_SEPARATION_TARGET)
+            rewards[a.robot_id] += rw["ally_separation_bonus"] * ratio
+            rewards[b.robot_id] += rw["ally_separation_bonus"] * ratio
         _track("ally_separation")
+
+        # 3e.1 v9.1 — Ally contact penalty (PROBLEM 63).
+        # Direct per-step penalty when two allied robots are within
+        # ALLY_CONTACT_DIST inches (physical contact zone).  Stops ally-on-ally
+        # pinning/pushing that blocks both robots from efficiently cycling.
+        # Complements the separation gradient: gradient pulls apart at range,
+        # contact penalty punishes actual collisions.
+        for alliance in ("red", "blue"):
+            allies = [robot_map[r] for r in AGENT_IDS if robot_map[r].alliance == alliance]
+            if len(allies) < 2:
+                continue
+            a, b = allies[0], allies[1]
+            d = math.hypot(float(a.body.position.x) - float(b.body.position.x),
+                           float(a.body.position.y) - float(b.body.position.y))
+            if d < ALLY_CONTACT_DIST:
+                rewards[a.robot_id] += rw["ally_contact_penalty"]
+                rewards[b.robot_id] += rw["ally_contact_penalty"]
+        _track("ally_contact")
 
         # 3f. Yellow-pin approach reward (v7 + v8.1 strategic extension).
         # v7: empty-handed robot whose alliance owns ANY toggle gets a
@@ -732,6 +765,13 @@ class OverrideEnv:
         # stationary/parked carries.  Fixes the drop-cycle exploit where moving
         # carriers were penalised identically to parked ones, making dropping
         # cheaper than continuing to the goal (PROBLEM 57).
+        #
+        # Diagnostics (v9, no reward effect): track how often the gate fires
+        # vs. how often it exempts a moving carrier.  Visible in [Rwd] log as
+        # `holding_gate_fired` (penalty applied) and `holding_gate_exempt`
+        # (over-timeout carrier was moving and skipped the penalty).
+        n_fired = 0
+        n_exempt = 0
         for rid in AGENT_IDS:
             cs = self._carry_steps[rid]
             if cs > HOLDING_TIMEOUT_STEPS:
@@ -742,6 +782,12 @@ class OverrideEnv:
                     ratio     = min((overshoot / HOLDING_RAMP_STEPS) ** 2,
                                     HOLDING_RAMP_SQ_CAP)
                     rewards[rid] += rw["holding_penalty_rate"] * ratio
+                    n_fired += 1
+                else:
+                    n_exempt += 1
+        # Per-step fractions averaged across n_component_rollouts at log time.
+        rc["holding_gate_fired"]  = rc.get("holding_gate_fired",  0.0) + (n_fired  / float(len(AGENT_IDS)))
+        rc["holding_gate_exempt"] = rc.get("holding_gate_exempt", 0.0) + (n_exempt / float(len(AGENT_IDS)))
         _track("holding_timeout")
 
         # 6. Empty-hand approach delta
@@ -907,20 +953,70 @@ class OverrideEnv:
                 self._toggle_grace[toggle.toggle_id] = TOGGLE_LEAVE_GRACE_STEPS
         _track("toggle_events")
 
-        # 12. Midfield park bonus — v8.2: ONLY fires in the final PARK_WINDOW_SECONDS
-        # (3 s) of the match at a strong flat rate.  No ramp multiplier needed;
-        # the narrow window already makes last-second commitment clearly better
-        # than early parking.  obs[ptr+19] urgency ramp covers the same 3-s window
-        # so the policy gets a clean "park now" cue without any reward engineering.
+        # 12. Midfield park bonus — v9.1: extended to 8-s window with progress
+        # ramp.  rate = midfield_endgame × progress, where
+        # progress = (PARK_WINDOW_SECONDS − tr) / PARK_WINDOW_SECONDS.
+        # → 0/step at t=8 s (window open), 1.0/step at t=0 s (match end).
+        # Being in midfield later is ALWAYS worth more per step.
+        # Total max (stay full 8 s): ∑ progress × steps ≈ +80 per robot.
+        # obs[ptr+19] urgency ramp is now aligned to the same 8-s horizon
+        # (ENDGAME_RAMP_SECONDS = 8) so the policy has a clean contextual cue.
         tr = float(self.sim.time_remaining)
         if self.sim.rules_engine.endgame_active and tr <= PARK_WINDOW_SECONDS:
+            progress = max(0.0, (PARK_WINDOW_SECONDS - tr) / PARK_WINDOW_SECONDS)
+            step_rate = rw["midfield_endgame"] * progress
             mc_x = mc_y = 72.0
             for r in self.sim.robots:
                 rx = float(r.body.position.x)
                 ry = float(r.body.position.y)
                 if abs(rx - mc_x) + abs(ry - mc_y) <= MIDFIELD_HALF + 10.0:
-                    rewards[r.robot_id] += rw["midfield_endgame"]
+                    rewards[r.robot_id] += step_rate
         _track("midfield_endgame")
+
+        # 12b. v9.1 SC5b park bonus — same 8-s progress ramp as midfield_endgame.
+        # Rate = sc5b_park_bonus × progress: 0/step at t=8 s, 1.5/step at t=0 s.
+        # Fires unconditionally (no yellow requirement) so the policy is
+        # incentivised both to CLAIM yellows and to DENY them via tie-forcing.
+        # Combined peak: (1.0 + 1.5) × 1.0 = 2.5/step at match end.
+        if self.sim.rules_engine.endgame_active and tr <= PARK_WINDOW_SECONDS:
+            progress = max(0.0, (PARK_WINDOW_SECONDS - tr) / PARK_WINDOW_SECONDS)
+            for r in self.sim.robots:
+                if self.sim.rules_engine.is_robot_in_midfield(r):
+                    rewards[r.robot_id] += rw["sc5b_park_bonus"] * progress
+        _track("sc5b_park_bonus")
+
+        # 12c. v9.1 — Midfield exit penalty (PROBLEM 62).
+        # Fires ONCE when a robot LEAVES the midfield during the park window.
+        # Penalty = midfield_exit_penalty × progress²  (quadratic, always ≤ 0).
+        #
+        # Anti-exploit proof:
+        #   At any progress p, the per-step park reward rate = 2.5 × p.
+        #   An exit at progress p costs: |−40| × p² = 40p² reward units.
+        #   Any "scoring run" outside midfield yields at most ~8-10 reward units.
+        #   Since 40p² + (forgone step rewards during gap) >> 8-10 for all p≥0.25,
+        #   leaving is NEVER net-positive once the robot is meaningfully into
+        #   the window.  Near the window start (p≈0), both reward and penalty
+        #   are near zero, so leaving early is not punished harshly (correct —
+        #   there is still time to score before committing).
+        #
+        # _prev_midfield is updated EVERY step (below) so the state is correct
+        # whether or not the park window is active.
+        if self.sim.rules_engine.endgame_active and tr <= PARK_WINDOW_SECONDS:
+            progress = max(0.0, (PARK_WINDOW_SECONDS - tr) / PARK_WINDOW_SECONDS)
+            for r in self.sim.robots:
+                was_in = self._prev_midfield.get(r.robot_id, False)
+                is_in  = self.sim.rules_engine.is_robot_in_midfield(r)
+                if was_in and not is_in:
+                    # quadratic scale: harsher the later the exit
+                    rewards[r.robot_id] += rw["midfield_exit_penalty"] * (progress ** 2)
+        _track("midfield_exit")
+
+        # Update _prev_midfield every step (outside the window gate) so the
+        # transition from pre-window to in-window is captured correctly.
+        for r in self.sim.robots:
+            self._prev_midfield[r.robot_id] = (
+                self.sim.rules_engine.is_robot_in_midfield(r)
+            )
 
         # 13a. Spin penalty — penalise in-place spinning.
         # Fires when angular velocity is high AND translational speed is low,

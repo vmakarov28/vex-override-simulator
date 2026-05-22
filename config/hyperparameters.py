@@ -360,6 +360,35 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     FIX (reward shaping):  env_wrapper section 10 skips center-goal yellow
     halves at placement; the count is tallied and paid out in the terminal
     block based on the same midfield-majority rule.
+
+  PROBLEM 62 (v9.1): Robots entered midfield during the last 20 s but
+    drifted out before the old 3-s park window opened — earning zero SC5b
+    reward for the commitment.  The narrow window also had no exit cost, so
+    cycling in-and-out was free.
+    FIX: PARK_WINDOW_SECONDS 3 → 8 s.  Both midfield_endgame and
+    sc5b_park_bonus are ramped linearly (rate = weight × progress, where
+    progress = (8-tr)/8 → 0 at t=8 s, 1 at t=0 s), so being in midfield
+    later is always worth more per step.  A new midfield_exit_penalty fires
+    once when a robot leaves the midfield during the window, scaled
+    quadratically: penalty = midfield_exit_penalty × progress².  The
+    quadratic exponent means exit later = more punishment, and because
+    penalty > step-reward at every progress value, leave-and-reenter
+    cycling is always net-negative.  ENDGAME_RAMP_SECONDS updated to 8 s
+    so obs[ptr+19] urgency ramp rises from the same 8-s horizon.
+
+  PROBLEM 63 (v9.1): Allied robots crash into and pin each other.
+    teammate_overlap_penalty (−0.12) and the small (0.02) binary
+    ally_separation_bonus were too weak to deter allied collisions.  No
+    direct cost existed for physical contact between allies.
+    FIX: ally_contact_penalty = −3.0/step when allies are within
+    ALLY_CONTACT_DIST (14 in).  teammate_overlap_penalty −0.12 → −2.0
+    (×17) so same-goal crowding is expensive, not trivial.
+
+  PROBLEM 64 (v9.1): Ally separation had no gradient — robots at 44 in
+    apart earned the same +0 as robots touching (binary threshold at 45 in).
+    FIX: separation bonus now scales linearly with distance:
+    reward = ally_separation_bonus × min(1, d / ALLY_SEPARATION_TARGET).
+    Gradient always pulls teammates apart, not just past a cliff edge.
 """
 
 # -------------------------------------------------------------------------
@@ -406,7 +435,7 @@ NUM_PARALLEL_ENVS = 32
 ROLLOUT_STEPS     = 512
 MINIBATCH_SIZE    = 256
 PPO_EPOCHS        = 10
-TOTAL_ENV_STEPS   = 200_000      # v9 smoke test (set to 24_000_000 for full run)
+TOTAL_ENV_STEPS   = 6_500_000    # ~5 hour run (~410 steps/sec × 17,000s budget)
 
 # -------------------------------------------------------------------------
 # NETWORK ARCHITECTURE
@@ -493,10 +522,11 @@ REWARD_WEIGHTS = {
     "intake_cycle_bonus":      1.5,    # one-time at intake: bonus × max(0, 1 - steps_since_last_score/INTAKE_CYCLE_TARGET)
 
     # --- v7: division of labour & cycle efficiency -----------------------
-    "teammate_overlap_penalty": -0.12,  # per-step: both alliance robots inside SCORING_RADIUS of same goal
+    "teammate_overlap_penalty": -2.0,   # v9.1: -0.12→-2.0 (×17) — same-goal crowding now clearly expensive (PROBLEM 63)
     "time_to_score_bonus":       4.0,   # one-time at score moment: bonus × max(0, 1 - carry_steps/TARGET)
     "yellow_approach_scale":     0.06,  # per-step: bonus when empty robot approaches yellow pin & alliance owns toggle
-    "ally_separation_bonus":     0.02,  # per-step: bonus when teammates >= ALLY_SEPARATION_TARGET apart
+    "ally_separation_bonus":     0.02,  # per-step: gradient bonus = weight × min(1, d/TARGET); 0 when touching, full at TARGET (PROBLEM 64)
+    "ally_contact_penalty":     -3.0,   # v9.1: per-step when allies within ALLY_CONTACT_DIST (PROBLEM 63)
 
     # --- v8.1: Strategy & defensive shaping ------------------------------
     "endgame_score_multiplier":  1.5,    # multiplier on causal scoring events during endgame
@@ -507,9 +537,11 @@ REWARD_WEIGHTS = {
     # --- v9: Anti-hijack / pressure-scoring rewards ----------------------
     "score_under_pressure":      5.0,    # one-time at score moment when any opponent is within PINNING_CONTACT_DIST
     "win_threshold_bonus":      10.0,    # one-time when lead first crosses +15 pts
+    "sc5b_park_bonus":           1.5,    # per-step × progress ramp; 0 at t=8 s, 1.5/step at t=0 s (SC5b strategic shaping)
 
     # --- Endgame ---------------------------------------------------------
-    "midfield_endgame":        1.0,    # per-step reward; only fires in final PARK_WINDOW_SECONDS (3 s); no ramp
+    "midfield_endgame":          1.0,   # per-step × progress ramp (0 at window open → 1.0/step at t=0); 8-s window (PROBLEM 62)
+    "midfield_exit_penalty":   -40.0,   # v9.1: one-time on midfield exit during window; scaled ×progress² so late exits cost more (PROBLEM 62)
 }
 
 # -------------------------------------------------------------------------
@@ -557,6 +589,7 @@ TOGGLE_CAMP_RADIUS      = 24.0   # inches
 # Ally separation target — minimum distance (inches) between teammates that
 # earns the per-step `ally_separation_bonus`.  ~3 robot lengths apart.
 ALLY_SEPARATION_TARGET  = 45.0
+ALLY_CONTACT_DIST       = 14.0   # v9.1: inches — below this triggers ally_contact_penalty (≈robot width)
 
 # Time-to-score: a robot that scores within TIME_TO_SCORE_TARGET steps of
 # picking up earns close-to-full bonus; longer carries fade to zero linearly.
@@ -566,11 +599,12 @@ TIME_TO_SCORE_TARGET    = 30     # v9: 35→30 steps (1.5 s); tighter fast-cycle
 # Endgame midfield ramp: in the final ENDGAME_RAMP_SECONDS of the match the
 # midfield_endgame reward multiplier ramps linearly from 1× → ENDGAME_RAMP_MAX_MULT.
 # This makes second-1 parking >> second-19 parking, teaching last-second commit.
-ENDGAME_RAMP_SECONDS    = 3.0    # v8.2: narrowed to match PARK_WINDOW_SECONDS so obs urgency ramp aligns with reward window
+ENDGAME_RAMP_SECONDS    = 8.0    # v9.1: 3→8 s to align obs urgency ramp with the wider park window (PROBLEM 62)
 ENDGAME_RAMP_MAX_MULT   = 4.0   # unused by section 12 since v8.2 (no ramp); kept for reference
 
-# v8.2: parking reward only fires this many seconds before match end.
-PARK_WINDOW_SECONDS     = 3.0
+# v9.1: park window extended 3→8 s.  Reward ramps with progress so later
+# parking is always worth more per step.  Exit penalty deters leaving.
+PARK_WINDOW_SECONDS     = 8.0
 
 # -------------------------------------------------------------------------
 # v8.3: Cycle-speed / carrying-drive constants
