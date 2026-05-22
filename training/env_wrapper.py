@@ -1047,6 +1047,7 @@ class OverrideEnv:
         # v8.1: scale causal scoring events during endgame so last-minute
         # scoring is worth substantially more.
         endgame_mult = rw["endgame_score_multiplier"] if self.sim.rules_engine.endgame_active else 1.0
+        _yellow_cup_delta = 0.0   # v9.2: accumulates yellow cup-placement rewards for separate logging
         for goal in self.sim.goals:
             pre_stack  = pre_goal_stacks.get(goal.goal_id, [])
             post_stack = list(goal.stack)
@@ -1142,10 +1143,14 @@ class OverrideEnv:
                                 towner = _get_toggle_for_goal(goal, list(self.sim.toggles))
                                 if towner == scorer_alliance:
                                     # Blocking OWN alliance's yellow — strong self-cancel penalty
-                                    for rid in ally_rids: rewards[rid] += rw["yellow_self_cancel"] * endgame_mult
+                                    _v = rw["yellow_self_cancel"] * endgame_mult
+                                    for rid in ally_rids: rewards[rid] += _v
+                                    _yellow_cup_delta += _v * len(ally_rids)
                                 elif towner is not None:
                                     # Blocking OPPONENT's yellow — good denial!
-                                    for rid in ally_rids: rewards[rid] += rw["yellow_deny_bonus"] * endgame_mult
+                                    _v = rw["yellow_deny_bonus"] * endgame_mult
+                                    for rid in ally_rids: rewards[rid] += _v
+                                    _yellow_cup_delta += _v * len(ally_rids)
                                 # towner is None (unowned toggle): no causal yellow reward
                         else:
                             # Clear bottom faces pin — pin's UP half stays VISIBLE.
@@ -1156,12 +1161,17 @@ class OverrideEnv:
                                 towner = _get_toggle_for_goal(goal, list(self.sim.toggles))
                                 if towner == scorer_alliance:
                                     # Correctly preserving OWN alliance's yellow — bonus!
-                                    for rid in ally_rids: rewards[rid] += rw["yellow_preserve_bonus"] * endgame_mult
+                                    _v = rw["yellow_preserve_bonus"] * endgame_mult
+                                    for rid in ally_rids: rewards[rid] += _v
+                                    _yellow_cup_delta += _v * len(ally_rids)
                                 elif towner is not None:
                                     # Preserving OPPONENT's yellow — same as denial_preserved_opp
                                     for rid in ally_rids: rewards[rid] += rw["denial_preserved_opp"] * endgame_mult
                 if cup_idx >= 1:
                     for rid in ally_rids: rewards[rid] += rw["stack_bonus"] * endgame_mult
+        # v9.2: separately log yellow cup-placement events (absorbed into causal_scoring otherwise)
+        if _yellow_cup_delta != 0.0:
+            rc["yellow_cup_place"] = rc.get("yellow_cup_place", 0.0) + _yellow_cup_delta / len(AGENT_IDS)
         _track("causal_scoring")
 
         # 11. Toggle events
