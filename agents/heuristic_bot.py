@@ -94,14 +94,14 @@ class HeuristicBot:
     FLIP_COOLDOWN_STEPS = 8
 
     # After this many consecutive steps chasing the same pin/cup without
-    # picking it up, clear the sticky bonus so a closer element wins next tick.
-    PICKUP_TIMEOUT = 50   # ~1.7 s at 30 Hz
+    # picking it up, blacklist that element so we try a different one.
+    PICKUP_TIMEOUT = 30   # ~1 s at 30 Hz
 
-    # Fire intake while driving within this radius (× INTAKE_RADIUS).
-    # Wider than INTAKE_RADIUS alone because the robot's physical body bumps
-    # elements before the intake geometry reaches them; holding intake while
-    # closing in catches the element the moment it's in range.
-    INTAKE_ZONE_MULT = 2.5
+    # How long (steps) a blacklisted element stays avoided.
+    BLACKLIST_DURATION = 100  # ~3.3 s
+
+    # Fire intake once within this radius (× INTAKE_RADIUS).
+    INTAKE_ZONE_MULT = 2.0
 
     def __init__(self, robot_id: str, sim):
         self.robot_id = robot_id
@@ -112,10 +112,13 @@ class HeuristicBot:
         self._target_cup_id: Optional[int] = None
         self._target_goal_id: Optional[int] = None
         # How many steps we've been chasing the current pin/cup target.
-        # If we can't pick it up within PICKUP_TIMEOUT steps, clear the
-        # sticky bonus so we switch to a more reachable element.
         self._target_pin_steps: int = 0
         self._target_cup_steps: int = 0
+        # Elements we've given up on — avoid them until the countdown expires.
+        self._pin_blacklist: set = set()
+        self._pin_blacklist_cd: int = 0
+        self._cup_blacklist: set = set()
+        self._cup_blacklist_cd: int = 0
         # Per-bot flip lockouts
         self._flip_pin_lockout = 0
         self._flip_cup_lockout = 0
@@ -262,6 +265,23 @@ class HeuristicBot:
                 self._target_goal_id = g.goal_id
                 return a
             if needs == "cup" and has_cup:
+                # Check orientation before scoring — a cup placed with the wrong
+                # face cancels the pin's scored half.  Flip if needed; the next
+                # tick will score (lockout keeps us from re-checking prematurely).
+                cup = self.robot.carrying_cup
+                correct = self._correct_cup_clear_up(g)
+                needs_flip = (correct is not None and cup is not None
+                              and _eff_clear_up(cup) != correct)
+                if needs_flip:
+                    if self._flip_cup_lockout == 0:
+                        a["flip_cup"] = True
+                        self._flip_cup_lockout = self.FLIP_COOLDOWN_STEPS
+                        self.last_reason = f"flip_cup_at_goal:{g.goal_id}"
+                        return a
+                    else:
+                        # Still waiting for flip to take effect — hold position
+                        self.last_reason = f"await_flip:{g.goal_id}"
+                        return a   # zero action: stand still at goal
                 a["score_cup"] = True
                 self.last_reason = f"score_cup:{g.goal_id}"
                 self._target_goal_id = g.goal_id
@@ -285,47 +305,78 @@ class HeuristicBot:
 
     def _pick_best_pin(self):
         my_pos = self._pos()
-        # Sticky bonus expires after PICKUP_TIMEOUT steps to avoid locking
-        # onto a pin that has been knocked into an unreachable position.
         timed_out = self._target_pin_steps >= self.PICKUP_TIMEOUT
+        if timed_out and self._target_pin_id is not None:
+            # Blacklist the stuck pin so we don't immediately re-select it
+            self._pin_blacklist.add(self._target_pin_id)
+            self._pin_blacklist_cd = max(self._pin_blacklist_cd, self.BLACKLIST_DURATION)
+            self._target_pin_id = None
+            self._target_pin_steps = 0
         best = None
         best_sc = -1e9
         for p in self.sim.pins:
             if p.scored or p.carried_by is not None:
                 continue
+            if p.pin_id in self._pin_blacklist:
+                continue   # skip recently-stuck pins
             d = self._dist(my_pos, (float(p.body.position.x), float(p.body.position.y)))
             val = self._pin_value(p)
             if val <= 0:
                 continue
-            if self._target_pin_id == p.pin_id and not timed_out:
-                d *= 0.8   # mild sticky bonus (was 0.7; reduced to allow switches)
+            if self._target_pin_id == p.pin_id:
+                d *= 0.8   # mild sticky bonus
             sc = val * 12.0 - d
             if sc > best_sc:
                 best_sc = sc
                 best = p
-        if timed_out:
-            # Clear sticky so _action_get_pin resets the timer on the new target
-            self._target_pin_id = None
-            self._target_pin_steps = 0
+        # If all pins are blacklisted, fall back to the nearest non-stuck one
+        if best is None:
+            self._pin_blacklist.clear()
+            self._pin_blacklist_cd = 0
+            for p in self.sim.pins:
+                if p.scored or p.carried_by is not None:
+                    continue
+                val = self._pin_value(p)
+                if val <= 0:
+                    continue
+                d = self._dist(my_pos, (float(p.body.position.x), float(p.body.position.y)))
+                sc = val * 12.0 - d
+                if sc > best_sc:
+                    best_sc = sc
+                    best = p
         return best
 
     def _pick_best_cup(self):
         my_pos = self._pos()
         timed_out = self._target_cup_steps >= self.PICKUP_TIMEOUT
+        if timed_out and self._target_cup_id is not None:
+            self._cup_blacklist.add(self._target_cup_id)
+            self._cup_blacklist_cd = max(self._cup_blacklist_cd, self.BLACKLIST_DURATION)
+            self._target_cup_id = None
+            self._target_cup_steps = 0
         best = None
         best_d = float("inf")
         for c in self.sim.cups:
             if c.scored or c.carried_by is not None:
                 continue
+            if id(c) in self._cup_blacklist:
+                continue
             d = self._dist(my_pos, (float(c.body.position.x), float(c.body.position.y)))
-            if self._target_cup_id == id(c) and not timed_out:
+            if self._target_cup_id == id(c):
                 d *= 0.8
             if d < best_d:
                 best_d = d
                 best = c
-        if timed_out:
-            self._target_cup_id = None
-            self._target_cup_steps = 0
+        if best is None:
+            self._cup_blacklist.clear()
+            self._cup_blacklist_cd = 0
+            for c in self.sim.cups:
+                if c.scored or c.carried_by is not None:
+                    continue
+                d = self._dist(my_pos, (float(c.body.position.x), float(c.body.position.y)))
+                if d < best_d:
+                    best_d = d
+                    best = c
         return best
 
     def _action_get_pin(self, a: dict) -> dict:
@@ -337,23 +388,27 @@ class HeuristicBot:
         px, py = float(pin.body.position.x), float(pin.body.position.y)
         d = self._dist(self._pos(), (px, py))
 
-        # Track how long we've been chasing this pin; reset timer on switch.
         if self._target_pin_id != pin.pin_id:
             self._target_pin_id = pin.pin_id
             self._target_pin_steps = 0
         self._target_pin_steps += 1
 
-        intake_zone = INTAKE_RADIUS * self.INTAKE_ZONE_MULT
-        # Always drive toward the pin.  Slow down when close to reduce the
-        # collision impulse that knocks it away before intake fires.
-        full_speed = d > INTAKE_RADIUS * 1.5
-        a["left"], a["right"] = self._drive_to((px, py), full_speed=full_speed)
-        # Hold intake=True throughout the approach zone.  The robot body will
-        # push the element briefly within range; holding the flag catches it.
-        if d <= intake_zone:
-            a["intake"] = True
+        # Three approach zones:
+        #   ≤ INTAKE_RADIUS      → stop wheels entirely so we don't push the
+        #                          element out of range; just fire intake.
+        #   ≤ INTAKE_RADIUS×2    → slow approach (70%) + intake held
+        #   >  INTAKE_RADIUS×2   → full-speed approach + intake held
+        # Intake fires at all distances — the simulator rejects it when out of
+        # its own range, so there's no cost to holding it.
+        a["intake"] = True
+        if d <= INTAKE_RADIUS:
+            a["left"], a["right"] = 0.0, 0.0        # stop — don't push element
+            self.last_reason = f"intake_pin:{pin.pin_id}"
+        elif d <= INTAKE_RADIUS * self.INTAKE_ZONE_MULT:
+            a["left"], a["right"] = self._drive_to((px, py), full_speed=False)
             self.last_reason = f"intake_pin:{pin.pin_id}"
         else:
+            a["left"], a["right"] = self._drive_to((px, py), full_speed=True)
             self.last_reason = f"approach_pin:{pin.pin_id}"
         return a
 
@@ -367,13 +422,15 @@ class HeuristicBot:
             self._target_cup_steps = 0
         self._target_cup_steps += 1
 
-        intake_zone = INTAKE_RADIUS * self.INTAKE_ZONE_MULT
-        full_speed = d > INTAKE_RADIUS * 1.5
-        a["left"], a["right"] = self._drive_to((cx, cy), full_speed=full_speed)
-        if d <= intake_zone:
-            a["intake"] = True
+        a["intake"] = True
+        if d <= INTAKE_RADIUS:
+            a["left"], a["right"] = 0.0, 0.0
+            self.last_reason = f"intake_cup:{cid}"
+        elif d <= INTAKE_RADIUS * self.INTAKE_ZONE_MULT:
+            a["left"], a["right"] = self._drive_to((cx, cy), full_speed=False)
             self.last_reason = f"intake_cup:{cid}"
         else:
+            a["left"], a["right"] = self._drive_to((cx, cy), full_speed=True)
             self.last_reason = f"approach_cup:{cid}"
         return a
 
@@ -383,6 +440,15 @@ class HeuristicBot:
         a = self._zero_action()
         if self._flip_pin_lockout > 0: self._flip_pin_lockout -= 1
         if self._flip_cup_lockout > 0: self._flip_cup_lockout -= 1
+        # Blacklist countdowns — clear the set when the timer expires
+        if self._pin_blacklist_cd > 0:
+            self._pin_blacklist_cd -= 1
+        else:
+            self._pin_blacklist.clear()
+        if self._cup_blacklist_cd > 0:
+            self._cup_blacklist_cd -= 1
+        else:
+            self._cup_blacklist.clear()
 
         # ── 1. EMERGENCY INTERCEPT ─────────────────────────────────────── #
         intercept = self._find_intercept_target()
