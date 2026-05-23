@@ -489,7 +489,7 @@ NUM_PARALLEL_ENVS = 32
 ROLLOUT_STEPS     = 512
 MINIBATCH_SIZE    = 256
 PPO_EPOCHS        = 10
-TOTAL_ENV_STEPS   = 10_000_000   # resume target: 6.5M saved + ~13M new steps (~9h at 410 sps)
+TOTAL_ENV_STEPS   = 5_000_000   # resume target: 6.5M saved + ~13M new steps (~9h at 410 sps)
 
 # -------------------------------------------------------------------------
 # NETWORK ARCHITECTURE
@@ -604,8 +604,8 @@ REWARD_WEIGHTS = {
     # --- v9.2: Cup orientation shaping pre-placement (PROBLEM 66) -----------
     # Per-step, proximity-weighted.  Fires when carrying a cup within
     # SCORING_RADIUS × 3 of a goal whose top is a pin.
-    "cup_orient_correct":       0.04,  # current orientation is right for this goal
-    "cup_orient_wrong":        -0.04,  # current orientation is wrong for this goal
+    "cup_orient_correct":       0.10,  # current orientation is right for this goal (v9.2b: 0.04→0.10)
+    "cup_orient_wrong":        -0.10,  # current orientation is wrong for this goal (v9.2b: -0.04→-0.10)
 
     # --- Endgame ---------------------------------------------------------
     "midfield_endgame":          1.0,   # per-step × progress ramp (0 at window open → 1.0/step at t=0); 8-s window (PROBLEM 62)
