@@ -22,6 +22,10 @@ Examples
 
 Match runs once at full speed for up to --duration seconds, ESC to quit early.
 A video is written to --video (default artifacts/videos/bots_run.mp4).
+
+When --verbose is given, per-step bot reasons are written to a log file
+under artifacts/logs/ (NOT to the console) so the terminal stays clean.
+The log path is printed at startup.
 """
 
 import os
@@ -77,7 +81,8 @@ def parse_args():
     p.add_argument("--seed",     type=int, default=None,
                    help="RNG seed.  Default: time-derived.")
     p.add_argument("--verbose",  action="store_true",
-                   help="Print each bot's chosen reason every step (very noisy).")
+                   help="Write each bot's chosen reason every step to a log file "
+                        "under artifacts/logs/.  Path is printed at startup.")
     return p.parse_args()
 
 
@@ -94,6 +99,20 @@ def main():
         idle_ids = sorted(set(AGENT_IDS) - bot_ids)
         if idle_ids:
             print(f"[Bots] No --policy given → robots {idle_ids} will idle (zero action)")
+
+    # ── Verbose log file ──────────────────────────────────────────────── #
+    log_file = None
+    log_path = None
+    if args.verbose:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "artifacts", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(log_dir, f"bots_verbose_{ts}.log")
+        log_file = open(log_path, "w", buffering=1)   # line-buffered
+        print(f"[Bots] Verbose log → {log_path}")
+        log_file.write(f"# run_with_bots verbose log  seed={seed}  bots={sorted(bot_ids)}\n")
+        log_file.write(f"# started {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
     # Build env (rendered, single-process).
     env = OverrideEnv(headless=False, seed=seed)
@@ -136,6 +155,7 @@ def main():
     sim_time = 0.0
     done     = False
     running  = True
+    step_idx = 0
 
     print(f"[Bots] Running for up to {args.duration:.0f}s — ESC to skip\n")
 
@@ -152,8 +172,8 @@ def main():
         for rid, bot in bots.items():
             cont, disc = bot.get_policy_action()
             actions[rid] = (cont, disc)
-            if args.verbose:
-                print(f"  [{rid}] {bot.last_reason}")
+            if log_file is not None:
+                log_file.write(f"t={sim_time:7.3f} step={step_idx:6d}  [{rid}]  {bot.last_reason}\n")
 
         # 2) trained policy for the rest (if available)
         if trainer is not None:
@@ -182,6 +202,7 @@ def main():
             recorder.write_frame(frame)
 
         sim_time += CONTROL_DT
+        step_idx += 1
         clock.tick(30)  # cap render at 30 fps
 
     if done:
@@ -194,6 +215,12 @@ def main():
     if recorder:
         recorder.close()
         print(f"[Bots] Video saved → {args.video}")
+
+    if log_file is not None:
+        log_file.write(f"\n# ended {time.strftime('%Y-%m-%d %H:%M:%S')}  total steps={step_idx}\n")
+        log_file.close()
+        print(f"[Bots] Verbose log closed → {log_path}")
+
     env.close()
 
 

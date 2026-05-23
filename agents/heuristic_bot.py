@@ -1,7 +1,7 @@
 """
 agents/heuristic_bot.py
 =======================
-Rule-based "perfect-play" bot for VEX Override.  v9.3.1
+Rule-based "perfect-play" bot for VEX Override.  v9.3.2
 
 Design philosophy
 -----------------
@@ -19,23 +19,19 @@ For training compatibility we also expose `get_policy_action()` which
 returns the same decision packaged as `(cont, disc)` numpy arrays
 matching the trained policy's action space (2 cont + 7 disc).
 
-v9.3.1 cycling fix
-------------------
-The original dispatcher called _try_score() whenever the robot was
-carrying ANYTHING, which drove the robot toward whatever _best_target_goal()
-returned — even goals where the robot's inventory was useless (e.g. having
-only a pin when the goal already had a pin on top and needed a cup).  The
-robot oscillated at the SCORING_RADIUS boundary and never reached the cup
-pickup priorities.
-
-The rewrite adds:
-  • _goal_needs(goal) — categorises each goal as 'pin', 'cup', or 'full'
-  • _best_scoreable_goal(has_pin, has_cup) — only returns goals where the
-    robot can LEGALLY place something it is currently carrying
-  • _try_score_at_range(has_pin, has_cup) — fires only when already in range
-  • Full-load strategy — when carrying only a pin and the best scoreable goal
-    is an empty Type-A goal, fetch a cup first so both elements can be
-    deposited in a single round-trip
+v9.3.2 changes vs v9.3.1
+-------------------------
+• Opportunistic toggle flipping: _finalize_action() injects toggle=True
+  into ANY travel or idle action whenever an unowned toggle is within
+  TOGGLE_INTERACTION_RANGE.  The bot now flips toggles "for free" while
+  passing by — no detour required.
+• Proactive toggle routing: if the bot has nothing better to do AND there
+  is an unowned toggle within 48 inches, it drives to it (priority 7).
+• Pin orientation check at goal: _try_score_at_range now checks the
+  yellow-half orientation before firing score_pin, mirroring the existing
+  cup-flip logic.
+• _finalize_action is a single post-processing step so toggle injection
+  works uniformly for every branch of the decision tree.
 
 Decision priority (highest first)
 ---------------------------------
@@ -43,13 +39,13 @@ Decision priority (highest first)
 2.  ENDGAME PARK — last 6 s: race to midfield for parking + SC5b majority.
 3.  SCORE NOW — already within SCORING_RADIUS of a goal I can score in.
 4.  PRE-PLACEMENT FLIP — orient cup or pin while approaching the goal.
-5.  FULL-LOAD FETCH — if I have only a pin and the target is an empty goal,
-    grab a cup first so I can score both in one trip.
+5.  FETCH MISSING ELEMENTS — get pin (empty hands) or cup (pin-only).
 6.  DRIVE TO SCOREABLE GOAL — I have what the goal needs; head there.
-7.  FETCH MISSING ELEMENT — go pick up pin (if I have neither), or cup (if
-    I have pin but no scoreable goal is reachable with pin alone).
-8.  TOGGLE — flip opponent-owned toggles within cheap-detour range.
-9.  DEFAULT — drift toward midfield centre.
+7.  TOGGLE — drive to nearest unowned toggle (fallback when nothing else).
+8.  DEFAULT — drift toward midfield centre.
+
+Toggle "for free": _finalize_action() fires toggle=True on ANY non-scoring
+action when passing within TOGGLE_INTERACTION_RANGE of an unowned toggle.
 """
 
 import math
@@ -102,6 +98,10 @@ class HeuristicBot:
 
     # Fire intake once within this radius (× INTAKE_RADIUS).
     INTAKE_ZONE_MULT = 2.0
+
+    # Maximum range at which the bot will proactively route to a toggle
+    # (priority 7 fallback — opportunistic injection has no distance limit).
+    TOGGLE_ROUTE_RANGE = 48.0  # inches
 
     def __init__(self, robot_id: str, sim):
         self.robot_id = robot_id
@@ -247,6 +247,9 @@ class HeuristicBot:
         Iterates ALL goals so consecutive element placement works: after
         scoring a pin the robot is still at the same goal on the next tick
         and immediately places the cup without an extra approach step.
+
+        Includes orientation checks for both pin and cup before scoring —
+        flips if needed so element halves land facing the right direction.
         """
         my_pos = self._pos()
         for g in self.sim.goals:
@@ -260,6 +263,18 @@ class HeuristicBot:
                 continue
             a = self._zero_action()
             if needs == "pin" and has_pin:
+                # Check yellow-half orientation before placing a pin.
+                should_flip, _ = self._should_flip_pin_for_goal(g)
+                if should_flip:
+                    if self._flip_pin_lockout == 0:
+                        a["flip_pin"] = True
+                        self._flip_pin_lockout = self.FLIP_COOLDOWN_STEPS
+                        self.last_reason = f"flip_pin_at_goal:{g.goal_id}"
+                        return a
+                    else:
+                        # Waiting for flip to take effect — hold position
+                        self.last_reason = f"await_pin_flip:{g.goal_id}"
+                        return a
                 a["score_pin"] = True
                 self.last_reason = f"score_pin:{g.goal_id}"
                 self._target_goal_id = g.goal_id
@@ -280,7 +295,7 @@ class HeuristicBot:
                         return a
                     else:
                         # Still waiting for flip to take effect — hold position
-                        self.last_reason = f"await_flip:{g.goal_id}"
+                        self.last_reason = f"await_cup_flip:{g.goal_id}"
                         return a   # zero action: stand still at goal
                 a["score_cup"] = True
                 self.last_reason = f"score_cup:{g.goal_id}"
@@ -434,9 +449,45 @@ class HeuristicBot:
             self.last_reason = f"approach_cup:{cid}"
         return a
 
+    # ── Post-processing — opportunistic toggle injection ─────────────────── #
+
+    def _finalize_action(self, a: dict) -> dict:
+        """Opportunistically fire toggle=True whenever passing near an
+        unowned toggle, on ANY non-scoring travel or idle action.
+
+        This means the bot flips toggles "for free" — no dedicated detour
+        needed.  We skip injection when the action already includes a score
+        or a flip to avoid conflicting actions in the same simulator step.
+        """
+        if a["score_pin"] or a["score_cup"] or a["flip_pin"] or a["flip_cup"]:
+            return a   # don't mix scoring/flip with toggle in same step
+        if a["toggle"]:
+            return a   # already toggling
+        my_pos = self._pos()
+        best_t = None
+        best_d = float("inf")
+        for t in self.sim.toggles:
+            if t.owner == self.alliance:
+                continue   # already ours
+            d = self._dist(my_pos, (float(t.x), float(t.y)))
+            if d <= TOGGLE_INTERACTION_RANGE and d < best_d:
+                best_d = d
+                best_t = t
+        if best_t is not None:
+            a["toggle"] = True
+            # Append to reason so log shows both actions
+            self.last_reason = self.last_reason + f"+toggle:{best_t.toggle_id}"
+        return a
+
     # ── Top-level dispatcher ─────────────────────────────────────────────── #
 
     def get_sim_action(self) -> Dict[str, Any]:
+        """Compute + finalise the action for this control step."""
+        a = self._compute_action()
+        return self._finalize_action(a)
+
+    def _compute_action(self) -> Dict[str, Any]:
+        """Core decision tree — returns action dict (toggle NOT yet injected)."""
         a = self._zero_action()
         if self._flip_pin_lockout > 0: self._flip_pin_lockout -= 1
         if self._flip_cup_lockout > 0: self._flip_cup_lockout -= 1
@@ -550,7 +601,7 @@ class HeuristicBot:
             self.last_reason = f"approach_goal:{target_goal.goal_id}"
             return a
 
-        # ── 7. TOGGLE — cheap detour ──────────────────────────────────── #
+        # ── 7. TOGGLE — proactively route to nearest unowned toggle ──────#
         toggle = self._find_useful_toggle()
         if toggle is not None:
             tx, ty = float(toggle.x), float(toggle.y)
@@ -680,7 +731,16 @@ class HeuristicBot:
         return False, None
 
     def _correct_cup_clear_up(self, goal) -> Optional[bool]:
-        """For a goal whose top is a pin, what should cup.clear_up be?"""
+        """For a goal whose top is a pin, what should cup.clear_up be?
+
+        Returns True  → place cup clear-side UP  (BLOCKS pin's up half)
+        Returns False → place cup dark-side UP   (ALLOWS pin's up half to score)
+        Returns None  → orientation doesn't matter / can't determine
+
+        Formula: up_vis = not eff_clear_up
+          • own-color pin facing up  → we WANT that half to score → dark up (False)
+          • opp-color pin facing up  → we WANT to deny that half  → clear up (True)
+        """
         if not goal.stack or not goal.stack[-1][1]:
             return None
         top_pin, _ = goal.stack[-1]
@@ -696,10 +756,10 @@ class HeuristicBot:
             return False if tog.owner == self.alliance else True
         return None
 
-    # ── Priority 7 — toggle ──────────────────────────────────────────────── #
+    # ── Priority 7 — proactive toggle routing ───────────────────────────── #
 
     def _find_useful_toggle(self):
-        """Return the best toggle within detour range that isn't already mine."""
+        """Return the best unowned toggle within TOGGLE_ROUTE_RANGE."""
         my_pos = self._pos()
         best = None
         best_sc = -1e9
@@ -707,9 +767,10 @@ class HeuristicBot:
             if t.owner == self.alliance:
                 continue
             d = self._dist(my_pos, (float(t.x), float(t.y)))
-            if d > 36.0:
+            if d > self.TOGGLE_ROUTE_RANGE:
                 continue
             sc = -d
+            # Bonus if there are yellow pins in goals controlled by this toggle
             for g in self.sim.goals:
                 if self._toggle_for_goal(g) is t:
                     for obj, is_pin in g.stack:
