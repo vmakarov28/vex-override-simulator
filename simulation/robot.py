@@ -268,11 +268,11 @@ class Robot:
                 if goal.goal_id == CENTER_GOAL_ID and len(goal.stack) >= ENDGAME_CENTER_MAX_STACK:
                     continue
 
-            # Prevent pin on pin (illegal stack)
+            # Prevent pin on pin (illegal stack) — skip this goal, keep trying others
             if goal.stack:
                 last_obj, last_is_pin = goal.stack[-1]
                 if last_is_pin:
-                    return False  # Cannot score pin directly on another pin
+                    continue
 
             rules_engine.process_scored_object(goal, self.carrying_pin, self.alliance)
             self.carrying_pin.scored = True
@@ -323,12 +323,12 @@ class Robot:
                 if goal.goal_id == CENTER_GOAL_ID and len(goal.stack) >= ENDGAME_CENTER_MAX_STACK:
                     continue
 
-            # Prevent illegal stacks (cup must go on a pin)
+            # Prevent illegal stacks (cup must go on a pin) — skip this goal, keep trying others
             if not goal.stack:
-                return False
+                continue
             last_obj, last_is_pin = goal.stack[-1]
             if not last_is_pin:
-                return False
+                continue
 
             # The side facing the FRONT of the robot goes DOWN on the goal.
             rules_engine.process_scored_object(goal, self.carrying_cup, self.alliance)
