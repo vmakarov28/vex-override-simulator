@@ -93,6 +93,16 @@ class HeuristicBot:
     # Bot-side flip cooldown (ticks) — must be ≥ env_wrapper's COOLDOWN_FLIP
     FLIP_COOLDOWN_STEPS = 8
 
+    # After this many consecutive steps chasing the same pin/cup without
+    # picking it up, clear the sticky bonus so a closer element wins next tick.
+    PICKUP_TIMEOUT = 50   # ~1.7 s at 30 Hz
+
+    # Fire intake while driving within this radius (× INTAKE_RADIUS).
+    # Wider than INTAKE_RADIUS alone because the robot's physical body bumps
+    # elements before the intake geometry reaches them; holding intake while
+    # closing in catches the element the moment it's in range.
+    INTAKE_ZONE_MULT = 2.5
+
     def __init__(self, robot_id: str, sim):
         self.robot_id = robot_id
         self.sim = sim
@@ -101,6 +111,11 @@ class HeuristicBot:
         self._target_pin_id: Optional[int] = None
         self._target_cup_id: Optional[int] = None
         self._target_goal_id: Optional[int] = None
+        # How many steps we've been chasing the current pin/cup target.
+        # If we can't pick it up within PICKUP_TIMEOUT steps, clear the
+        # sticky bonus so we switch to a more reachable element.
+        self._target_pin_steps: int = 0
+        self._target_cup_steps: int = 0
         # Per-bot flip lockouts
         self._flip_pin_lockout = 0
         self._flip_cup_lockout = 0
@@ -270,6 +285,9 @@ class HeuristicBot:
 
     def _pick_best_pin(self):
         my_pos = self._pos()
+        # Sticky bonus expires after PICKUP_TIMEOUT steps to avoid locking
+        # onto a pin that has been knocked into an unreachable position.
+        timed_out = self._target_pin_steps >= self.PICKUP_TIMEOUT
         best = None
         best_sc = -1e9
         for p in self.sim.pins:
@@ -279,27 +297,35 @@ class HeuristicBot:
             val = self._pin_value(p)
             if val <= 0:
                 continue
-            if self._target_pin_id == p.pin_id:
-                d *= 0.7   # sticky bonus
+            if self._target_pin_id == p.pin_id and not timed_out:
+                d *= 0.8   # mild sticky bonus (was 0.7; reduced to allow switches)
             sc = val * 12.0 - d
             if sc > best_sc:
                 best_sc = sc
                 best = p
+        if timed_out:
+            # Clear sticky so _action_get_pin resets the timer on the new target
+            self._target_pin_id = None
+            self._target_pin_steps = 0
         return best
 
     def _pick_best_cup(self):
         my_pos = self._pos()
+        timed_out = self._target_cup_steps >= self.PICKUP_TIMEOUT
         best = None
         best_d = float("inf")
         for c in self.sim.cups:
             if c.scored or c.carried_by is not None:
                 continue
             d = self._dist(my_pos, (float(c.body.position.x), float(c.body.position.y)))
-            if self._target_cup_id == id(c):
-                d *= 0.7
+            if self._target_cup_id == id(c) and not timed_out:
+                d *= 0.8
             if d < best_d:
                 best_d = d
                 best = c
+        if timed_out:
+            self._target_cup_id = None
+            self._target_cup_steps = 0
         return best
 
     def _action_get_pin(self, a: dict) -> dict:
@@ -310,25 +336,45 @@ class HeuristicBot:
             return a
         px, py = float(pin.body.position.x), float(pin.body.position.y)
         d = self._dist(self._pos(), (px, py))
-        if d <= INTAKE_RADIUS:
+
+        # Track how long we've been chasing this pin; reset timer on switch.
+        if self._target_pin_id != pin.pin_id:
+            self._target_pin_id = pin.pin_id
+            self._target_pin_steps = 0
+        self._target_pin_steps += 1
+
+        intake_zone = INTAKE_RADIUS * self.INTAKE_ZONE_MULT
+        # Always drive toward the pin.  Slow down when close to reduce the
+        # collision impulse that knocks it away before intake fires.
+        full_speed = d > INTAKE_RADIUS * 1.5
+        a["left"], a["right"] = self._drive_to((px, py), full_speed=full_speed)
+        # Hold intake=True throughout the approach zone.  The robot body will
+        # push the element briefly within range; holding the flag catches it.
+        if d <= intake_zone:
             a["intake"] = True
             self.last_reason = f"intake_pin:{pin.pin_id}"
         else:
-            a["left"], a["right"] = self._drive_to((px, py))
             self.last_reason = f"approach_pin:{pin.pin_id}"
-        self._target_pin_id = pin.pin_id
         return a
 
     def _action_get_cup(self, a: dict, cup) -> dict:
         cx, cy = float(cup.body.position.x), float(cup.body.position.y)
         d = self._dist(self._pos(), (cx, cy))
-        if d <= INTAKE_RADIUS:
+        cid = id(cup)
+
+        if self._target_cup_id != cid:
+            self._target_cup_id = cid
+            self._target_cup_steps = 0
+        self._target_cup_steps += 1
+
+        intake_zone = INTAKE_RADIUS * self.INTAKE_ZONE_MULT
+        full_speed = d > INTAKE_RADIUS * 1.5
+        a["left"], a["right"] = self._drive_to((cx, cy), full_speed=full_speed)
+        if d <= intake_zone:
             a["intake"] = True
-            self.last_reason = f"intake_cup:{id(cup)}"
+            self.last_reason = f"intake_cup:{cid}"
         else:
-            a["left"], a["right"] = self._drive_to((cx, cy))
-            self.last_reason = f"approach_cup:{id(cup)}"
-        self._target_cup_id = id(cup)
+            self.last_reason = f"approach_cup:{cid}"
         return a
 
     # ── Top-level dispatcher ─────────────────────────────────────────────── #
@@ -501,20 +547,24 @@ class HeuristicBot:
         for opp in self.sim.robots:
             if opp.alliance == self.alliance:
                 continue
-            if opp.carrying_pin is None and opp.carrying_cup is None:
+            # Only intercept if they're carrying a PIN — cups alone can't start
+            # a new stack and are lower priority.
+            if opp.carrying_pin is None:
                 continue
             ox, oy = float(opp.body.position.x), float(opp.body.position.y)
             for g in self.sim.goals:
                 if g.alliance == self.alliance:
                     continue
                 d_opp_goal = self._dist((ox, oy), (g.x, g.y))
-                if d_opp_goal > SCORING_RADIUS * 1.8:
+                # Tightened from 1.8× to 1.15× — only fire when the opponent
+                # is essentially touching the goal, not just nearby on the field.
+                if d_opp_goal > SCORING_RADIUS * 1.15:
                     continue
                 d_me_opp = self._dist(my_pos, (ox, oy))
-                if d_me_opp > d_opp_goal + 8.0:
+                # Only realistic to intercept if we're close enough to matter
+                if d_me_opp > d_opp_goal + 6.0:
                     continue
-                val = 1.0 if opp.carrying_pin else 0.5
-                threat = val / (1.0 + d_opp_goal / 5.0)
+                threat = 1.0 / (1.0 + d_opp_goal / 4.0)
                 if threat > best_threat:
                     best_threat = threat
                     best = opp
