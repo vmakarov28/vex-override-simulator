@@ -252,10 +252,10 @@ class RulesEngine:
                         flipped = getattr(next_obj, 'flipped', False)
                         eff_clear_up = (not next_obj.clear_on_top) if flipped else next_obj.clear_on_top
                         up_vis = not eff_clear_up
-                # Count yellow halves
-                if down_vis and obj.get_down_color() == "yellow":
+                # Count yellow halves — use name properties (strings), not RGB tuples
+                if down_vis and obj.down_half_name == "yellow":
                     n_yellow_visible += 1
-                if up_vis and obj.get_up_color() == "yellow":
+                if up_vis and obj.up_half_name == "yellow":
                     n_yellow_visible += 1
 
         # v9.3 PROBLEM 71: emit a diagnostic line so the SC5b adjustment is

@@ -125,6 +125,23 @@ class HeuristicBot:
         # Diagnostic
         self.last_reason: str = "init"
 
+    def reset(self):
+        """Clear all per-episode state.  Call after env.reset() when reusing
+        the same bot object across multiple matches."""
+        self._robot_cache      = None
+        self._target_pin_id    = None
+        self._target_cup_id    = None
+        self._target_goal_id   = None
+        self._target_pin_steps = 0
+        self._target_cup_steps = 0
+        self._pin_blacklist    = set()
+        self._pin_blacklist_cd = 0
+        self._cup_blacklist    = set()
+        self._cup_blacklist_cd = 0
+        self._flip_pin_lockout = 0
+        self._flip_cup_lockout = 0
+        self.last_reason       = "init"
+
     # ── Robot / alliance helpers ─────────────────────────────────────────── #
 
     @property
@@ -718,7 +735,11 @@ class HeuristicBot:
 
     def _should_flip_pin_for_goal(self, goal):
         """Return (should_flip, goal) if carrying yellow-half pin should
-        have yellow facing UP for the given goal."""
+        have yellow facing UP for the given goal.
+
+        Uses pin.up_half_name (a plain string) instead of get_up_color()
+        (which returns an RGB tuple) so the comparison is correct.
+        """
         pin = self.robot.carrying_pin
         if pin is None or not pin.is_yellow:
             return False, None
@@ -726,7 +747,7 @@ class HeuristicBot:
         if tog is None or tog.owner != self.alliance:
             if goal.goal_id != CENTER_GOAL_ID or not self._we_have_midfield_majority():
                 return False, None
-        if pin.get_up_color() != "yellow":
+        if pin.up_half_name != "yellow":
             return True, goal
         return False, None
 
@@ -740,11 +761,13 @@ class HeuristicBot:
         Formula: up_vis = not eff_clear_up
           • own-color pin facing up  → we WANT that half to score → dark up (False)
           • opp-color pin facing up  → we WANT to deny that half  → clear up (True)
+
+        Uses pin.up_half_name (plain string) instead of get_up_color() (RGB tuple).
         """
         if not goal.stack or not goal.stack[-1][1]:
             return None
         top_pin, _ = goal.stack[-1]
-        up = top_pin.get_up_color()
+        up = top_pin.up_half_name   # "red", "blue", or "yellow"
         if up == "red":
             return True  if self.alliance == "blue" else False
         if up == "blue":

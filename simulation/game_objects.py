@@ -268,13 +268,36 @@ class GamePin:
         }.get(self.color, (C_GRAY_MID, C_GRAY_MID))
 
     def get_up_color(self):
-        """Returns the color of the 'up' (visible/scored) half."""
+        """Returns the color of the 'up' (visible/scored) half as an RGB tuple."""
         c1, c2 = self.get_colors()
         return c2 if self.flipped else c1
 
     def get_down_color(self):
-        """Returns the color of the 'down' half."""
+        """Returns the color of the 'down' half as an RGB tuple."""
         c1, c2 = self.get_colors()
+        return c1 if self.flipped else c2
+
+    # Colour-name helpers — return plain strings so callers can compare
+    # without importing the C_* RGB constants from game_objects.
+    _COLOR_NAME_MAP = {
+        "red":           ("red",    "red"),
+        "blue":          ("blue",   "blue"),
+        "yellow":        ("yellow", "yellow"),
+        "yellow_yellow": ("yellow", "yellow"),
+        "red_yellow":    ("red",    "yellow"),
+        "blue_yellow":   ("blue",   "yellow"),
+    }
+
+    @property
+    def up_half_name(self) -> str:
+        """Name string of the up-facing half: 'red', 'blue', or 'yellow'."""
+        c1, c2 = self._COLOR_NAME_MAP.get(self.color, ("gray", "gray"))
+        return c2 if self.flipped else c1
+
+    @property
+    def down_half_name(self) -> str:
+        """Name string of the down-facing half: 'red', 'blue', or 'yellow'."""
+        c1, c2 = self._COLOR_NAME_MAP.get(self.color, ("gray", "gray"))
         return c1 if self.flipped else c2
 
 
