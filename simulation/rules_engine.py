@@ -214,12 +214,56 @@ class RulesEngine:
         # since live yellows are deferred — but recomputing is the canonical
         # source of truth).
         center_goal = next((g for g in goals if g.goal_id == CENTER_GOAL_ID), None)
+        delta_r = delta_b = 0
+        n_yellow_visible = 0
         if center_goal:
             old_r = center_goal.red_score
             old_b = center_goal.blue_score
             center_goal.get_score(toggles, midfield_majority=majority)
-            self.red_score  += center_goal.red_score  - old_r
-            self.blue_score += center_goal.blue_score - old_b
+            delta_r = center_goal.red_score - old_r
+            delta_b = center_goal.blue_score - old_b
+            self.red_score  += delta_r
+            self.blue_score += delta_b
+            # v9.3 PROBLEM 71: count visible yellow halves in the center goal
+            # at match end for the diagnostic line below.
+            n = len(center_goal.stack)
+            for i, (obj, is_pin) in enumerate(center_goal.stack):
+                if not is_pin:
+                    continue
+                # DOWN visibility
+                if i == 0:
+                    down_vis = False
+                else:
+                    prev_obj, prev_is_pin = center_goal.stack[i - 1]
+                    if prev_is_pin:
+                        down_vis = True
+                    else:
+                        flipped = getattr(prev_obj, 'flipped', False)
+                        eff_clear_up = (not prev_obj.clear_on_top) if flipped else prev_obj.clear_on_top
+                        down_vis = eff_clear_up
+                # UP visibility
+                if i + 1 >= n:
+                    up_vis = True
+                else:
+                    next_obj, next_is_pin = center_goal.stack[i + 1]
+                    if next_is_pin:
+                        up_vis = True
+                    else:
+                        flipped = getattr(next_obj, 'flipped', False)
+                        eff_clear_up = (not next_obj.clear_on_top) if flipped else next_obj.clear_on_top
+                        up_vis = not eff_clear_up
+                # Count yellow halves
+                if down_vis and obj.get_down_color() == "yellow":
+                    n_yellow_visible += 1
+                if up_vis and obj.get_up_color() == "yellow":
+                    n_yellow_visible += 1
+
+        # v9.3 PROBLEM 71: emit a diagnostic line so the SC5b adjustment is
+        # visible in match-end output.  This makes future "yellow not credited"
+        # bugs immediately obvious without needing to instrument anything.
+        print(f"[SC5b] midfield: red={r_count} blue={b_count} → majority={majority} | "
+              f"center_yellow_visible={n_yellow_visible} | "
+              f"+pts: red={delta_r} blue={delta_b}")
 
         return {
             "red":  self.red_score,

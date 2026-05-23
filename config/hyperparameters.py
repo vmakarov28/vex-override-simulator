@@ -413,6 +413,37 @@ Cumulative fixes (v3/v5 problems preserved for history; v6 adds new fixes):
     would preserve own / deny opponent; −cup_orient_wrong if orientation
     would cancel own / preserve opponent.  Both scaled by proximity to goal.
 
+  PROBLEM 69 (v9.3): Cup flip exploit — robots learned to flip the cup back
+    and forth while near a goal to repeatedly collect cup_orient_correct.
+    Math: after PROBLEM 66's weight bump (0.04→0.10), the delta from
+    wrong→correct orientation = +0.20 vs flip_penalty = -0.15 → net +0.05
+    per flip.  Visual evidence: robots repeatedly flipping cups while
+    approaching goals; flip_penalty consistently -4 to -6 per [Rwd] window
+    (~30 flips/episode).
+    FIX: per-robot _steps_since_cup_flip counter.  cup_orient_correct
+    is SUPPRESSED for CUP_FLIP_LOCKOUT_STEPS after any flip_cup; the
+    wrong-orientation PENALTY still applies, so the robot can't dodge it
+    by flipping (each flip restarts the lockout).  Net behaviour: the
+    robot is forced to choose an orientation BEFORE arriving at the goal
+    and commit to it, instead of farming the delta.
+
+  PROBLEM 70 (v9.3): Pinning resurged in late training (9M→14M steps).
+    The pinning penalty climbed from -90 to -400 as the policy converged
+    onto a "pin + hold" local optimum after other low-hanging fruit was
+    exploited.  Entropy also dropped 5.0→4.68 in the same window,
+    consistent with overfit to a single strategy.
+    FIX: pinning_violation -4.0 → -6.5 (1.6×).  Combined with the existing
+    PINNING_STEPS_LIMIT=40 threshold (2 s), sustained pinning now costs
+    ~16% more per violation step, restoring negative ROI for the strategy.
+
+  PROBLEM 71 (v9.3): SC5b center-yellow scoring couldn't be verified from
+    logs.  No visibility into whether the +10/yellow half was actually
+    being applied at match end based on midfield majority.
+    FIX: calculate_final_score now prints a single-line diagnostic with
+    midfield counts, majority, n_yellow_halves_visible_in_center, and
+    the +pts_delta applied to each alliance.  This makes any future
+    SC5b bug immediately visible in the match-end output.
+
   PROBLEM 68 (v9.2): Policy only ever trained from clean match-start states.
     The yellow self-cancel scenario (score yellow pin, then place cup dark-side-
     down on it) almost never appears naturally from a fresh episode — yellow
@@ -567,7 +598,7 @@ REWARD_WEIGHTS = {
     "flip_penalty":           -0.15,   # small cost per flip; only flip when pin/cup color justifies it
     "idle_penalty":           -0.05,
     "start_zone_penalty":     -0.05,
-    "pinning_violation":      -4.0,   # v9: -0.8 → -4.0 (5×) to make pinning unprofitable vs score_delta (PROBLEM 58)
+    "pinning_violation":      -6.5,   # v9.3 PROBLEM 70: -4.0 → -6.5 (1.6×) — pinning resurged from -90 to -400 around 13M steps
     "wrong_element_loiter":   -0.15,   # per-step: carrying wrong element within scoring radius of goal
     "spin_penalty":           -0.10,   # per-step: high angular velocity + low translational speed
     "toggle_camping":         -0.15,   # per-step: loitering near a toggle your alliance already owns
@@ -776,6 +807,15 @@ CURRICULUM_STAGES = [
         "min_steps": 1_500_000,
     },
 ]
+
+# -------------------------------------------------------------------------
+# v9.3: Cup flip exploit lockout (PROBLEM 69)
+# -------------------------------------------------------------------------
+# After any flip_cup that fires while carrying a cup, suppress the
+# cup_orient_correct bonus for this many control steps.  The orientation
+# PENALTY still applies during this window so flipping cannot dodge it.
+# 15 steps ≈ 0.5 s at CONTROL_DT=1/30.
+CUP_FLIP_LOCKOUT_STEPS = 15
 
 # -------------------------------------------------------------------------
 # v9.2: Mid-match scenario injection (PROBLEM 68)

@@ -81,6 +81,7 @@ from config.hyperparameters import (
     DEFENSIVE_LINE_PERP_DIST, PARK_WINDOW_SECONDS,
     HOLDING_RAMP_SQ_CAP, INTAKE_CYCLE_TARGET,
     SCENARIO_INJECT_PROB, SCENARIO_INJECT_TIME_MIN, SCENARIO_INJECT_TIME_MAX,
+    CUP_FLIP_LOCKOUT_STEPS,
 )
 from config.game_rules import (
     SCORING_RADIUS, ENDGAME_SECONDS, TOTAL_SECONDS,
@@ -120,6 +121,8 @@ class OverrideEnv:
         }
 
         self._carry_steps: Dict[str, int]           = {rid: 0 for rid in AGENT_IDS}
+        # v9.3 PROBLEM 69: cup flip exploit lockout counter
+        self._steps_since_cup_flip: Dict[str, int]  = {rid: 9999 for rid in AGENT_IDS}
         self._contact_steps: Dict[Tuple, int]       = {p: 0 for p in ROBOT_PAIRS}
         self._start_positions: Dict[str, Tuple]     = {}
         self._prev_target_dist: Dict[str, float]    = {rid: 0.0 for rid in AGENT_IDS}
@@ -172,6 +175,10 @@ class OverrideEnv:
         self._prev_scores        = {rid: 0 for rid in AGENT_IDS}
         self._steps_since_last_score = {rid: MAX_EPISODE_STEPS + 1 for rid in AGENT_IDS}
         self._last_drop_step         = {rid: -1 for rid in AGENT_IDS}
+        # v9.3 (PROBLEM 69): cup flip exploit lockout — orientation-correct
+        # bonus is suppressed for N steps after any flip so flipping cannot
+        # net positive reward by alternating wrong→right repeatedly.
+        self._steps_since_cup_flip = {rid: 9999 for rid in AGENT_IDS}
         self._pending_center_yellow_halves = 0  # v9 SC5b deferred-yellow counter
         self._prev_midfield = {rid: False for rid in AGENT_IDS}  # v9.1 exit-penalty tracker
         # NOTE: do NOT clear self._reward_components here.  Per-component
@@ -399,6 +406,10 @@ class OverrideEnv:
 
             if flip_pin or flip_cup:
                 flips_fired[rid] = True
+            # v9.3 PROBLEM 69: reset cup-flip lockout when the robot flips
+            # while holding a cup, so the orientation bonus can't be farmed.
+            if flip_cup and rob.carrying_cup is not None:
+                self._steps_since_cup_flip[rid] = 0
             if score_pin or score_cup:
                 score_attempted[rid] = True
 
@@ -466,6 +477,8 @@ class OverrideEnv:
         # _compute_rewards when a score is detected for that robot.
         for rid in AGENT_IDS:
             self._steps_since_last_score[rid] += 1
+            # v9.3 PROBLEM 69: advance cup-flip lockout counter
+            self._steps_since_cup_flip[rid] += 1
 
         post_red  = self.sim.rules_engine.red_score
         post_blue = self.sim.rules_engine.blue_score
@@ -900,8 +913,20 @@ class OverrideEnv:
                     continue
                 prox = 1.0 / (1.0 + d / GOAL_PROXIMITY_NORM)
                 if cup_eff_clear == correct_clear_up:
-                    goal_r = rw["cup_orient_correct"] * prox
+                    # v9.3 PROBLEM 69: cup flip exploit fix — only grant the
+                    # correct-orientation BONUS when the robot has NOT flipped
+                    # the cup in the last CUP_FLIP_LOCKOUT_STEPS.  This kills
+                    # the exploit where the robot alternates wrong→right each
+                    # step, paying flip_penalty (-0.15) but collecting cup
+                    # orient delta (+0.20) for net +0.05/flip.
+                    if self._steps_since_cup_flip[rid] >= CUP_FLIP_LOCKOUT_STEPS:
+                        goal_r = rw["cup_orient_correct"] * prox
+                    else:
+                        goal_r = 0.0   # bonus suppressed during lockout
                 else:
+                    # Wrong-orientation PENALTY always applies; the robot
+                    # cannot dodge it by flipping (the flip itself pays
+                    # flip_penalty and starts a new lockout).
                     goal_r = rw["cup_orient_wrong"] * prox
                 # Only count the single most-relevant goal per robot
                 if abs(goal_r) > abs(best_goal_reward):
