@@ -254,11 +254,29 @@ class HeuristicBot:
         # Last picked-up element type — biases next fetch.
         self._last_intake_type: Optional[str] = None  # "pin" / "cup"
 
+        # Match-load follow-through.  After firing match_load, the loaded
+        # cup/pin spawns at a known corner position.  Track it for ~1.5 s
+        # so we tight-cycle: drive straight to it and intake before any
+        # other consideration (avoids leaving the spawned element behind
+        # due to the wall-pin penalty in normal _pick_best_* scans).
+        self._just_loaded_steps: int = 0
+        self._last_load_spawn: Optional[Tuple[float, float]] = None
+        # Index 0/1 picking which of the two loading-zone corners we own
+        # this trip (so partners don't crowd the same corner).
+        self._target_load_zone: Optional[int] = None
+        # Once we commit to a match-load trip, stay committed for ~3 s so
+        # noisy _should_match_load flickers don't make us drift halfway to
+        # the corner and back repeatedly (observed: 30 s wasted otherwise).
+        self._match_load_commit: int = 0
+        # Back-off after a failed trip (committed but couldn't reach the
+        # zone in time) — don't pound the same path repeatedly.
+        self._ml_cooldown_steps: int = 0
+
         # Diagnostic
         self.last_reason: str = "init"
 
         HeuristicBot._shared_targets[self.robot_id] = {
-            "pin": None, "cup": None, "goal": None,
+            "pin": None, "cup": None, "goal": None, "load_zone": None,
         }
 
     def reset(self):
@@ -281,9 +299,14 @@ class HeuristicBot:
         self._carry_pin_steps   = 0
         self._carry_cup_steps   = 0
         self._last_intake_type  = None
+        self._just_loaded_steps = 0
+        self._last_load_spawn   = None
+        self._target_load_zone  = None
+        self._match_load_commit = 0
+        self._ml_cooldown_steps = 0
         self.last_reason        = "init"
         HeuristicBot._shared_targets[self.robot_id] = {
-            "pin": None, "cup": None, "goal": None,
+            "pin": None, "cup": None, "goal": None, "load_zone": None,
         }
 
     # ── Robot / alliance helpers ───────────────────────────────────────── #
@@ -474,24 +497,27 @@ class HeuristicBot:
 
     def _publish_targets(self):
         HeuristicBot._shared_targets[self.robot_id] = {
-            "pin":  self._target_pin_id,
-            "cup":  self._target_cup_id,
-            "goal": self._target_goal_id,
+            "pin":       self._target_pin_id,
+            "cup":       self._target_cup_id,
+            "goal":      self._target_goal_id,
+            "load_zone": getattr(self, "_target_load_zone", None),
         }
 
     def _partner_targets(self) -> Dict[str, set]:
         """Targets owned by allied partners (excluding ourselves)."""
-        pins, cups, goals = set(), set(), set()
+        pins, cups, goals, load_zones = set(), set(), set(), set()
         alliance_of: Dict[str, str] = {r.robot_id: r.alliance for r in self.sim.robots}
         for rid, tgt in HeuristicBot._shared_targets.items():
             if rid == self.robot_id:
                 continue
             if alliance_of.get(rid) != self.alliance:
                 continue
-            if tgt.get("pin")  is not None: pins.add(tgt["pin"])
-            if tgt.get("cup")  is not None: cups.add(tgt["cup"])
-            if tgt.get("goal") is not None: goals.add(tgt["goal"])
-        return {"pins": pins, "cups": cups, "goals": goals}
+            if tgt.get("pin")        is not None: pins.add(tgt["pin"])
+            if tgt.get("cup")        is not None: cups.add(tgt["cup"])
+            if tgt.get("goal")       is not None: goals.add(tgt["goal"])
+            if tgt.get("load_zone")  is not None: load_zones.add(tgt["load_zone"])
+        return {"pins": pins, "cups": cups, "goals": goals,
+                "load_zones": load_zones}
 
     # ── Goal categorisation ───────────────────────────────────────────── #
 
@@ -1048,6 +1074,12 @@ class HeuristicBot:
                 self._cup_blacklist.add(self._target_cup_id)
                 self._target_cup_id = None
                 self._target_cup_steps = 0
+            # Abort any in-flight match-load trip — the path is blocked.
+            # Apply a long cooldown so we don't loop right back into it.
+            if self._match_load_commit > 0:
+                self._match_load_commit = 0
+                self._target_load_zone  = None
+                self._ml_cooldown_steps = 600   # 30 s back-off
             # Start an escape burst.  Alternate direction for variety.
             self._escape_dir   = -self._escape_dir
             self._escape_steps = self.ESCAPE_DURATION
@@ -1180,6 +1212,64 @@ class HeuristicBot:
         # have nothing to do at any goal right now.
         self._target_goal_id = None
 
+        # ── 6.8. MATCH LOAD (red1/blue1 only) ──────────────────────────── #
+        # Decrement counters every step regardless of which branch fires.
+        if self._just_loaded_steps > 0:
+            self._just_loaded_steps -= 1
+        if self._match_load_commit > 0:
+            self._match_load_commit -= 1
+            if self._match_load_commit == 0:
+                # Commit window expired without firing — apply back-off so
+                # we don't pound an unreachable zone every step.
+                self._ml_cooldown_steps = 120   # ~6 s
+                self._target_load_zone  = None
+        if self._ml_cooldown_steps > 0:
+            self._ml_cooldown_steps -= 1
+
+        # Post-load tight intake: drive straight to the spawn and grab it
+        # before the wall-pin penalty in _pick_best_* makes us drive away.
+        if (self._just_loaded_steps > 0 and self._last_load_spawn is not None
+                and (not has_pin or not has_cup)):
+            spawn = self._last_load_spawn
+            d = self._dist(self._pos(), spawn)
+            if d <= INTAKE_RADIUS * 2.0:
+                a["intake"] = True
+                a["left"], a["right"] = self._drive_to(spawn, full_speed=False)
+                a["left"]  *= 0.5
+                a["right"] *= 0.5
+                self.last_reason = "intake_loaded"
+                return a
+        if self._just_loaded_steps == 0:
+            self._last_load_spawn = None
+
+        # Start a new trip if conditions warrant.
+        if self._should_match_load(has_pin, has_cup):
+            self._match_load_commit = 60   # ~3 s commitment
+
+        if self._match_load_commit > 0 and (not has_pin or not has_cup):
+            zone_idx, lz_pt = self._pick_loading_zone()
+            self._target_load_zone = zone_idx
+            spawn = self._spawn_for_loading_zone(zone_idx)
+            if self._in_loading_zone():
+                a["match_load"] = True
+                a["left"], a["right"] = 0.0, 0.0
+                self._last_load_spawn   = spawn
+                self._just_loaded_steps = 30   # ~1.5 s window
+                self._match_load_commit = 0    # trip done
+                self.last_reason = f"match_load_fire:{zone_idx}"
+                return a
+            # Disable obstacle deflection — the loading-zone corner is
+            # often shadowed by alliance-side goals; deflection routes the
+            # bot into walls.  Let physics handle the bump and the wall.
+            a["left"], a["right"] = self._drive_to(
+                lz_pt, full_speed=True, avoid_obstacles=False)
+            self.last_reason = f"drive_to_match_load:{zone_idx}"
+            return a
+
+        # Not heading to the loading zone — release our claim on it.
+        if self._match_load_commit == 0:
+            self._target_load_zone = None
+
         if not has_pin and not has_cup:
             # Both slots empty.  Decide pin vs cup based on alliance/neutral
             # goal demand: more goals need pin → fetch pin, more need cup →
@@ -1308,21 +1398,292 @@ class HeuristicBot:
                 self._last_intake_type = "cup"
         cont = np.array([a["left"], a["right"]], dtype=np.float32)
         disc = np.array([
-            1.0 if a["intake"]    else 0.0,
-            1.0 if a["score_pin"] else 0.0,
-            1.0 if a["score_cup"] else 0.0,
-            1.0 if a["toggle"]    else 0.0,
-            1.0 if a["flip_pin"]  else 0.0,
-            1.0 if a["flip_cup"]  else 0.0,
-            0.0,
+            1.0 if a["intake"]     else 0.0,
+            1.0 if a["score_pin"]  else 0.0,
+            1.0 if a["score_cup"]  else 0.0,
+            1.0 if a["toggle"]     else 0.0,
+            1.0 if a["flip_pin"]   else 0.0,
+            1.0 if a["flip_cup"]   else 0.0,
+            1.0 if a["match_load"] else 0.0,
         ], dtype=np.float32)
         return cont, disc
+
+    # ── Match-load helpers ────────────────────────────────────────────── #
+
+    def _can_match_load(self) -> bool:
+        """Only red1/blue1 are eligible (matches simulator restriction)."""
+        return self.robot_id in ("red1", "blue1")
+
+    def _loading_zone_targets(self) -> List[Tuple[float, float]]:
+        """Two corner waypoints inside our alliance's loading zone.
+        Index 0 = top corner (y<24), index 1 = bottom corner (y>120).
+        Stays clear of walls (x in [9,135], y in [9,135] keeps us un-pinned).
+        """
+        if self.alliance == "red":
+            return [(10.0, 16.0), (10.0, 128.0)]
+        return [(134.0, 16.0), (134.0, 128.0)]
+
+    def _pick_loading_zone(self) -> Tuple[int, Tuple[float, float]]:
+        """Choose which loading-zone corner to use.
+
+        Logic (in order):
+          1. If we've committed to a corner this trip, keep it (sticky).
+          2. Prefer un-claimed corners with a clear line-of-sight from us.
+          3. Fall back to closest by distance.
+
+        Returns (index, (x, y)).
+        """
+        zones = self._loading_zone_targets()
+        my = self._pos()
+        partners = self._partner_targets()
+        claimed = partners.get("load_zones", set())
+
+        # Sticky: keep our previous choice while we're still pursuing it.
+        if self._target_load_zone in (0, 1):
+            return self._target_load_zone, zones[self._target_load_zone]
+
+        # Prefer un-claimed AND line-of-sight clear, ordered by distance.
+        candidates_clear = [
+            (i, zones[i]) for i in (0, 1)
+            if i not in claimed and self._line_clear_of_goals(my, zones[i])
+        ]
+        if candidates_clear:
+            idx, pt = min(candidates_clear,
+                          key=lambda ip: self._dist(my, ip[1]))
+            return idx, pt
+
+        # Fall back: any un-claimed, by distance.
+        candidates = [(i, zones[i]) for i in (0, 1) if i not in claimed]
+        if not candidates:
+            candidates = [(i, zones[i]) for i in (0, 1)]
+        idx, pt = min(candidates, key=lambda ip: self._dist(my, ip[1]))
+        return idx, pt
+
+    def _nearest_loading_zone(self) -> Tuple[float, float]:
+        """Closest corner (read-only convenience — does NOT commit)."""
+        my = self._pos()
+        return min(self._loading_zone_targets(),
+                   key=lambda t: self._dist(my, t))
+
+    def _spawn_for_loading_zone(self, idx: int) -> Tuple[float, float]:
+        """Where the spawned cup/pin lands for this loading zone index."""
+        sx = 6.0 if self.alliance == "red" else 138.0
+        sy = 12.0 if idx == 0 else 132.0
+        return (sx, sy)
+
+    def _in_loading_zone(self) -> bool:
+        x, y = self._pos()
+        if self.alliance == "red":
+            return x < 12.0 and (y < 24.0 or y > 120.0)
+        return x > 132.0 and (y < 24.0 or y > 120.0)
+
+    def _has_reachable_loading_zone(self, max_d: float = 55.0) -> bool:
+        """True if at least one loading-zone corner is within max_d AND
+        has no goal blocking the straight path from our current position.
+
+        Used to gate match-load decisions: avoids committing to a trip we
+        cannot complete because alliance-side goals shadow the corner.
+        """
+        my = self._pos()
+        for pt in self._loading_zone_targets():
+            if self._dist(my, pt) > max_d:
+                continue
+            if self._line_clear_of_goals(my, pt):
+                return True
+        return False
+
+    def _line_clear_of_goals(self, a: Tuple[float, float],
+                              b: Tuple[float, float]) -> bool:
+        """True if the segment a→b doesn't pass through any goal's
+        collision radius (goal radius ~10 + robot half-width ~8.5 → 19).
+        """
+        ax, ay = a; bx, by = b
+        dx, dy = bx - ax, by - ay
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-6:
+            return True
+        for g in self.sim.goals:
+            # Project goal centre onto the segment
+            t = ((g.x - ax) * dx + (g.y - ay) * dy) / seg_len_sq
+            t = max(0.0, min(1.0, t))
+            cx = ax + t * dx
+            cy = ay + t * dy
+            if math.hypot(g.x - cx, g.y - cy) < 19.0:
+                return False
+        return True
+
+    def _nearest_useful_element_dist(self) -> float:
+        """Closest distance to any non-wall, valuable, fetchable pin or cup.
+        Used to compare match-load round-trip vs. normal-fetch round-trip.
+        """
+        my = self._pos()
+        best = float("inf")
+        for p in self.sim.pins:
+            if p.scored or p.carried_by is not None: continue
+            if getattr(p, 'is_nested', False): continue
+            if self._pin_value(p) <= 0: continue
+            px, py = float(p.body.position.x), float(p.body.position.y)
+            if self._is_wall_pinned(px, py): continue
+            d = self._dist(my, (px, py))
+            if d < best: best = d
+        for c in self.sim.cups:
+            if c.scored or c.carried_by is not None: continue
+            cx, cy = float(c.body.position.x), float(c.body.position.y)
+            if self._is_wall_pinned(cx, cy): continue
+            d = self._dist(my, (cx, cy))
+            if d < best: best = d
+        return best
+
+    def _inventory_left(self) -> Tuple[int, int, int]:
+        """(cups, alliance_pins, yellow_pins) remaining for our alliance."""
+        s = self.sim
+        if self.alliance == "red":
+            return (int(s.red_cups_left), int(s.red_alliance_pins_left),
+                    int(s.red_yellow_pins_left))
+        return (int(s.blue_cups_left), int(s.blue_alliance_pins_left),
+                int(s.blue_yellow_pins_left))
+
+    def _have_loose_yellow_yellow_on_field(self) -> bool:
+        """True if a yellow_yellow pin (both halves yellow) is loose.
+
+        match_load selection 2 spawns a 'yellow_yellow' pin specifically —
+        so checking only for that color matches the value of the load.
+        red_yellow / blue_yellow pins (one yellow half) do not justify
+        skipping a match load.
+        """
+        for p in self.sim.pins:
+            if getattr(p, 'scored', False):
+                continue
+            if getattr(p, 'carried_by', None) is not None:
+                continue
+            up = getattr(p, 'up_half_name', None)
+            dn = getattr(p, 'down_half_name', None)
+            if up == "yellow" and dn == "yellow":
+                return True
+        return False
+
+    def _should_match_load(self, has_pin: bool, has_cup: bool) -> bool:
+        """Decide whether the bot should head to the loading zone.
+
+        Triggers (conservative — match-load competes with normal fetch, so
+        we only fire when match-load is CLEARLY the right choice):
+          1. Empty hands + we still have yellow inventory + no loose
+             yellow_yellow exists on the field.  Match-load is the only
+             remaining route to +20 yellow scoring.
+          2. Empty hands + the entire field is depleted of non-wall
+             fetchable elements + we have inventory.  Pure fallback.
+          3. Partial inventory + the missing element type is genuinely
+             unavailable on the field.
+
+        After a failed trip (commit timed out without firing) we back
+        off via _ml_cooldown_steps so we don't pound the same path forever.
+        """
+        if not self._can_match_load():
+            return False
+        if has_pin and has_cup:
+            return False
+        if self._ml_cooldown_steps > 0:
+            return False
+        # Skip in the final ~20 s of driver — load/score/park needs ~15 s.
+        if (self.sim.match_phase == "driver" and
+                self.sim.time_remaining is not None and
+                self.sim.time_remaining <= 20.0):
+            return False
+        cups, ap, yp = self._inventory_left()
+        if cups + ap + yp == 0:
+            return False
+
+        # Distance + line-of-sight gate: only start a trip if a loading
+        # zone corner is close (≤45") AND no goal blocks the direct path.
+        # Without LoS check the bot wedges between alliance-side goals
+        # (e.g. (120,48)) and the wall and wastes time oscillating.
+        if not self._has_reachable_loading_zone():
+            return False
+
+        # CASE 1 — yellow pin opportunity, no comparable loose yy left.
+        if (not has_pin and not has_cup and yp > 0 and cups > 0 and
+                not self._have_loose_yellow_yellow_on_field()):
+            return True
+
+        # CASE 1b — yellow pin still in inventory AND loading zone is the
+        # FASTEST route to a yellow_yellow.  We compare round-trip cost:
+        # bot → corner (loading_d) vs bot → nearest loose yy (closest_yy_d).
+        # The _has_reachable_loading_zone gate above already proved a
+        # clear-path corner within range exists, so this is purely about
+        # whether match-load wins on speed.
+        if not has_pin and not has_cup and yp > 0 and cups > 0:
+            my = self._pos()
+            loading_d = self._dist(my, self._nearest_loading_zone())
+            closest_yy_d = float("inf")
+            for p in self.sim.pins:
+                if getattr(p, 'scored', False): continue
+                if getattr(p, 'carried_by', None) is not None: continue
+                if getattr(p, 'up_half_name', None) != "yellow": continue
+                if getattr(p, 'down_half_name', None) != "yellow": continue
+                d = self._dist(my, (float(p.body.position.x),
+                                    float(p.body.position.y)))
+                if d < closest_yy_d: closest_yy_d = d
+            if loading_d <= 50.0 and loading_d < closest_yy_d * 0.85:
+                return True
+            # Early-match: if we've held the yellow inventory unused for
+            # most of the match so far, and the corner is reachable,
+            # spend it.  Sitting on unused yp until endgame is wasteful.
+            # autonomous phase OR first half of driver:
+            in_early = (self.sim.match_phase == "autonomous" or
+                        (self.sim.match_phase == "driver" and
+                         self.sim.time_remaining is not None and
+                         self.sim.time_remaining > 60.0))
+            if in_early and loading_d <= 30.0:
+                return True
+
+        # CASE 2 — empty hands, field depleted of fetchable elements.
+        if (not has_pin and not has_cup and
+                not self._any_useful_pin_on_field() and
+                not self._any_useful_cup_on_field()):
+            return True
+
+        # CASE 3 — partial inventory, missing-type unavailable.
+        if has_pin and not has_cup and cups > 0:
+            if not self._any_useful_cup_on_field():
+                return True
+        if has_cup and not has_pin and (ap + yp) > 0:
+            if not self._any_useful_pin_on_field():
+                return True
+
+        return False
+
+    def _any_useful_pin_on_field(self) -> bool:
+        """Read-only: is there at least one valuable, fetchable pin?"""
+        for p in self.sim.pins:
+            if p.scored or p.carried_by is not None:
+                continue
+            if getattr(p, 'is_nested', False):
+                continue
+            if self._pin_value(p) <= 0:
+                continue
+            px, py = float(p.body.position.x), float(p.body.position.y)
+            if self._is_wall_pinned(px, py):
+                continue
+            return True
+        return False
+
+    def _any_useful_cup_on_field(self) -> bool:
+        """Read-only: is there at least one fetchable cup?"""
+        for c in self.sim.cups:
+            if c.scored or c.carried_by is not None:
+                continue
+            cx, cy = float(c.body.position.x), float(c.body.position.y)
+            if self._is_wall_pinned(cx, cy):
+                continue
+            return True
+        return False
 
     @staticmethod
     def _zero_action() -> Dict[str, Any]:
         return {"left": 0.0, "right": 0.0,
                 "intake": False, "score_pin": False, "score_cup": False,
-                "toggle": False, "flip_pin": False, "flip_cup": False}
+                "toggle": False, "flip_pin": False, "flip_cup": False,
+                "match_load": False}
 
     # ── Flip-decision helpers ─────────────────────────────────────────── #
 

@@ -394,14 +394,15 @@ class OverrideEnv:
             toggle = toggle_raw and self._toggle_is_legal(rob)
 
             sim_actions[i] = {
-                "left":      float(np.clip(cont[0], -1.0, 1.0)),
-                "right":     float(np.clip(cont[1], -1.0, 1.0)),
-                "intake":    intake,
-                "score_pin": score_pin,
-                "score_cup": score_cup,
-                "toggle":    toggle,
-                "flip_pin":  flip_pin,
-                "flip_cup":  flip_cup,
+                "left":       float(np.clip(cont[0], -1.0, 1.0)),
+                "right":      float(np.clip(cont[1], -1.0, 1.0)),
+                "intake":     intake,
+                "score_pin":  score_pin,
+                "score_cup":  score_cup,
+                "toggle":     toggle,
+                "flip_pin":   flip_pin,
+                "flip_cup":   flip_cup,
+                "match_load": match_load,
             }
 
             if flip_pin or flip_cup:

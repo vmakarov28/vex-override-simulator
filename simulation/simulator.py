@@ -235,6 +235,8 @@ class OverrideSimulator:
                         robot.try_score_cup(self.goals, self.rules_engine)
                     if act.get("toggle", False):
                         robot.try_toggle(self.toggles)
+                    if act.get("match_load", False):
+                        self._try_bot_match_load(robot)
                 else:
                     robot.apply_drive(0, 0)
 
@@ -662,6 +664,41 @@ class OverrideSimulator:
             return (pos.x < 12 and pos.y < 24) or (pos.x < 12 and pos.y > 120)
         else:
             return (pos.x > 132 and pos.y < 24) or (pos.x > 132 and pos.y > 120)
+
+    def _try_bot_match_load(self, robot) -> bool:
+        """Bot-driven match load.  Only red1/blue1 are eligible (matches the
+        keyboard handler's restriction).  Robot must be in its alliance's
+        loading zone.  Picks the best available selection automatically:
+
+            1. Loaded cup + yellow pin (selection 2)   — highest value
+            2. Loaded cup + alliance pin (selection 1) — pin+cup at once
+            3. Individual alliance pin   (selection 4)
+            4. Individual cup            (selection 3)
+            5. Individual yellow pin     (selection 5) — fallback (no cup left)
+
+        Returns True if a match load actually fired.
+        """
+        if robot.robot_id not in ("red1", "blue1"):
+            return False
+        alliance = robot.alliance
+        if not self._is_in_loading_zone(robot, alliance):
+            return False
+        if self._has_inventory(alliance, "cup") and self._has_inventory(alliance, "yellow_pin"):
+            self._perform_match_load(robot, 2)
+            return True
+        if self._has_inventory(alliance, "cup") and self._has_inventory(alliance, "alliance_pin"):
+            self._perform_match_load(robot, 1)
+            return True
+        if self._has_inventory(alliance, "alliance_pin"):
+            self._perform_match_load(robot, 4)
+            return True
+        if self._has_inventory(alliance, "cup"):
+            self._perform_match_load(robot, 3)
+            return True
+        if self._has_inventory(alliance, "yellow_pin"):
+            self._perform_match_load(robot, 5)
+            return True
+        return False
 
     def _perform_match_load(self, robot, selection):
         alliance = robot.alliance

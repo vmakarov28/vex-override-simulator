@@ -130,27 +130,30 @@ class OverrideEnv(ParallelEnv):
 
             for rid in AGENT_IDS:
                 if rid in actions:
-                    act       = np.asarray(actions[rid], dtype=np.float32)
-                    left      = float(np.clip(act[0], -1.0, 1.0))
-                    right     = float(np.clip(act[1], -1.0, 1.0))
-                    intake    = bool(act[2] > 0.5)
-                    score_pin = bool(act[3] > 0.5)
-                    score_cup = bool(act[4] > 0.5)
-                    toggle    = bool(act[5] > 0.5)
-                    flip_pin  = bool(act[6] > 0.5)
-                    flip_cup  = bool(act[7] > 0.5)
+                    act        = np.asarray(actions[rid], dtype=np.float32)
+                    left       = float(np.clip(act[0], -1.0, 1.0))
+                    right      = float(np.clip(act[1], -1.0, 1.0))
+                    intake     = bool(act[2] > 0.5)
+                    score_pin  = bool(act[3] > 0.5)
+                    score_cup  = bool(act[4] > 0.5)
+                    toggle     = bool(act[5] > 0.5)
+                    flip_pin   = bool(act[6] > 0.5)
+                    flip_cup   = bool(act[7] > 0.5)
+                    match_load = bool(act[8] > 0.5) if act.shape[0] > 8 else False
                     if flip_pin or flip_cup:   flips_fired[rid]     = True
                     if score_pin or score_cup: score_attempted[rid] = True
                     sim_actions.append({
                         "left": left, "right": right, "intake": intake,
                         "score_pin": score_pin, "score_cup": score_cup,
                         "toggle": toggle, "flip_pin": flip_pin, "flip_cup": flip_cup,
+                        "match_load": match_load,
                     })
                 else:
                     sim_actions.append({
                         "left": 0.0, "right": 0.0, "intake": False,
                         "score_pin": False, "score_cup": False,
                         "toggle": False, "flip_pin": False, "flip_cup": False,
+                        "match_load": False,
                     })
 
             self.sim.step(1.0 / 20.0, sim_actions)
