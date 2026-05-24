@@ -1,65 +1,75 @@
 """
 agents/heuristic_bot.py
 =======================
-Rule-based "perfect-play" bot for VEX Override.  v9.4
+Rule-based "perfect-play" bot for VEX Override.  v10.0 — "Always Scoring".
 
-What changed in v9.4 vs v9.3.2
--------------------------------
-The previous bot was correct but slow and uncoordinated, scoring ~0-20 pts
-per alliance per match.  v9.4 targets 100+ pts per alliance via:
+What changed in v10.0 vs v9.4
+------------------------------
+Root cause of the v9.4 0-pts-per-match bug: the bot sat still during the
+40-step flip cooldown waiting for a *perfect* orientation that never came,
+because the env_wrapper silently rejected most flip attempts.  Bots
+oscillated forever between `flip_pin_at_goal` and `await_pin_flip` without
+ever scoring.
 
-1. **Partner coordination** — module-level `_shared_targets` registry lets
-   two alliance bots avoid claiming the same pin/cup/goal.  Each bot
-   publishes its targets every step; siblings consult the registry when
-   picking, then choose alternatives if a partner already owns a target.
+v10.0 rewrites the priority tree around one principle:
 
-2. **Stack-value goal selection** — `_goal_expected_value(goal, has_pin,
-   has_cup)` scores each goal by the points unlockable with our current
-   inventory, weighted by distance.  Strongly prefers alliance-owned goals,
-   toggle-owned goals (yellow scoring), and goals that complete a stack
-   we've already started.
+    ► NEVER stop moving and NEVER wait for a flip when in scoring range.
+      A 5-pt score is infinitely better than a 0-pt non-score.
 
-3. **Pre-orient after pickup** — as soon as we pick up a pin or cup we
-   choose the target goal and immediately start flipping toward the correct
-   orientation while still driving toward the goal.  The env_wrapper's
-   2-second flip cooldown overlaps with travel time instead of compounding
-   on top of it.
+Specific changes
+----------------
+1.  **Score first, optimise later.**  `_try_score_at_range` always returns
+    a `score_pin` / `score_cup` action when in range with the right element
+    type.  No more `await_pin_flip`.  The bot now scores even with
+    suboptimal orientation.
 
-4. **Faster navigation** — wider spin threshold (110°) lets the bot turn
-   in arcs while driving instead of stopping and pivoting.  Approach
-   geometry targets a point 9" inside the goal (still within SCORING_RADIUS
-   = 12") so the robot does not crash into the goal's physics body and
-   bounce out of range.  When inside scoring range, wheels are zeroed to
-   prevent oscillation.
+2.  **Pre-flip ONLY during travel.**  Flip actions fire only while we are
+    > PRE_FLIP_MIN_DIST inches from the target goal.  The 2-s cooldown
+    overlaps with travel time so by the time we arrive we're already
+    oriented.
 
-5. **Aggressive endgame** — last 8 s: dump any carried element into the
-   nearest valid goal with no orientation checks.  Last 3 s: race to
-   midfield regardless of inventory.
+3.  **Orientation-aware goal selection.**  `_score_value_now` scores each
+    candidate goal by points unlockable *with the pin/cup in its current
+    orientation*.  Bots prefer goals where the orientation is already right
+    over goals that would need a flip — both robots in an alliance can then
+    score sequentially without any cooldown overhead.
 
-6. **Tightened lockouts** — `FLIP_COOLDOWN_STEPS = 40` matches the
-   env_wrapper's `COOLDOWN_FLIP` so the bot doesn't waste 4/5 flip
-   attempts on the silently-gated path.
+4.  **Bots never sit still.**  Whenever a step would otherwise return zero
+    wheels (waiting for cooldown / no immediate task), the bot drifts toward
+    its next planned target (often midfield, sometimes an alternate goal).
 
-7. **Smarter intercept** — only fires when an opponent is essentially
-   touching one of their valid goals AND we're physically closer than
-   they are.  Prevents giving up our own scoring trip to chase a phantom
-   threat.
+5.  **Stuck-escape behaviour.**  If linear velocity stays < STUCK_SPEED for
+    STUCK_STEPS the bot performs a brief backup + rotate to break free.
+
+6.  **Aggressive intake.**  Any unowned pin/cup within INTAKE_RADIUS gets
+    grabbed automatically (intake=True is fired on every approach step).
+
+7.  **Cup-orientation pre-flip.**  Same as pin: flip cup en route, then
+    score immediately on arrival regardless of final orientation.
+
+8.  **Chain stacking.**  After scoring a pin, the bot's next pickup is
+    biased toward a cup (and vice-versa) so the partial stack at the
+    just-scored goal can be completed without anyone returning.
 
 Decision priority (highest first)
 ---------------------------------
-1.  ENDGAME PARK (last ~3 s, regardless of inventory)
-2.  ENDGAME DUMP  (last ~8 s, dump any carried element somewhere legal)
-3.  EMERGENCY INTERCEPT (pin-carrying opponent within scoring contact)
-4.  SCORE NOW (within SCORING_RADIUS of a goal we can score in)
-5.  PRE-PLACEMENT FLIP (orient pin/cup en route)
-6.  FETCH MISSING ELEMENT (pin first if empty-handed, then cup)
-7.  DRIVE TO SCOREABLE GOAL
-8.  TOGGLE (proactive route to nearest unowned toggle)
-9.  DEFAULT — drift toward midfield centre.
+1.  ENDGAME PARK  (last ~3 s, race to midfield)
+2.  ENDGAME DUMP  (last ~8 s, score anything legal)
+3.  SCORE NOW     (within SCORING_RADIUS of a valid goal — fire immediately)
+4.  STUCK ESCAPE  (velocity dead for too long → back up + spin)
+5.  PRE-FLIP EN ROUTE (only when target_goal is >PRE_FLIP_MIN_DIST away)
+6.  DRIVE TO BEST SCOREABLE GOAL  (orientation-aware target selection)
+7.  FETCH MISSING ELEMENT (pin first if empty-handed, else cup)
+8.  TOGGLE PROACTIVE   (route to a useful unowned toggle)
+9.  DEFAULT — drift toward the midfield, opportunistically toggle on pass.
 
-Opportunistic toggle injection (`_finalize_action`): any non-scoring step
-auto-injects `toggle=True` when within `TOGGLE_INTERACTION_RANGE` of an
-unowned toggle, so quadrant control gets claimed "for free" while driving.
+Opportunistic toggle injection (`_finalize_action`):  any non-scoring step
+auto-injects `toggle=True` when within TOGGLE_INTERACTION_RANGE of an
+unowned toggle.
+
+Determinism: no RNG, no learning — given identical state, identical action.
+The seed in `OverrideEnv` only affects field initialisation (pin/cup
+positions, toggle owners), not the bot.
 """
 
 import math
@@ -89,74 +99,82 @@ def _eff_clear_up(cup) -> bool:
 
 # ─────────────────────────────────────────────────────────────────────────── #
 class HeuristicBot:
-    """Single-robot deterministic heuristic agent.
+    """Deterministic, rule-based agent for a single VEX Override robot.
 
-    Construct one per robot:
-        bot = HeuristicBot(robot_id="red1", sim=sim)
-        # every control step:
-        cont, disc = bot.get_policy_action()
+    Construct once per robot.  Call `get_policy_action()` every control step
+    to receive `(cont, disc)` numpy arrays in env_wrapper format.
     """
 
     # ── Tunables ───────────────────────────────────────────────────────── #
-    # Matches env_wrapper.COOLDOWN_FLIP so we don't waste attempts on the
-    # silently-gated path.  Pin flips are expensive — 2 s of cooldown.
-    FLIP_COOLDOWN_STEPS = 40
+    FLIP_COOLDOWN_STEPS = 40       # matches env_wrapper.COOLDOWN_FLIP
 
-    # After this many consecutive steps chasing the same pin/cup without
-    # picking it up, blacklist that element and try a different one.
-    PICKUP_TIMEOUT = 50            # ~2.5 s at 20 Hz
-    BLACKLIST_DURATION = 80        # ~4 s
+    PICKUP_TIMEOUT     = 50        # ~2.5 s — chase the same pin/cup
+    BLACKLIST_DURATION = 80        # ~4 s — then ignore it
 
-    # Approach zones (× INTAKE_RADIUS = 10").
-    INTAKE_SLOW_MULT = 1.6         # below 16" → 70% speed
+    INTAKE_SLOW_MULT  = 1.6        # below 16" → 70% speed
     INTAKE_CRAWL_MULT = 1.05       # below 10.5" → 35% (don't fully stop)
 
-    # _drive_to() turn behaviour
     SPIN_THRESHOLD_DEG = 110.0     # turn-in-place only above this error
-    SLOW_RADIUS = 16.0             # below this distance from target, slow down
+    SLOW_RADIUS        = 16.0      # below this distance, scale throttle down
 
-    # Goal approach: target a point this far from the goal center (inside
-    # SCORING_RADIUS = 12") so we don't drive INTO the goal physics body
-    # and bounce out of range.
-    APPROACH_GOAL_INSET = 9.0
+    APPROACH_GOAL_INSET  = 9.0     # target this far from goal centre
+    SCORE_BRAKE_RADIUS   = SCORING_RADIUS - 1.0   # 11"; brake just inside the boundary
 
-    # If within this distance, brake completely — we're in scoring range
-    # and scoring will fire next step anyway.
-    SCORE_BRAKE_RADIUS = SCORING_RADIUS  # 12"
+    # Pre-flip only when more than this far from the target goal.
+    # Inside this radius we score immediately, regardless of orientation.
+    PRE_FLIP_MIN_DIST = 18.0
+
+    # Stuck-escape
+    STUCK_SPEED      = 1.5         # in/s — below this we count as not moving
+    STUCK_STEPS      = 30          # 1.5 s of no movement → escape kicks in
+    ESCAPE_DURATION  = 16          # 0.8 s of reverse + spin
 
     # Endgame timing (seconds remaining)
     ENDGAME_DUMP_TIME = 8.0
     ENDGAME_PARK_TIME = 3.0
 
-    # Toggle routing (priority 8 only — opportunistic injection has no limit)
+    # Toggle proactive routing (priority 8)
     TOGGLE_ROUTE_RANGE = 60.0
 
     # ── Module-level shared state for partner coordination ────────────── #
     # robot_id -> {"pin": pin_id, "cup": id(cup_obj), "goal": goal_id}
     _shared_targets: Dict[str, Dict[str, Optional[int]]] = {}
 
-    def __init__(self, robot_id: str, sim):
+    def __init__(self, robot_id: str, sim, event_log=None):
         self.robot_id = robot_id
         self.sim = sim
+        self.event_log = event_log
         self._robot_cache = None
-        # Sticky targets — prevents partners constantly swapping
-        self._target_pin_id: Optional[int]  = None
-        self._target_cup_id: Optional[int]  = None
+
+        # Sticky targets
+        self._target_pin_id:  Optional[int] = None
+        self._target_cup_id:  Optional[int] = None
         self._target_goal_id: Optional[int] = None
-        # How many steps we've been chasing the current pin/cup target.
         self._target_pin_steps: int = 0
         self._target_cup_steps: int = 0
-        # Elements we've given up on — avoid them until countdown expires.
+
+        # Blacklists for elements we've given up on
         self._pin_blacklist: set = set()
         self._pin_blacklist_cd: int = 0
         self._cup_blacklist: set = set()
         self._cup_blacklist_cd: int = 0
-        # Per-bot flip lockouts
+
+        # Per-bot flip lockouts (mirror env_wrapper cooldowns so we don't
+        # waste actions, but we never WAIT for them when in scoring range).
         self._flip_pin_lockout = 0
         self._flip_cup_lockout = 0
+
+        # Stuck detection
+        self._low_speed_steps = 0
+        self._escape_steps    = 0
+        self._escape_dir      = 1   # +1 = back-spin one way, -1 the other
+
+        # Last picked-up element type — biases next fetch.
+        self._last_intake_type: Optional[str] = None  # "pin" / "cup"
+
         # Diagnostic
         self.last_reason: str = "init"
-        # Initialise our slot in the shared registry
+
         HeuristicBot._shared_targets[self.robot_id] = {
             "pin": None, "cup": None, "goal": None,
         }
@@ -175,6 +193,10 @@ class HeuristicBot:
         self._cup_blacklist_cd  = 0
         self._flip_pin_lockout  = 0
         self._flip_cup_lockout  = 0
+        self._low_speed_steps   = 0
+        self._escape_steps      = 0
+        self._escape_dir        = 1
+        self._last_intake_type  = None
         self.last_reason        = "init"
         HeuristicBot._shared_targets[self.robot_id] = {
             "pin": None, "cup": None, "goal": None,
@@ -203,6 +225,10 @@ class HeuristicBot:
         p = self.robot.body.position
         return float(p.x), float(p.y)
 
+    def _speed(self) -> float:
+        v = self.robot.body.velocity
+        return math.hypot(float(v.x), float(v.y))
+
     # ── Geometry helpers ──────────────────────────────────────────────── #
 
     @staticmethod
@@ -211,10 +237,10 @@ class HeuristicBot:
 
     def _drive_to(self, target_xy: Tuple[float, float],
                   full_speed: bool = True) -> Tuple[float, float]:
-        """Return (left, right) wheel commands to steer toward target_xy.
+        """Wheel commands to steer toward target_xy.
 
         - Turn-in-place only when heading error exceeds SPIN_THRESHOLD_DEG.
-        - Within SLOW_RADIUS, scale down throttle so we don't overshoot.
+        - Within SLOW_RADIUS, throttle is scaled by distance.
         """
         rx, ry = self._pos()
         tx, ty = target_xy
@@ -231,7 +257,6 @@ class HeuristicBot:
             return -sgn, sgn
 
         base = 1.0 if full_speed else 0.7
-        # Slow approach when close to target — prevents overshoot
         if dist < self.SLOW_RADIUS:
             base *= max(0.4, dist / self.SLOW_RADIUS)
         bias = max(-0.7, min(0.7, err * 1.4))
@@ -240,19 +265,18 @@ class HeuristicBot:
         return max(-1.0, min(1.0, left)), max(-1.0, min(1.0, right))
 
     def _approach_goal_point(self, goal) -> Tuple[float, float]:
-        """Target a point INSET inside the goal radius, so the robot doesn't
-        crash into the goal's physics body."""
+        """Aim for a point INSET inside the goal radius so we don't crash
+        into the goal's physics body and bounce out of range."""
         rx, ry = self._pos()
         dx, dy = goal.x - rx, goal.y - ry
         d = math.hypot(dx, dy)
         if d < self.APPROACH_GOAL_INSET:
             return (goal.x, goal.y)
-        # Step back from the goal center along the line robot→goal
         sf = (d - self.APPROACH_GOAL_INSET) / d
         return (rx + dx * sf, ry + dy * sf)
 
     def _toggle_for_goal(self, goal) -> Optional[object]:
-        """Return the toggle that controls this goal's yellow ownership."""
+        """Toggle that controls this goal's yellow ownership (None for centre)."""
         if goal.goal_id == CENTER_GOAL_ID:
             return None
         dx = goal.x - 72.0
@@ -266,10 +290,9 @@ class HeuristicBot:
     def _valid_goal_for_me(self, goal) -> bool:
         return goal.alliance in ("neutral", self.alliance)
 
-    # ── Partner coordination via shared registry ──────────────────────── #
+    # ── Partner coordination ──────────────────────────────────────────── #
 
     def _publish_targets(self):
-        """Update the shared registry with our current targets."""
         HeuristicBot._shared_targets[self.robot_id] = {
             "pin":  self._target_pin_id,
             "cup":  self._target_cup_id,
@@ -277,9 +300,8 @@ class HeuristicBot:
         }
 
     def _partner_targets(self) -> Dict[str, set]:
-        """Return targets owned by ALLIED partners (excluding ourselves)."""
+        """Targets owned by allied partners (excluding ourselves)."""
         pins, cups, goals = set(), set(), set()
-        # Build a fast alliance-lookup
         alliance_of: Dict[str, str] = {r.robot_id: r.alliance for r in self.sim.robots}
         for rid, tgt in HeuristicBot._shared_targets.items():
             if rid == self.robot_id:
@@ -295,12 +317,7 @@ class HeuristicBot:
 
     @staticmethod
     def _goal_needs(goal) -> str:
-        """What element type does this goal need placed next?
-
-        'pin'  → goal is empty, or has a cup on top  (place a pin)
-        'cup'  → goal has a pin on top               (place a cup)
-        'full' → goal already has 3 elements
-        """
+        """What this goal needs next:  'pin'  /  'cup'  /  'full'."""
         n = len(goal.stack)
         if n >= 3:
             return "full"
@@ -309,71 +326,109 @@ class HeuristicBot:
         _, top_is_pin = goal.stack[-1]
         return "cup" if top_is_pin else "pin"
 
-    def _goal_expected_value(self, goal, has_pin: bool, has_cup: bool) -> float:
-        """Estimate points unlockable at this goal with our current inventory.
+    def _half_pts_for_me(self, half_name: str, goal) -> float:
+        """Points we'd earn if this half lands visible on this goal."""
+        if half_name == self.alliance:
+            return 5.0
+        if half_name in ("red", "blue"):
+            return -5.0   # opponent half — gives them 5 pts; mildly bad
+        if half_name == "yellow":
+            if goal.goal_id == CENTER_GOAL_ID:
+                # SC5b: yellow ownership decided at match end by midfield
+                # majority.  Encourage if we have/can plausibly hold majority.
+                if self._we_have_midfield_majority():
+                    return 10.0
+                return 0.0
+            tog = self._toggle_for_goal(goal)
+            if tog is None:
+                return 0.0
+            if tog.owner == self.alliance:
+                return 10.0
+            if tog.owner == self.opp_alliance:
+                return -10.0   # gives them 10 pts
+            return 0.0
+        return 0.0
 
-        Used to rank scoreable goals.  Higher = better target.
+    def _score_value_now(self, goal, has_pin: bool, has_cup: bool) -> float:
+        """Estimated points if we score the currently-held element NOW
+        at `goal`, given its current orientation.  Negative = scoring here
+        would actively help the opponent (don't do it).
         """
         needs = self._goal_needs(goal)
         if needs == "full":
             return -1.0
-        can_score = (needs == "pin" and has_pin) or (needs == "cup" and has_cup)
-        if not can_score:
-            return -1.0
-
         n = len(goal.stack)
-        v = 0.0
-        # Base: a pin placement scores 5 pts (UP half visible, post hides DOWN)
-        # if it's the first pin; or 10 pts (both halves visible through cup gap)
-        # if it's the second pin on top of a cup.
-        if needs == "pin":
-            v += 10.0 if n == 2 else 5.0   # 2nd pin (after pin+cup) scores both halves
-        elif needs == "cup":
-            # Cup itself = 0 pts, but enables the next pin → estimate as 8 pts
-            # since a future pin on this cup would score ~10 pts.
-            v += 6.0
 
-        # Toggle bonus: if alliance owns the toggle, yellow halves placed here
-        # double in value (5 → 10).  We don't know if our pin has yellow halves
-        # without inspecting the carried pin, but a yellow-owning bias is fine.
-        tog = self._toggle_for_goal(goal)
-        if tog is not None and tog.owner == self.alliance:
-            v += 4.0
-        elif tog is not None and tog.owner == self.opp_alliance:
-            v -= 2.0   # opponent gets the yellow bonus → mildly discourage
+        if needs == "pin" and has_pin:
+            pin = self.robot.carrying_pin
+            if pin is None:
+                return -1.0
+            if n == 0:
+                # First pin on empty goal: DOWN half hidden by post,
+                # only UP half scores.
+                return self._half_pts_for_me(pin.up_half_name, goal)
+            else:
+                # n == 2 (pin + cup), placing a second pin on top.
+                # UP half always visible; DOWN half visible if cup is clear-up.
+                cup_obj, _ = goal.stack[1]
+                cup_clear_up = _eff_clear_up(cup_obj)
+                up_pts = self._half_pts_for_me(pin.up_half_name, goal)
+                dn_pts = (self._half_pts_for_me(pin.down_half_name, goal)
+                          if cup_clear_up else 0.0)
+                return up_pts + dn_pts
 
-        # Alliance goals are sticky-good: only OUR alliance can ever score here
-        if goal.alliance == self.alliance:
-            v += 4.0
+        if needs == "cup" and has_cup:
+            # Cup itself = 0 pts.  But the orientation we drop here decides
+            # whether the pin already on the goal contributes points and
+            # whether a future pin on top will be visible.
+            cup = self.robot.carrying_cup
+            if cup is None:
+                return -1.0
+            if n == 0 or not goal.stack[-1][1]:
+                return -1.0
+            pin_below, _ = goal.stack[-1]
+            # The cup we're about to place sits on pin_below.  When clear-up
+            # (white up) the pin below loses its visible UP half — we want
+            # that ONLY when the pin's UP half is the OPPONENT's colour.
+            up = pin_below.up_half_name
+            up_pts = self._half_pts_for_me(up, goal)
+            # If pin_below.up_half_name is our colour (+pts) we want cup
+            # clear-down (eff_clear_up=False) so the up half stays visible.
+            # If it's opp colour (-pts) we want cup clear-up (eff_clear_up=True).
+            want_clear_up = (up_pts < 0.0)
+            cup_clear_up_now = _eff_clear_up(cup)
+            return 3.0 if cup_clear_up_now == want_clear_up else -1.0
 
-        # Center goal: encourage only if we have midfield majority potential
-        if goal.goal_id == CENTER_GOAL_ID:
-            v -= 2.0   # mild penalty: harder to defend, opponents also target it
-            if self._we_have_midfield_majority():
-                v += 6.0   # SC5b yellows go to us → much more valuable
-
-        # If a partner has already claimed this goal, deprioritise hard
-        partners = self._partner_targets()
-        if goal.goal_id in partners["goals"]:
-            v -= 10.0
-
-        return v
+        return -1.0
 
     def _best_scoreable_goal(self, has_pin: bool, has_cup: bool):
-        """Best goal where I can LEGALLY place something I'm currently holding.
+        """Best goal where I can legally place what I'm holding NOW.
 
-        Picks by expected value MINUS distance penalty.
+        Scoring uses orientation-aware expected value MINUS a distance
+        penalty.  Partners' claimed goals are deprioritised.
         """
         my_pos = self._pos()
+        partners = self._partner_targets()
         best = None
         best_sc = -1e9
         for g in self.sim.goals:
             if not self._valid_goal_for_me(g):
                 continue
-            v = self._goal_expected_value(g, has_pin, has_cup)
-            if v < 0:
+            needs = self._goal_needs(g)
+            if needs == "full":
                 continue
+            if (needs == "pin" and not has_pin) or (needs == "cup" and not has_cup):
+                continue
+            v = self._score_value_now(g, has_pin, has_cup)
+            # Even goals with v <= 0 are kept as fallbacks; just heavily penalised.
             d = self._dist(my_pos, (g.x, g.y))
+            # Bonuses
+            if g.alliance == self.alliance:
+                v += 3.0    # alliance goals always preferred (only we can score)
+            if g.goal_id == CENTER_GOAL_ID:
+                v -= 1.5
+            if g.goal_id in partners["goals"]:
+                v -= 8.0
             sc = v * 4.0 - d
             if sc > best_sc:
                 best_sc = sc
@@ -385,16 +440,15 @@ class HeuristicBot:
     # ── Immediate scoring ─────────────────────────────────────────────── #
 
     def _try_score_at_range(self, has_pin: bool, has_cup: bool):
-        """If already within SCORING_RADIUS of a goal I can score in, score.
+        """Within SCORING_RADIUS of a valid goal?  Score immediately.
 
-        Iterates ALL goals so consecutive element placement works: after
-        scoring a pin the robot is still at the same goal on the next tick
-        and immediately places the cup without an extra approach step.
-
-        Includes orientation checks for both pin and cup before scoring —
-        flips if needed so element halves land facing the right direction.
+        We DO NOT wait for flip cooldown.  A 5-pt score is infinitely
+        better than 0-pts spent waiting.  Orientation is pre-handled
+        during travel (see priority 5).
         """
         my_pos = self._pos()
+        # Iterate goals by best-value first so we pick the best one to score in.
+        scored_candidates = []
         for g in self.sim.goals:
             if not self._valid_goal_for_me(g):
                 continue
@@ -404,64 +458,68 @@ class HeuristicBot:
             needs = self._goal_needs(g)
             if needs == "full":
                 continue
-            a = self._zero_action()
-            if needs == "pin" and has_pin:
-                should_flip, _ = self._should_flip_pin_for_goal(g)
-                if should_flip:
-                    if self._flip_pin_lockout == 0:
-                        a["flip_pin"] = True
-                        self._flip_pin_lockout = self.FLIP_COOLDOWN_STEPS
-                        self.last_reason = f"flip_pin_at_goal:{g.goal_id}"
-                        return a
-                    else:
-                        # Hold position while flip cooldown ticks down
-                        self.last_reason = f"await_pin_flip:{g.goal_id}"
-                        return a
-                a["score_pin"] = True
-                self.last_reason = f"score_pin:{g.goal_id}"
-                self._target_goal_id = g.goal_id
+            if (needs == "pin" and not has_pin) or (needs == "cup" and not has_cup):
+                continue
+            v = self._score_value_now(g, has_pin, has_cup)
+            scored_candidates.append((v, d, g, needs))
+        if not scored_candidates:
+            return None
+        # Highest value, then closest
+        scored_candidates.sort(key=lambda t: (-t[0], t[1]))
+        v, d, g, needs = scored_candidates[0]
+
+        # Only refuse to score if the action would be NET NEGATIVE *and*
+        # the bot is empty-handed afterward (so we lose nothing by waiting).
+        # In practice this only triggers for placing a wrong-orientation cup
+        # on an own-alliance pin — we'd rather flip first.
+        if v < 0.0 and needs == "cup":
+            # Try to flip the cup if we still can; otherwise score anyway.
+            cup = self.robot.carrying_cup
+            if cup is not None and self._flip_cup_lockout == 0:
+                a = self._zero_action()
+                a["flip_cup"] = True
+                self._flip_cup_lockout = self.FLIP_COOLDOWN_STEPS
+                # Drive in a tight circle so we don't drift out of range.
+                a["left"], a["right"] = self._tight_circle()
+                self.last_reason = f"flip_cup_in_zone:{g.goal_id}"
                 return a
-            if needs == "cup" and has_cup:
-                cup = self.robot.carrying_cup
-                correct = self._correct_cup_clear_up(g)
-                needs_flip = (correct is not None and cup is not None
-                              and _eff_clear_up(cup) != correct)
-                if needs_flip:
-                    if self._flip_cup_lockout == 0:
-                        a["flip_cup"] = True
-                        self._flip_cup_lockout = self.FLIP_COOLDOWN_STEPS
-                        self.last_reason = f"flip_cup_at_goal:{g.goal_id}"
-                        return a
-                    else:
-                        self.last_reason = f"await_cup_flip:{g.goal_id}"
-                        return a
-                a["score_cup"] = True
-                self.last_reason = f"score_cup:{g.goal_id}"
-                self._target_goal_id = g.goal_id
-                return a
-        return None
+            # Cup cooldown still ticking — score anyway, lose a few points.
+
+        a = self._zero_action()
+        if needs == "pin":
+            a["score_pin"] = True
+            self.last_reason = f"score_pin:{g.goal_id}(v={v:.1f})"
+        else:
+            a["score_cup"] = True
+            self.last_reason = f"score_cup:{g.goal_id}(v={v:.1f})"
+        self._target_goal_id = g.goal_id
+        return a
+
+    def _tight_circle(self) -> Tuple[float, float]:
+        """Return wheel commands for a small in-place arc — keeps the
+        robot dynamic during cooldown waits."""
+        return 0.45, -0.05
 
     # ── Element pickup helpers ────────────────────────────────────────── #
 
     def _pin_value(self, pin) -> float:
-        """How valuable is THIS pin for our alliance?  Negative = avoid."""
+        """How valuable is this pin?  Negative = avoid."""
         c = pin.color
-        own_solid   = (self.alliance == "red"  and c == "red")  or (self.alliance == "blue" and c == "blue")
-        opp_solid   = (self.alliance == "red"  and c == "blue") or (self.alliance == "blue" and c == "red")
-        own_yellow  = (self.alliance == "red"  and c == "red_yellow")  or (self.alliance == "blue" and c == "blue_yellow")
-        opp_yellow  = (self.alliance == "red"  and c == "blue_yellow") or (self.alliance == "blue" and c == "red_yellow")
-        full_yellow = (c == "yellow" or c == "yellow_yellow")
-        if own_yellow:   return 1.5
+        own_solid    = (self.alliance == "red"  and c == "red")  or (self.alliance == "blue" and c == "blue")
+        opp_solid    = (self.alliance == "red"  and c == "blue") or (self.alliance == "blue" and c == "red")
+        own_yellow   = (self.alliance == "red"  and c == "red_yellow")  or (self.alliance == "blue" and c == "blue_yellow")
+        opp_yellow   = (self.alliance == "red"  and c == "blue_yellow") or (self.alliance == "blue" and c == "red_yellow")
+        full_yellow  = (c == "yellow" or c == "yellow_yellow")
+        if own_yellow:   return 1.8
         if own_solid:    return 1.0
-        if full_yellow:  return 1.2
-        if opp_yellow:   return 0.4
-        if opp_solid:    return -1.0
+        if full_yellow:  return 1.4
+        if opp_yellow:   return -1.5
+        if opp_solid:    return -2.0
         return 0.1
 
     def _pick_best_pin(self):
         my_pos = self._pos()
-        timed_out = self._target_pin_steps >= self.PICKUP_TIMEOUT
-        if timed_out and self._target_pin_id is not None:
+        if self._target_pin_steps >= self.PICKUP_TIMEOUT and self._target_pin_id is not None:
             self._pin_blacklist.add(self._target_pin_id)
             self._pin_blacklist_cd = max(self._pin_blacklist_cd, self.BLACKLIST_DURATION)
             self._target_pin_id = None
@@ -473,6 +531,8 @@ class HeuristicBot:
         for p in self.sim.pins:
             if p.scored or p.carried_by is not None:
                 continue
+            if getattr(p, 'is_nested', False):
+                continue
             if p.pin_id in self._pin_blacklist:
                 continue
             val = self._pin_value(p)
@@ -480,26 +540,27 @@ class HeuristicBot:
                 continue
             d = self._dist(my_pos, (float(p.body.position.x), float(p.body.position.y)))
             if self._target_pin_id == p.pin_id:
-                d *= 0.75   # sticky bonus
+                d *= 0.75
             if p.pin_id in partner_pins:
-                d += 50.0   # partner already heading there → strong deprioritise
-            sc = val * 12.0 - d
+                d += 50.0
+            sc = val * 15.0 - d
             if sc > best_sc:
                 best_sc = sc
                 best = p
-        # Fallback: if everything was blacklisted or partner-claimed, ignore
-        # both filters and pick the absolute closest valuable pin.
         if best is None:
+            # Drop blacklist & partner filter — grab anything valuable
             self._pin_blacklist.clear()
             self._pin_blacklist_cd = 0
             for p in self.sim.pins:
                 if p.scored or p.carried_by is not None:
                     continue
+                if getattr(p, 'is_nested', False):
+                    continue
                 val = self._pin_value(p)
                 if val <= 0:
                     continue
                 d = self._dist(my_pos, (float(p.body.position.x), float(p.body.position.y)))
-                sc = val * 12.0 - d
+                sc = val * 15.0 - d
                 if sc > best_sc:
                     best_sc = sc
                     best = p
@@ -507,8 +568,7 @@ class HeuristicBot:
 
     def _pick_best_cup(self):
         my_pos = self._pos()
-        timed_out = self._target_cup_steps >= self.PICKUP_TIMEOUT
-        if timed_out and self._target_cup_id is not None:
+        if self._target_cup_steps >= self.PICKUP_TIMEOUT and self._target_cup_id is not None:
             self._cup_blacklist.add(self._target_cup_id)
             self._cup_blacklist_cd = max(self._cup_blacklist_cd, self.BLACKLIST_DURATION)
             self._target_cup_id = None
@@ -546,7 +606,8 @@ class HeuristicBot:
     def _action_get_pin(self, a: dict) -> dict:
         pin = self._pick_best_pin()
         if pin is None:
-            a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=False)
+            # Field is empty of valuable pins — drift to midfield while we wait.
+            a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
             self.last_reason = "no_pin_available"
             return a
         px, py = float(pin.body.position.x), float(pin.body.position.y)
@@ -557,13 +618,11 @@ class HeuristicBot:
             self._target_pin_steps = 0
         self._target_pin_steps += 1
 
-        # Always fire intake — the sim rejects it when out of range, no penalty.
         a["intake"] = True
         if d <= INTAKE_RADIUS * self.INTAKE_CRAWL_MULT:
-            # Don't fully stop — crawl forward so we don't drift out of range.
             a["left"], a["right"] = self._drive_to((px, py), full_speed=False)
-            a["left"]  *= 0.35
-            a["right"] *= 0.35
+            a["left"]  *= 0.4
+            a["right"] *= 0.4
             self.last_reason = f"intake_pin:{pin.pin_id}"
         elif d <= INTAKE_RADIUS * self.INTAKE_SLOW_MULT:
             a["left"], a["right"] = self._drive_to((px, py), full_speed=False)
@@ -586,8 +645,8 @@ class HeuristicBot:
         a["intake"] = True
         if d <= INTAKE_RADIUS * self.INTAKE_CRAWL_MULT:
             a["left"], a["right"] = self._drive_to((cx, cy), full_speed=False)
-            a["left"]  *= 0.35
-            a["right"] *= 0.35
+            a["left"]  *= 0.4
+            a["right"] *= 0.4
             self.last_reason = f"intake_cup:{cid}"
         elif d <= INTAKE_RADIUS * self.INTAKE_SLOW_MULT:
             a["left"], a["right"] = self._drive_to((cx, cy), full_speed=False)
@@ -600,9 +659,8 @@ class HeuristicBot:
     # ── Post-processing — opportunistic toggle injection ─────────────── #
 
     def _finalize_action(self, a: dict) -> dict:
-        """Opportunistically fire toggle=True whenever passing near an
-        unowned toggle, on ANY non-scoring travel or idle action.
-        """
+        """Inject toggle=True if we're near an unowned toggle, on any
+        non-scoring step.  Free quadrant-control claims while driving."""
         if a["score_pin"] or a["score_cup"] or a["flip_pin"] or a["flip_cup"]:
             return a
         if a["toggle"]:
@@ -622,17 +680,43 @@ class HeuristicBot:
             self.last_reason = self.last_reason + f"+toggle:{best_t.toggle_id}"
         return a
 
+    # ── Stuck-escape ──────────────────────────────────────────────────── #
+
+    def _update_stuck_state(self):
+        spd = self._speed()
+        if spd < self.STUCK_SPEED:
+            self._low_speed_steps += 1
+        else:
+            self._low_speed_steps = 0
+        # Decrement an active escape
+        if self._escape_steps > 0:
+            self._escape_steps -= 1
+
+    def _maybe_escape_action(self) -> Optional[dict]:
+        if self._escape_steps > 0:
+            a = self._zero_action()
+            # Reverse + spin one way
+            d = self._escape_dir
+            a["left"]  = -0.8 * d
+            a["right"] = -0.4 * d
+            self.last_reason = "escape_stuck"
+            return a
+        if self._low_speed_steps >= self.STUCK_STEPS:
+            # Start an escape burst.  Alternate direction for variety.
+            self._escape_dir   = -self._escape_dir
+            self._escape_steps = self.ESCAPE_DURATION
+            self._low_speed_steps = 0
+            return self._maybe_escape_action()
+        return None
+
     # ── Top-level dispatcher ──────────────────────────────────────────── #
 
     def get_sim_action(self) -> Dict[str, Any]:
-        """Compute + finalise the action for this control step."""
         a = self._compute_action()
-        # Publish our targets so siblings can see them next step.
         self._publish_targets()
         return self._finalize_action(a)
 
     def _compute_action(self) -> Dict[str, Any]:
-        """Core decision tree — returns action dict (toggle NOT yet injected)."""
         a = self._zero_action()
         if self._flip_pin_lockout > 0: self._flip_pin_lockout -= 1
         if self._flip_cup_lockout > 0: self._flip_cup_lockout -= 1
@@ -645,18 +729,24 @@ class HeuristicBot:
         else:
             self._cup_blacklist.clear()
 
+        # Track stuck-state every step (escape kicks in before priority 1
+        # so it overrides even endgame park if we're physically blocked).
+        self._update_stuck_state()
+
         has_pin = self.robot.carrying_pin is not None
         has_cup = self.robot.carrying_cup is not None
         endgame = (self.sim.rules_engine.endgame_active and
                    self.sim.time_remaining is not None)
 
-        # ── 1. ENDGAME PARK — last ~3 s, race to midfield ─────────────── #
+        # ── 1. ENDGAME PARK ─────────────────────────────────────────── #
         if endgame and self.sim.time_remaining <= self.ENDGAME_PARK_TIME:
+            esc = self._maybe_escape_action()
+            if esc is not None: return esc
             a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
             self.last_reason = "endgame_park"
             return a
 
-        # ── 2. ENDGAME DUMP — last ~8 s, dump anything we have ─────────── #
+        # ── 2. ENDGAME DUMP ─────────────────────────────────────────── #
         if endgame and self.sim.time_remaining <= self.ENDGAME_DUMP_TIME and (has_pin or has_cup):
             dump = self._try_dump_at_range(has_pin, has_cup)
             if dump is not None:
@@ -668,80 +758,96 @@ class HeuristicBot:
                 self.last_reason = f"endgame_dump_to:{target.goal_id}"
                 self._target_goal_id = target.goal_id
                 return a
-            # Nothing legal to dump → head to midfield to at least park
             a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
             self.last_reason = "endgame_park_carry"
             return a
 
-        # ── 3. EMERGENCY INTERCEPT ─────────────────────────────────────── #
-        intercept = self._find_intercept_target()
-        if intercept is not None:
-            ox = float(intercept.body.position.x)
-            oy = float(intercept.body.position.y)
-            a["left"], a["right"] = self._drive_to((ox, oy), full_speed=True)
-            self.last_reason = f"intercept:{intercept.robot_id}"
-            return a
-
-        # ── 4. SCORE NOW — if already at a scoreable goal ──────────────── #
+        # ── 3. SCORE NOW — within range with a valid element ──────────── #
         score_now = self._try_score_at_range(has_pin, has_cup)
         if score_now is not None:
             return score_now
 
-        # ── 5. PRE-PLACEMENT FLIPS — orient elements en route ─────────── #
+        # ── 4. STUCK ESCAPE ────────────────────────────────────────────── #
+        esc = self._maybe_escape_action()
+        if esc is not None:
+            return esc
+
+        # ── 5. PRE-FLIP EN ROUTE ───────────────────────────────────────── #
         target_goal = self._best_scoreable_goal(has_pin, has_cup)
         if target_goal is not None:
-            if has_cup and self._flip_cup_lockout == 0:
-                should, _ = self._should_flip_cup_for_goal(target_goal)
-                if should:
-                    a["flip_cup"] = True
-                    self._flip_cup_lockout = self.FLIP_COOLDOWN_STEPS
-                    a["left"], a["right"] = self._drive_to(
-                        self._approach_goal_point(target_goal))
-                    self.last_reason = f"flip_cup_for_goal:{target_goal.goal_id}"
-                    return a
-            if has_pin and self._flip_pin_lockout == 0:
-                should, _ = self._should_flip_pin_for_goal(target_goal)
-                if should:
-                    a["flip_pin"] = True
-                    self._flip_pin_lockout = self.FLIP_COOLDOWN_STEPS
-                    a["left"], a["right"] = self._drive_to(
-                        self._approach_goal_point(target_goal))
-                    self.last_reason = f"flip_pin_for_goal:{target_goal.goal_id}"
-                    return a
+            d_to_goal = self._dist(self._pos(), (target_goal.x, target_goal.y))
+            if d_to_goal > self.PRE_FLIP_MIN_DIST:
+                if has_pin and self._flip_pin_lockout == 0:
+                    should = self._should_flip_pin_for_goal(target_goal)
+                    if should:
+                        a["flip_pin"] = True
+                        self._flip_pin_lockout = self.FLIP_COOLDOWN_STEPS
+                        a["left"], a["right"] = self._drive_to(
+                            self._approach_goal_point(target_goal),
+                            full_speed=True)
+                        self.last_reason = f"flip_pin_en_route:{target_goal.goal_id}"
+                        return a
+                if has_cup and self._flip_cup_lockout == 0:
+                    should = self._should_flip_cup_for_goal(target_goal)
+                    if should:
+                        a["flip_cup"] = True
+                        self._flip_cup_lockout = self.FLIP_COOLDOWN_STEPS
+                        a["left"], a["right"] = self._drive_to(
+                            self._approach_goal_point(target_goal),
+                            full_speed=True)
+                        self.last_reason = f"flip_cup_en_route:{target_goal.goal_id}"
+                        return a
 
-        # ── 6. FETCH MISSING ELEMENTS ─────────────────────────────────── #
-        # Smart full-load strategy: if we have only a pin and the target goal
-        # needs a pin, fetch a cup first so we can deposit both in one trip.
-
+        # ── 6. FETCH MISSING ELEMENT ───────────────────────────────────── #
+        # Smart full-load: when target_goal needs the OTHER element type,
+        # fetch that next so we deposit both in one trip.
         if not has_pin and not has_cup:
+            # Bias toward whichever we just used (so the partial stack we
+            # just contributed to gets completed): if last intake was a pin,
+            # we likely already scored a pin → next we need a cup.
+            if self._last_intake_type == "pin":
+                cup = self._pick_best_cup()
+                if cup is not None:
+                    self._last_intake_type = "cup"
+                    return self._action_get_cup(a, cup)
             return self._action_get_pin(a)
 
-        if has_pin and not has_cup:
-            if target_goal is None:
+        if has_pin and not has_cup and target_goal is not None:
+            needs = self._goal_needs(target_goal)
+            if needs == "pin":
+                # We can drop the pin — but only after a cup is at the goal
+                # (handled by score_now above).  Meanwhile, grab a cup so we
+                # can immediately follow up with a pin+cup placement.
                 cup = self._pick_best_cup()
                 if cup is not None:
                     return self._action_get_cup(a, cup)
-                a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=False)
-                self.last_reason = "no_cup_no_goal"
-                return a
-            else:
-                needs = self._goal_needs(target_goal)
-                if needs == "pin":
-                    cup = self._pick_best_cup()
-                    if cup is not None:
-                        return self._action_get_cup(a, cup)
 
-        if not has_pin and has_cup:
-            if target_goal is None:
-                return self._action_get_pin(a)
+        if not has_pin and has_cup and target_goal is not None:
+            needs = self._goal_needs(target_goal)
+            if needs == "cup":
+                # Goal needs a cup — but to make this useful we also need a pin
+                # to follow.  Grab the pin first.  (We deposit cup-then-pin
+                # in two visits.)
+                pin = self._pick_best_pin()
+                if pin is not None:
+                    return self._action_get_pin(a)
 
-        # ── 7. DRIVE TO SCOREABLE GOAL ────────────────────────────────── #
+        if has_pin and not has_cup and target_goal is None:
+            cup = self._pick_best_cup()
+            if cup is not None:
+                return self._action_get_cup(a, cup)
+        if not has_pin and has_cup and target_goal is None:
+            return self._action_get_pin(a)
+
+        # ── 7. DRIVE TO SCOREABLE GOAL ─────────────────────────────────── #
         if target_goal is not None:
-            # If we're already within scoring range, brake — score will fire
-            # next step.  Prevents oscillation around the SCORING_RADIUS boundary.
             d = self._dist(self._pos(), (target_goal.x, target_goal.y))
             if d <= self.SCORE_BRAKE_RADIUS:
-                a["left"], a["right"] = 0.0, 0.0
+                # We are inside the brake zone but score_now didn't fire,
+                # which means we don't have the right element type.  Free
+                # up the slot: do nothing wheel-wise but try a small jog
+                # to keep us alive.
+                a["left"], a["right"] = self._tight_circle()
                 self.last_reason = f"brake_at_goal:{target_goal.goal_id}"
                 return a
             a["left"], a["right"] = self._drive_to(
@@ -749,7 +855,7 @@ class HeuristicBot:
             self.last_reason = f"approach_goal:{target_goal.goal_id}"
             return a
 
-        # ── 8. TOGGLE — proactively route to nearest unowned toggle ──────#
+        # ── 8. TOGGLE — proactively route to nearest unowned toggle ────── #
         toggle = self._find_useful_toggle()
         if toggle is not None:
             tx, ty = float(toggle.x), float(toggle.y)
@@ -762,16 +868,15 @@ class HeuristicBot:
                 self.last_reason = f"approach_toggle:{toggle.toggle_id}"
             return a
 
-        # ── 9. DEFAULT ────────────────────────────────────────────────── #
-        a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=False)
+        # ── 9. DEFAULT ─────────────────────────────────────────────────── #
+        # Drift toward midfield (parking position) — never freeze.
+        a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
         self.last_reason = "default_midfield"
         return a
 
     # ── Endgame dump helpers ──────────────────────────────────────────── #
 
     def _nearest_dump_goal(self, has_pin: bool, has_cup: bool):
-        """Pick the nearest goal where we can legally drop something — no
-        orientation, no value: just unload before time runs out."""
         my_pos = self._pos()
         best = None
         best_d = float("inf")
@@ -791,8 +896,6 @@ class HeuristicBot:
         return best
 
     def _try_dump_at_range(self, has_pin: bool, has_cup: bool):
-        """Like _try_score_at_range but skips orientation checks — endgame
-        only.  A dark-up cup is still better than no points."""
         my_pos = self._pos()
         for g in self.sim.goals:
             if not self._valid_goal_for_me(g):
@@ -817,13 +920,21 @@ class HeuristicBot:
     # ── Policy-action API ─────────────────────────────────────────────── #
 
     def get_policy_action(self):
-        """Return `(cont, disc)` numpy arrays matching env_wrapper format.
-
-        cont = [left, right]
-        disc = [intake, score_pin, score_cup, toggle, flip_pin, flip_cup, match_load]
-        """
+        """Return `(cont, disc)` numpy arrays matching env_wrapper format."""
         import numpy as np
         a = self.get_sim_action()
+        # Track what type of element we last intaked so the chain-stacking
+        # bias in section 6 knows which element to fetch next.
+        if a["intake"]:
+            # We don't know if the intake will SUCCEED until next step, but
+            # if we just picked one up between the last step and now, our
+            # carrying state will reflect it on the NEXT call (where the
+            # branch picks up).  This heuristic flips on a successful pickup:
+            r = self.robot
+            if r.carrying_pin is not None and self._last_intake_type != "pin":
+                self._last_intake_type = "pin"
+            elif r.carrying_cup is not None and self._last_intake_type != "cup":
+                self._last_intake_type = "cup"
         cont = np.array([a["left"], a["right"]], dtype=np.float32)
         disc = np.array([
             1.0 if a["intake"]    else 0.0,
@@ -832,7 +943,7 @@ class HeuristicBot:
             1.0 if a["toggle"]    else 0.0,
             1.0 if a["flip_pin"]  else 0.0,
             1.0 if a["flip_cup"]  else 0.0,
-            0.0,   # match_load — sim doesn't process it from action dicts
+            0.0,
         ], dtype=np.float32)
         return cont, disc
 
@@ -842,122 +953,53 @@ class HeuristicBot:
                 "intake": False, "score_pin": False, "score_cup": False,
                 "toggle": False, "flip_pin": False, "flip_cup": False}
 
-    # ── Priority 3 — emergency intercept ──────────────────────────────── #
+    # ── Flip-decision helpers ─────────────────────────────────────────── #
 
-    def _find_intercept_target(self):
-        """Return an opponent we should charge to disrupt, or None.
-
-        Only fires when:
-          - we're not already inches from a scoreable goal (don't abandon
-            our own near-complete trip)
-          - opponent is carrying a pin AND within SCORING_RADIUS*1.2 of one
-            of THEIR valid goals
-          - we are closer to that goal than the opponent (intercept is
-            actually feasible)
-        """
-        my_pos = self._pos()
-
-        # Don't abandon our own scoring trip
-        if self.robot.carrying_pin or self.robot.carrying_cup:
-            for g in self.sim.goals:
-                if self._valid_goal_for_me(g) and \
-                   self._dist(my_pos, (g.x, g.y)) <= SCORING_RADIUS + 2:
-                    return None
-
-        best = None
-        best_threat = 0.0
-        for opp in self.sim.robots:
-            if opp.alliance == self.alliance:
-                continue
-            if opp.carrying_pin is None:
-                continue
-            ox, oy = float(opp.body.position.x), float(opp.body.position.y)
-            for g in self.sim.goals:
-                # Opponent must be able to score here
-                if g.alliance not in ("neutral", opp.alliance):
-                    continue
-                if self._goal_needs(g) == "full":
-                    continue
-                d_opp_goal = self._dist((ox, oy), (g.x, g.y))
-                if d_opp_goal > SCORING_RADIUS * 1.2:
-                    continue
-                d_me_goal = self._dist(my_pos, (g.x, g.y))
-                # Only intercept if we can plausibly beat them
-                if d_me_goal > d_opp_goal + 4.0:
-                    continue
-                threat = 1.0 / (1.0 + d_opp_goal / 4.0)
-                if threat > best_threat:
-                    best_threat = threat
-                    best = opp
-        return best
-
-    # ── Priority 5 helpers — pre-placement flip ──────────────────────── #
-
-    def _should_flip_cup_for_goal(self, goal):
-        """Return (should_flip, goal) if carrying cup is wrong orientation
-        for the given goal's top pin."""
+    def _should_flip_cup_for_goal(self, goal) -> bool:
+        """Should we flip the cup we're carrying before dropping it at `goal`?
+        Only fires when goal currently has a pin on top (needs a cup)."""
         cup = self.robot.carrying_cup
         if cup is None or self._goal_needs(goal) != "cup":
-            return False, None
-        correct = self._correct_cup_clear_up(goal)
-        if correct is None:
-            return False, None
-        if _eff_clear_up(cup) != correct:
-            return True, goal
-        return False, None
+            return False
+        if not goal.stack or not goal.stack[-1][1]:
+            return False
+        pin_below, _ = goal.stack[-1]
+        # We want cup.eff_clear_up = (the pin's up half is opponent's colour).
+        up = pin_below.up_half_name
+        up_pts = self._half_pts_for_me(up, goal)
+        want_clear_up = (up_pts < 0.0)
+        return _eff_clear_up(cup) != want_clear_up
 
-    def _should_flip_pin_for_goal(self, goal):
-        """Return (should_flip, goal) if carrying yellow-half pin should
-        have yellow facing UP for the given goal.
-
-        Uses pin.up_half_name (a plain string) instead of get_up_color()
-        (which returns an RGB tuple) so the comparison is correct.
+    def _should_flip_pin_for_goal(self, goal) -> bool:
+        """Should we flip the pin we're carrying before dropping it at `goal`?
+        Only meaningful for two-tone pins (e.g. red_yellow).  Returns True
+        when the OTHER orientation would yield strictly more points for us.
         """
         pin = self.robot.carrying_pin
-        if pin is None or not pin.is_yellow:
-            return False, None
-        tog = self._toggle_for_goal(goal)
-        # Yellow scoring only happens if our alliance owns the toggle
-        # (or, for center, we have midfield majority).  Otherwise yellow
-        # orientation is irrelevant.
-        own_yellow_scoring = (tog is not None and tog.owner == self.alliance) or \
-                             (goal.goal_id == CENTER_GOAL_ID and self._we_have_midfield_majority())
-        if not own_yellow_scoring:
-            return False, None
-        if pin.up_half_name != "yellow":
-            return True, goal
-        return False, None
-
-    def _correct_cup_clear_up(self, goal) -> Optional[bool]:
-        """For a goal whose top is a pin, what should cup.clear_up be?
-
-        Returns True  → cup clear-side UP  (BLOCKS pin's UP half visibility)
-        Returns False → cup dark-side UP   (ALLOWS pin's UP half to score)
-        Returns None  → orientation doesn't matter / can't determine
-
-        Formula: up_vis(pin_below) = not eff_clear_up(cup_above)
-          • own-color pin facing up → we WANT that half visible → dark up (False)
-          • opp-color pin facing up → we WANT to deny that half  → clear up (True)
-        """
-        if not goal.stack or not goal.stack[-1][1]:
-            return None
-        top_pin, _ = goal.stack[-1]
-        up = top_pin.up_half_name
-        if up == "red":
-            return True  if self.alliance == "blue" else False
-        if up == "blue":
-            return True  if self.alliance == "red"  else False
-        if up == "yellow":
-            tog = self._toggle_for_goal(goal)
-            if tog is None or tog.owner not in ("red", "blue"):
-                return None
-            return False if tog.owner == self.alliance else True
-        return None
+        if pin is None:
+            return False
+        # Compute pts for current orientation
+        n = len(goal.stack)
+        if n == 0:
+            cur = self._half_pts_for_me(pin.up_half_name, goal)
+            alt = self._half_pts_for_me(pin.down_half_name, goal)
+            return alt > cur + 1e-3
+        if n == 2:
+            cup_obj, _ = goal.stack[1]
+            cup_clear_up = _eff_clear_up(cup_obj)
+            cur = self._half_pts_for_me(pin.up_half_name, goal)
+            if cup_clear_up:
+                cur += self._half_pts_for_me(pin.down_half_name, goal)
+            # Alt is reversed: down_half goes UP, up_half goes DOWN
+            alt = self._half_pts_for_me(pin.down_half_name, goal)
+            if cup_clear_up:
+                alt += self._half_pts_for_me(pin.up_half_name, goal)
+            return alt > cur + 1e-3
+        return False
 
     # ── Priority 8 — proactive toggle routing ────────────────────────── #
 
     def _find_useful_toggle(self):
-        """Return the best unowned toggle within TOGGLE_ROUTE_RANGE."""
         my_pos = self._pos()
         best = None
         best_sc = -1e9
@@ -968,12 +1010,11 @@ class HeuristicBot:
             if d > self.TOGGLE_ROUTE_RANGE:
                 continue
             sc = -d
-            # Bonus if there are yellow pins in goals controlled by this toggle
             for g in self.sim.goals:
                 if self._toggle_for_goal(g) is t:
                     for obj, is_pin in g.stack:
                         if is_pin and obj.is_yellow:
-                            sc += 8.0
+                            sc += 10.0
             if sc > best_sc:
                 best_sc = sc
                 best = t

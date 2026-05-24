@@ -27,10 +27,21 @@ Each match runs for up to --duration seconds.  ESC quits the whole session.
 A video is written to --video (default artifacts/videos/bots_run.mp4).
 With --matches > 1 each video is suffixed _m1, _m2, … before the extension.
 
-When --verbose is given, per-step bot reasons are written to a log file
-under artifacts/logs/ (NOT to the console) so the terminal stays clean.
-The log path is printed at startup.  With --matches > 1 a new file is
-opened for each match.
+Logging (always on)
+-------------------
+Every run writes TWO log files per match under artifacts/logs/:
+  * `bots_events_<ts>_m<N>.csv`   — structured event log (SCORE, INTAKE,
+                                     DROP, FLIP_PIN, FLIP_CUP, TOGGLE,
+                                     PHASE) for easy post-hoc analysis.
+                                     Columns: t_sim,step,robot,event,
+                                     detail,x,y,score_red,score_blue.
+  * `bots_reasons_<ts>_m<N>.log`  — per-step textual `last_reason` of
+                                     each bot (the original v9.4 trace).
+                                     Useful for figuring out *why* a bot
+                                     made a particular decision.
+
+Pass `--no-reasons-log` to skip the reasons log (events CSV is always
+written — it's lightweight and indispensable for debugging).
 """
 
 import os
@@ -49,6 +60,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from training.env_wrapper import OverrideEnv, AGENT_IDS
 from agents.heuristic_bot import HeuristicBot
+from agents.bot_event_log import BotEventLog
 from config.hyperparameters import CONTROL_DT
 
 
@@ -94,17 +106,19 @@ def parse_args():
     p.add_argument("--video",    type=str, default="artifacts/videos/bots_run.mp4",
                    help="Output video path.  Use '' to skip recording.")
     p.add_argument("--seed",     type=int, default=None,
-                   help="RNG seed for the first match.  Subsequent matches use seed+1, etc.")
-    p.add_argument("--verbose",  action="store_true",
-                   help="Write each bot's chosen reason every step to a log file "
-                        "under artifacts/logs/.  Path is printed at startup.")
+                   help="RNG seed for the first match.  Subsequent matches use seed+1, etc.  "
+                        "Note: HeuristicBot is fully deterministic — the seed only "
+                        "controls field initialisation (element starting positions).")
+    p.add_argument("--no-reasons-log", action="store_true",
+                   help="Skip the per-step textual reasons log (events CSV is "
+                        "always written under artifacts/logs/).")
     return p.parse_args()
 
 
 # --------------------------------------------------------------------- #
 def run_match(env, bots, trainer, args, match_idx: int,
-              log_file=None, recorder=None):
-    """Run a single match.  Returns (red_score, blue_score, completed)."""
+              reasons_log=None, event_log=None, recorder=None):
+    """Run a single match.  Returns (red_score, blue_score, completed, running, stats)."""
     import pygame
     clock    = pygame.time.Clock()
     sim_time = 0.0
@@ -112,6 +126,12 @@ def run_match(env, bots, trainer, args, match_idx: int,
     running  = True
     step_idx = 0
     info     = {}
+
+    # Stats accumulators
+    intakes  = {rid: 0 for rid in AGENT_IDS}
+    drops    = {rid: 0 for rid in AGENT_IDS}
+    pre_carry = {r.robot_id: (r.carrying_pin is not None or r.carrying_cup is not None)
+                 for r in env.sim.robots}
 
     print(f"[Bots] Match {match_idx} — running for up to {args.duration:.0f}s — ESC to quit\n")
 
@@ -121,6 +141,10 @@ def run_match(env, bots, trainer, args, match_idx: int,
                 running = False
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
                 running = False
+
+        # Snapshot pre-step state for event logger
+        if event_log is not None:
+            event_log.snapshot_pre(env.sim)
 
         # --- gather actions --------------------------------------- #
         actions = {}
@@ -132,8 +156,8 @@ def run_match(env, bots, trainer, args, match_idx: int,
         for rid, bot in bots.items():
             cont, disc = bot.get_policy_action()
             actions[rid] = (cont, disc)
-            if log_file is not None:
-                log_file.write(
+            if reasons_log is not None:
+                reasons_log.write(
                     f"t={sim_time:7.3f} step={step_idx:6d}  [{rid}]  {bot.last_reason}\n"
                 )
 
@@ -160,6 +184,10 @@ def run_match(env, bots, trainer, args, match_idx: int,
         env._last_masks = env.get_action_masks()
         env.render()
 
+        # Diff and emit events from snapshot
+        if event_log is not None:
+            event_log.diff_and_emit(env.sim, sim_time, step_idx, bots=bots)
+
         if recorder:
             frame = pygame.surfarray.array3d(env.sim.screen).transpose(1, 0, 2)
             recorder.write_frame(frame)
@@ -171,7 +199,29 @@ def run_match(env, bots, trainer, args, match_idx: int,
     rs = info.get("red_score",  env.sim.red_score)
     bs = info.get("blue_score", env.sim.blue_score)
     completed = bool(done)
-    return rs, bs, completed, running   # running=False means ESC was pressed
+
+    # Build a per-robot stats dict
+    stats = {
+        "intakes":  dict(event_log.intakes_per_robot)  if event_log else {},
+        "scores":   dict(event_log.scores_per_robot)   if event_log else {},
+        "drops":    dict(event_log.drops_per_robot)    if event_log else {},
+        "flips":    dict(event_log.flips_per_robot)    if event_log else {},
+        "toggles":  dict(event_log.toggles_per_robot)  if event_log else {},
+    }
+    return rs, bs, completed, running, stats
+
+
+def _print_match_summary(match_idx: int, rs: int, bs: int, stats: dict):
+    winner = "Red" if rs > bs else ("Blue" if bs > rs else "Tie")
+    print(f"\n[Bots] Match {match_idx} — Red {rs:3d} : {bs:3d} Blue  [{winner}]")
+    print(f"  {'robot':<8}{'scores':>8}{'intakes':>10}{'drops':>8}{'flips':>8}{'toggles':>10}")
+    for rid in AGENT_IDS:
+        s  = stats.get("scores",  {}).get(rid, 0)
+        i  = stats.get("intakes", {}).get(rid, 0)
+        d  = stats.get("drops",   {}).get(rid, 0)
+        f  = stats.get("flips",   {}).get(rid, 0)
+        tg = stats.get("toggles", {}).get(rid, 0)
+        print(f"  {rid:<8}{s:>8}{i:>10}{d:>8}{f:>8}{tg:>10}")
 
 
 # --------------------------------------------------------------------- #
@@ -216,28 +266,38 @@ def main():
     import pygame
 
     results = []
+    all_stats = []
 
     for match_idx in range(1, args.matches + 1):
         print(f"\n{'='*60}")
         print(f"[Bots] Starting match {match_idx}/{args.matches}  seed={seed}")
         print(f"{'='*60}")
 
-        # ── Verbose log (one file per match) ──────────────────────────── #
-        log_file = None
-        log_path = None
-        if args.verbose:
+        # ── Reasons log (per-step textual; opt-out via --no-reasons-log) ── #
+        reasons_log = None
+        reasons_path = None
+        if not args.no_reasons_log:
             log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "artifacts", "logs")
             os.makedirs(log_dir, exist_ok=True)
-            ts       = time.strftime("%Y%m%d_%H%M%S")
-            log_path = os.path.join(log_dir, f"bots_verbose_{ts}_m{match_idx}.log")
-            log_file = open(log_path, "w", buffering=1)
-            print(f"[Bots] Verbose log → {log_path}")
-            log_file.write(
-                f"# run_with_bots verbose log  match={match_idx}  seed={seed}  "
+            ts           = time.strftime("%Y%m%d_%H%M%S")
+            reasons_path = os.path.join(log_dir, f"bots_reasons_{ts}_m{match_idx}.log")
+            reasons_log  = open(reasons_path, "w", buffering=1)
+            print(f"[Bots] Reasons log  → {reasons_path}")
+            reasons_log.write(
+                f"# bots_reasons  match={match_idx}  seed={seed}  "
                 f"bots={sorted(bot_ids)}\n"
                 f"# started {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             )
+
+        # ── Event CSV (always on; structured, parsable) ────────────────── #
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "artifacts", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts           = time.strftime("%Y%m%d_%H%M%S")
+        events_path  = os.path.join(log_dir, f"bots_events_{ts}_m{match_idx}.csv")
+        event_log    = BotEventLog(events_path)
+        print(f"[Bots] Events CSV   → {events_path}")
 
         # ── Video recorder (one file per match) ───────────────────────── #
         recorder  = None
@@ -253,30 +313,40 @@ def main():
                 recorder = None
 
         # ── Run the match ─────────────────────────────────────────────── #
-        rs, bs, completed, still_running = run_match(
+        rs, bs, completed, still_running, stats = run_match(
             env, bots, trainer, args, match_idx,
-            log_file=log_file, recorder=recorder,
+            reasons_log=reasons_log, event_log=event_log, recorder=recorder,
         )
 
         # ── Report result ─────────────────────────────────────────────── #
         winner = "Red" if rs > bs else ("Blue" if bs > rs else "Tie")
         if completed:
-            print(f"\n[Bots] Match {match_idx} complete — Red {rs} : {bs} Blue  [{winner}]")
+            _print_match_summary(match_idx, rs, bs, stats)
         else:
             print(f"\n[Bots] Match {match_idx} stopped early — Red {rs} : {bs} Blue  [{winner}]")
+            _print_match_summary(match_idx, rs, bs, stats)
         results.append((rs, bs))
+        all_stats.append(stats)
 
         if recorder:
             recorder.close()
             print(f"[Bots] Video saved → {vid_path}")
 
-        if log_file is not None:
-            log_file.write(
+        # Finalise event log with summary block
+        try:
+            event_log.write_summary(env.sim, match_idx, rs, bs)
+        except Exception:
+            pass
+        event_log.close()
+        print(f"[Bots] Events CSV closed → {events_path}")
+
+        if reasons_log is not None:
+            reasons_log.write(
                 f"\n# ended {time.strftime('%Y-%m-%d %H:%M:%S')}  "
                 f"result=Red {rs}:Blue {bs}\n"
             )
-            log_file.close()
-            print(f"[Bots] Verbose log closed → {log_path}")
+            reasons_log.close()
+            print(f"[Bots] Reasons log closed → {reasons_path}")
 
         # If user hit ESC, stop the whole session
         if not still_running:
@@ -290,7 +360,6 @@ def main():
             obs  = env.reset()
             env._last_obs   = obs
             env._last_masks = env.get_action_masks()
-            # Reset bot state so stale targets / blacklists don't carry over
             for bot in bots.values():
                 bot.reset()
             print(f"[Bots] Field reset for match {match_idx + 1}.")
@@ -304,6 +373,20 @@ def main():
         avg_r = sum(r for r, _ in results) / len(results)
         avg_b = sum(b for _, b in results) / len(results)
         print(f"  Average  : Red {avg_r:.1f} — {avg_b:.1f} Blue")
+
+        # Cumulative per-robot totals
+        totals = {rid: {"scores": 0, "intakes": 0, "drops": 0,
+                        "flips": 0, "toggles": 0} for rid in AGENT_IDS}
+        for st in all_stats:
+            for rid in AGENT_IDS:
+                for k in totals[rid]:
+                    totals[rid][k] += st.get(k, {}).get(rid, 0)
+        print(f"\n  Cumulative per-robot stats:")
+        print(f"  {'robot':<8}{'scores':>8}{'intakes':>10}{'drops':>8}{'flips':>8}{'toggles':>10}")
+        for rid in AGENT_IDS:
+            t = totals[rid]
+            print(f"  {rid:<8}{t['scores']:>8}{t['intakes']:>10}"
+                  f"{t['drops']:>8}{t['flips']:>8}{t['toggles']:>10}")
         print(f"{'='*60}")
 
     env.close()
