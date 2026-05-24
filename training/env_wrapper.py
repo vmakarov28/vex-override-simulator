@@ -541,6 +541,20 @@ class OverrideEnv:
 
         done = self.sim.match_over or self._step_count >= MAX_EPISODE_STEPS
 
+        # SC5b: if the episode ended by step-count limit but the simulator's
+        # _update_phase hasn't fired yet (timer drift can shift it ±1 step),
+        # apply calculate_final_score now so center-goal yellow halves owned
+        # by the midfield majority are counted in the reported final score.
+        if done and not self.sim.match_over:
+            final = self.sim.rules_engine.calculate_final_score(
+                self.sim.goals, self.sim.toggles, self.sim.robots)
+            post_red  = final["red"]
+            post_blue = final["blue"]
+            self.sim.red_score  = post_red
+            self.sim.blue_score = post_blue
+            self.sim.match_over = True
+            self.sim.match_phase = "ended"
+
         if done:
             # v9 SC5b: deferred payout for yellow halves placed in the center
             # goal.  Count robots in the Midfield right now; alliance with

@@ -196,8 +196,18 @@ def run_match(env, bots, trainer, args, match_idx: int,
         step_idx += 1
         clock.tick(30)
 
-    rs = info.get("red_score",  env.sim.red_score)
-    bs = info.get("blue_score", env.sim.blue_score)
+    # If the loop exited via sim_time limit (not done signal), the simulator's
+    # own _update_phase may not have fired yet — apply SC5b now.
+    if not env.sim.match_over:
+        final = env.sim.rules_engine.calculate_final_score(
+            env.sim.goals, env.sim.toggles, env.sim.robots)
+        rs = final["red"]
+        bs = final["blue"]
+        env.sim.red_score  = rs
+        env.sim.blue_score = bs
+    else:
+        rs = info.get("red_score",  env.sim.red_score)
+        bs = info.get("blue_score", env.sim.blue_score)
     completed = bool(done)
 
     # Build a per-robot stats dict
