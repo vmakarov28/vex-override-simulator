@@ -291,17 +291,21 @@ class Robot:
         return False
 
     def try_toggle(self, toggles: list) -> bool:
-        """Try to flip the nearest toggle."""
+        """Try to flip the nearest toggle.
+
+        Single-flip alliance takeover: pressing toggle while next to a
+        toggle that is NOT already ours sets it to our alliance directly.
+        If it's already ours, it's a no-op (pressing toggle on an own
+        toggle previously cycled red→blue→yellow, accidentally giving
+        ownership to the opponent — that exploit is closed).
+        """
         pos = self.body.position
         for toggle in toggles:
             dist = math.hypot(pos.x - toggle.x, pos.y - toggle.y)
             if dist <= 18:  # interaction range
-                if toggle.owner == "red":
-                    toggle.owner = "blue"
-                elif toggle.owner == "blue":
-                    toggle.owner = "yellow"
-                else:
-                    toggle.owner = self.alliance
+                if toggle.owner == self.alliance:
+                    return False         # no-op; don't give it away
+                toggle.owner = self.alliance
                 return True
         return False
 

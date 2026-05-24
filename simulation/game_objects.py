@@ -981,15 +981,17 @@ class FieldToggle:
         self.width  = 2.0
 
     def try_interact(self, robot):
+        """Single-flip alliance takeover (matches Robot.try_toggle).
+        Pressing toggle near a non-own toggle sets it to the robot's
+        alliance.  Own toggles are no-op (closes the cycle exploit
+        where flipping your own toggle would give it to the opponent).
+        """
         dist = math.sqrt((robot.body.position.x - self.x) ** 2 +
                          (robot.body.position.y - self.y) ** 2)
         if dist <= TOGGLE_INTERACTION_RANGE:
-            if self.owner == "red":
-                self.owner = "blue"
-            elif self.owner == "blue":
-                self.owner = "yellow"
-            else:
-                self.owner = "red" if robot.alliance == "red" else "blue"
+            if self.owner == robot.alliance:
+                return False
+            self.owner = robot.alliance
             return True
         return False
 
