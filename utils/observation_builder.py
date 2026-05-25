@@ -1,21 +1,42 @@
 """
 utils/observation_builder.py
 ────────────────────────────────────────────────────────────────────────────
-Builds the fixed-size 551-dimensional observation vector for one agent.
+Builds the fixed-size 610-dimensional observation vector for one agent.
 
 Layout  (all values normalized to roughly [-1, 1] or [0, 1]):
   [  0: 24]  Self state
   [ 24: 36]  Teammate state
   [ 36: 56]  Opponents (2 × 10)
-  [ 56:209]  Goals (9 × 17 = 153)
-               +3 bits vs. v4: top-pin UP color one-hot [red, blue, yellow]
-               This lets robots decide flip/cup-orientation before scoring.
-  [209:409]  K-nearest pins (20 × 10 = 200)
-  [409:514]  K-nearest cups (15 × 7 = 105)
-  [514:534]  Toggles (4 × 5 = 20)
-  [534:551]  Global match state (17)
+  [ 56:227]  Goals (9 × 19 = 171)  [v9.2: +2 per goal vs v9's 17]
+               Per-goal features [0..16 same as v9, +2 new]:
+               [17] yellow_toggle_mine: 1 if my alliance owns the toggle
+                    controlling yellow scoring for this goal
+               [18] cup_place_quality: if carrying cup, +1 if current
+                    orientation correctly preserves own / denies opponent,
+                    −1 if wrong, 0 if no cup or no pin on top
+  [227:447]  K-nearest pins (20 × 11 = 220)
+  [447:552]  K-nearest cups (15 × 7 = 105)
+  [552:572]  Toggles (4 × 5 = 20)
+  [572:592]  Global match state (20)
+  [592:602]  v8.1 self-awareness + defensive intel (10)
+               - own carry_steps / TIME_TO_SCORE_TARGET (1)
+               - own holding-overshoot ratio (1)
+               - opp1 carrying pin UP colour one-hot (3)
+               - opp2 carrying pin UP colour one-hot (3)
+               - yellow pins remaining / 12 (1)
+               - can-score-anywhere bit (1)
+  [602:606]  v8.2 movement intelligence (4)
+               - own speed magnitude / MAX_SPEED (1)
+               - teammate carry_steps / TIME_TO_SCORE_TARGET (1)
+               - opp1 speed magnitude / MAX_SPEED (1)
+               - opp2 speed magnitude / MAX_SPEED (1)
+  [606:610]  v9 pressure features (4)
+               - in_scoring_range: 1 if within SCORING_RADIUS of a legal scorable goal while carrying (1)
+               - being_pinned_frac: opponents within PINNING_CONTACT_DIST / 2.0 (1)
+               - score_lead_tight: (my - opp) / 15.0 clamped [-1, 1] (1)
+               - dist_to_nearest_scorable_goal / FIELD_DIAG; 1.0 if not carrying (1)
   ──────────
-  Total: 551
+  Total: 610
 """
 
 import math
@@ -28,6 +49,11 @@ from config.game_rules import (
     MIDFIELD_CENTER, MIDFIELD_HALF,
     ENDGAME_SECONDS, TOTAL_SECONDS, AUTONOMOUS_SECONDS,
     CENTER_GOAL_ID, ENDGAME_CENTER_MAX_STACK,
+)
+from config.hyperparameters import (
+    ENDGAME_RAMP_SECONDS, TIME_TO_SCORE_TARGET,
+    HOLDING_TIMEOUT_STEPS, HOLDING_RAMP_STEPS,
+    PINNING_CONTACT_DIST,
 )
 from simulation.game_objects import (
     GamePin, GameCup, FieldGoal, FieldToggle,
@@ -44,7 +70,7 @@ MAX_ANG_VEL = 10.0
 K_PINS = 20   # nearest pins to encode
 K_CUPS = 15   # nearest cups to encode
 
-OBS_DIM = 551
+OBS_DIM = 610
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color → one-hot helper  (3 bits: [red, blue, yellow])
@@ -95,7 +121,7 @@ def build_observation(
     simulator,
 ) -> np.ndarray:
     """
-    Build the 551-dim observation vector for `robot`.
+    Build the 564-dim observation vector for `robot`.
 
     Parameters
     ----------
@@ -110,7 +136,7 @@ def build_observation(
 
     Returns
     -------
-    np.ndarray of shape (551,), dtype float32
+    np.ndarray of shape (564,), dtype float32
     """
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     ptr = 0
@@ -278,6 +304,58 @@ def build_observation(
                 elif up_col == C_YELLOW:
                     top_pin_up_yellow = 1.0
 
+        # v9.2 [17]: yellow_toggle_mine — 1 if my alliance owns the toggle
+        # controlling yellow scoring for this goal.  For the center goal,
+        # proxy on current midfield count majority (not final, but directional).
+        yellow_toggle_mine = 0.0
+        is_center = (goal.goal_id == CENTER_GOAL_ID)
+        if is_center:
+            # Use current midfield counts as a proxy for SC5b majority
+            my_mid  = rules_engine.midfield_red_count  if robot.alliance == "red" else rules_engine.midfield_blue_count
+            opp_mid = rules_engine.midfield_blue_count if robot.alliance == "red" else rules_engine.midfield_red_count
+            if my_mid > opp_mid:
+                yellow_toggle_mine = 1.0
+        else:
+            # Non-center: check which toggle controls this goal's quadrant
+            gdx_raw = goal.x - 72.0
+            gdy_raw = goal.y - 72.0
+            if abs(gdx_raw) >= abs(gdy_raw):
+                ctrl_tid = 1 if gdx_raw <= 0 else 2
+            else:
+                ctrl_tid = 3 if gdy_raw <= 0 else 4
+            for tog in toggles:
+                if tog.toggle_id == ctrl_tid and tog.owner == robot.alliance:
+                    yellow_toggle_mine = 1.0
+                    break
+
+        # v9.2 [18]: cup_place_quality — if carrying cup, +1 if current cup
+        # orientation is correct for scoring on this goal's top pin:
+        #   correct = clear-side-down (eff_clear_up=False) when preserving OWN pin
+        #           = dark-side-down  (eff_clear_up=True)  when denying OPP pin
+        # −1 if orientation is wrong, 0 if not carrying cup or no pin on top.
+        cup_place_quality = 0.0
+        if robot.carrying_cup is not None and goal.stack and goal.stack[-1][1]:
+            top_pin_obj, _ = goal.stack[-1]
+            cup_eff_clear   = (not robot.carrying_cup.clear_on_top
+                               if getattr(robot.carrying_cup, 'flipped', False)
+                               else robot.carrying_cup.clear_on_top)
+            # Determine correct orientation for this goal's top pin
+            if top_pin_up_red > 0 or top_pin_up_blue > 0:
+                # Solid color pin: correct = dark-side-down (eff_clear=True) for opponent, clear-side-down for own
+                top_is_own = (top_pin_up_red > 0 and robot.alliance == "red") or \
+                             (top_pin_up_blue > 0 and robot.alliance == "blue")
+                correct_eff_clear = not top_is_own   # deny opp=True, preserve own=False
+            elif top_pin_up_yellow > 0:
+                # Yellow: correct depends on toggle ownership
+                if yellow_toggle_mine > 0:
+                    correct_eff_clear = False  # preserve own yellow: clear-side-down
+                else:
+                    correct_eff_clear = True   # deny opponent yellow or neutral: dark-side-down
+            else:
+                correct_eff_clear = None  # unknown, skip
+            if correct_eff_clear is not None:
+                cup_place_quality = 1.0 if (cup_eff_clear == correct_eff_clear) else -1.0
+
         obs[ptr + 0]  = gdx
         obs[ptr + 1]  = gdy
         obs[ptr + 2]  = gdist
@@ -295,9 +373,13 @@ def build_observation(
         obs[ptr + 14] = top_pin_up_red
         obs[ptr + 15] = top_pin_up_blue
         obs[ptr + 16] = top_pin_up_yellow
-        ptr += 17
+        obs[ptr + 17] = yellow_toggle_mine    # v9.2
+        obs[ptr + 18] = cup_place_quality     # v9.2
+        ptr += 19
 
-    # ── [209:409] K-nearest pins (20 × 10) ───────────────────────────────────
+    # ── [227:447] K-nearest pins (20 × 11) ───────────────────────────────────
+    # Slot layout per pin: [dx, dy, dist, carried, up_r, up_g, up_b, dn_r, dn_g, dn_b,
+    #                       nearest_goal_dist]  (v8.3: +1 mirrors cup obs[ptr+6])
     live_pins = [p for p in pins if not p.scored]
     live_pins.sort(key=lambda p: math.hypot(float(p.body.position.x) - rx,
                                              float(p.body.position.y) - ry))
@@ -313,9 +395,13 @@ def build_observation(
             obs[ptr + 3] = 1.0 if p.carried_by is not None else 0.0
             obs[ptr + 4] = up_oh[0]; obs[ptr + 5] = up_oh[1]; obs[ptr + 6] = up_oh[2]
             obs[ptr + 7] = dn_oh[0]; obs[ptr + 8] = dn_oh[1]; obs[ptr + 9] = dn_oh[2]
-        ptr += 10
+            # v8.3: distance from this pin to its nearest goal (helps pick pins
+            # close to the robot's intended scoring location, not just nearest pin)
+            pin_g_dists = [math.hypot(px_ - g.x, py_ - g.y) for g in goals]
+            obs[ptr + 10] = min(pin_g_dists) / FIELD_DIAG if pin_g_dists else 0.0
+        ptr += 11
 
-    # ── [409:514] K-nearest cups (15 × 7) ────────────────────────────────────
+    # ── [447:552] K-nearest cups (15 × 7) ────────────────────────────────────
     live_cups = [c for c in cups if not c.scored]
     live_cups.sort(key=lambda c: math.hypot(float(c.body.position.x) - rx,
                                              float(c.body.position.y) - ry))
@@ -335,7 +421,7 @@ def build_observation(
             obs[ptr + 6] = min_cup_g
         ptr += 7
 
-    # ── [514:534] Toggles (4 × 5) ────────────────────────────────────────────
+    # ── [552:572] Toggles (4 × 5) ────────────────────────────────────────────
     for tog in toggles:
         tgx, tgy = float(tog.x), float(tog.y)
         obs[ptr + 0] = (tgx - rx) / FIELD_WIDTH
@@ -346,7 +432,7 @@ def build_observation(
         obs[ptr + 4] = 1.0 if tog.owner == opp else 0.0
         ptr += 5
 
-    # ── [534:551] Global match state (17) ────────────────────────────────────
+    # ── [534:554] Global match state (20) ────────────────────────────────────
     tr = float(simulator.time_remaining)
     te = float(simulator.time_elapsed)
     full = float(TOTAL_SECONDS)
@@ -374,7 +460,149 @@ def build_observation(
     time_to_endgame = max(0.0, drv_remaining - ENDGAME_SECONDS) / 105.0
     obs[ptr + 15] = time_to_endgame
     obs[ptr + 16] = 1.0 if simulator.timer_started else 0.0
-    ptr += 17
+
+    # ── v7 features (3) ─────────────────────────────────────────────────
+    # (a) Alliance-relative score delta in [-1, 1].  80-pt swing saturates.
+    my_score  = rules_engine.red_score  if robot.alliance == "red" else rules_engine.blue_score
+    opp_score = rules_engine.blue_score if robot.alliance == "red" else rules_engine.red_score
+    obs[ptr + 17] = max(-1.0, min(1.0, (my_score - opp_score) / 80.0))
+
+    # (b) Heading-vs-velocity cosine alignment for self in [-1, 1].
+    # Robots spinning in place have low |speed|, returning 0 here.  Robots
+    # driving forward along their heading return ~1; backing along heading: ~-1.
+    speed = math.hypot(rvx, rvy)
+    if speed > 1.0:
+        # heading unit vector
+        hx, hy = math.cos(ra), math.sin(ra)
+        obs[ptr + 18] = (rvx * hx + rvy * hy) / speed
+    else:
+        obs[ptr + 18] = 0.0
+
+    # (c) Endgame urgency ramp: 0 outside endgame; rises 0→1 linearly across
+    # the final ENDGAME_RAMP_SECONDS of the match.  Lets the policy condition
+    # on "park NOW" vs "park later" without inferring it from raw time_remaining.
+    if is_end and tr <= ENDGAME_RAMP_SECONDS:
+        obs[ptr + 19] = max(0.0, min(1.0, (ENDGAME_RAMP_SECONDS - tr) / ENDGAME_RAMP_SECONDS))
+    else:
+        obs[ptr + 19] = 0.0
+    ptr += 20
+
+    # ── v8.1 self-awareness + defensive intel (10) ──────────────────────
+    # (a) Own carry-step counter normalized to TIME_TO_SCORE_TARGET — lets
+    # the policy reason about "I've been carrying too long, score now or
+    # cycle".  Reads `robot._carry_steps` set by env_wrapper.step();
+    # defaults to 0 when not set (e.g. PettingZoo wrapper).
+    own_carry = float(getattr(robot, "_carry_steps", 0))
+    obs[ptr + 0] = min(1.0, own_carry / float(TIME_TO_SCORE_TARGET))
+
+    # (b) Holding-penalty overshoot ratio: 0 below HOLDING_TIMEOUT_STEPS,
+    # rising linearly to 1 over the next HOLDING_RAMP_STEPS.  Anticipates
+    # the quadratic timeout penalty before it bites hard.
+    overshoot = max(0.0, own_carry - float(HOLDING_TIMEOUT_STEPS))
+    obs[ptr + 1] = min(1.0, overshoot / float(HOLDING_RAMP_STEPS))
+
+    # (c–d) Per-opponent carrying pin UP-colour one-hot.  Defensive intel:
+    # if the nearest opponent has a yellow pin, blocking their goal is
+    # high-value.  Empty pin slot → all zeros.
+    opp_color_slots = [0.0] * 6   # [r1,b1,y1, r2,b2,y2]
+    for i, opp in enumerate(opponents[:2]):
+        if opp.carrying_pin is not None:
+            up_oh = _color_onehot(opp.carrying_pin.get_up_color())
+            opp_color_slots[i * 3 + 0] = up_oh[0]
+            opp_color_slots[i * 3 + 1] = up_oh[1]
+            opp_color_slots[i * 3 + 2] = up_oh[2]
+    for j in range(6):
+        obs[ptr + 2 + j] = opp_color_slots[j]
+
+    # (e) Yellow pins remaining (unscored, not carried) normalised by /12.
+    # Resource-awareness signal for "should I commit to yellow strategy".
+    yellow_left = sum(
+        1 for p in pins
+        if not p.scored and p.carried_by is None and
+        (p.get_up_color() == C_YELLOW or p.get_down_color() == C_YELLOW)
+    )
+    obs[ptr + 8] = min(1.0, yellow_left / 12.0)
+
+    # (f) Can-score-anywhere bit: 1 if this robot can legally extend the
+    # stack at any reachable goal right now, else 0.  Makes the legality
+    # signal explicit rather than requiring inference across goal slots.
+    can_anywhere = 0.0
+    if robot.carrying_pin is not None or robot.carrying_cup is not None:
+        for g in goals:
+            if g.alliance not in ("neutral", robot.alliance):
+                continue
+            top_is_pin = bool(g.stack) and bool(g.stack[-1][1])
+            can_pin = robot.carrying_pin is not None and not top_is_pin
+            can_cup = robot.carrying_cup is not None and     top_is_pin
+            if can_pin or can_cup:
+                can_anywhere = 1.0
+                break
+    obs[ptr + 9] = can_anywhere
+    ptr += 10
+
+    # ── v8.2 movement intelligence (4) ──────────────────────────────────────
+    # Provides explicit speed scalars that the policy would otherwise have to
+    # recompute from raw velocity components (nonlinear operation slows early
+    # learning of spin-penalty avoidance and carrying_speed_bonus shaping).
+
+    # (a) Own speed magnitude — used by carrying_speed_scale reward and
+    # spin_penalty avoidance; avoids network relearning sqrt(rvx²+rvy²).
+    obs[ptr + 0] = min(1.0, math.hypot(rvx, rvy) / MAX_SPEED)
+
+    # (b) Teammate carry_steps normalized — policy can coordinate: if teammate
+    # is near their timeout, target a different goal to avoid crowding.
+    tm_carry = float(getattr(teammates[0], "_carry_steps", 0)) if teammates else 0.0
+    obs[ptr + 1] = min(1.0, tm_carry / float(TIME_TO_SCORE_TARGET))
+
+    # (c–d) Opponent speed magnitudes — distinguishes a charging opponent
+    # from a stationary one without requiring the policy to combine ovx/ovy.
+    for i, opp in enumerate(opponents[:2]):
+        ovx_ = float(opp.body.velocity.x)
+        ovy_ = float(opp.body.velocity.y)
+        obs[ptr + 2 + i] = min(1.0, math.hypot(ovx_, ovy_) / MAX_SPEED)
+    ptr += 4
+
+    # ── v9 pressure features (4) ─────────────────────────────────────────────
+    # (a) in_scoring_range: 1 if within SCORING_RADIUS of a legal scorable goal while carrying
+    in_range = 0.0
+    if robot.carrying_pin is not None or robot.carrying_cup is not None:
+        for g in goals:
+            if g.alliance not in ("neutral", robot.alliance):
+                continue
+            top_is_pin = bool(g.stack) and bool(g.stack[-1][1])
+            can_pin = robot.carrying_pin is not None and not top_is_pin
+            can_cup = robot.carrying_cup is not None and top_is_pin
+            if (can_pin or can_cup) and math.hypot(rx - g.x, ry - g.y) <= SCORING_RADIUS:
+                in_range = 1.0
+                break
+    obs[ptr + 0] = in_range
+
+    # (b) being_pinned_frac: opponents within PINNING_CONTACT_DIST / 2.0
+    n_pinners = sum(
+        1 for opp in opponents
+        if math.hypot(float(opp.body.position.x) - rx,
+                      float(opp.body.position.y) - ry) < PINNING_CONTACT_DIST
+    )
+    obs[ptr + 1] = min(1.0, n_pinners / 2.0)
+
+    # (c) score_lead_tight: (my - opp) / 15.0 clamped [-1, 1]
+    obs[ptr + 2] = max(-1.0, min(1.0, (my_score - opp_score) / 15.0))
+
+    # (d) dist_to_nearest_scorable_goal / FIELD_DIAG (1.0 if not carrying)
+    best_sd = None
+    if robot.carrying_pin is not None or robot.carrying_cup is not None:
+        for g in goals:
+            if g.alliance not in ("neutral", robot.alliance):
+                continue
+            top_is_pin = bool(g.stack) and bool(g.stack[-1][1])
+            can_pin = robot.carrying_pin is not None and not top_is_pin
+            can_cup = robot.carrying_cup is not None and top_is_pin
+            if can_pin or can_cup:
+                d = math.hypot(rx - g.x, ry - g.y)
+                if best_sd is None or d < best_sd:
+                    best_sd = d
+    obs[ptr + 3] = (best_sd / FIELD_DIAG) if best_sd is not None else 1.0
+    ptr += 4
 
     assert ptr == OBS_DIM, f"Obs dim mismatch: {ptr} != {OBS_DIM}"
     return obs
@@ -383,7 +611,7 @@ def build_observation(
 def build_all_observations(simulator) -> dict:
     """
     Build observations for all four robots at once.
-    Returns {robot_id: np.ndarray(551,)} dict.
+    Returns {robot_id: np.ndarray(564,)} dict.
     """
     return {
         robot.robot_id: build_observation(
@@ -400,12 +628,16 @@ def build_all_observations(simulator) -> dict:
     }
 
 
-def get_action_mask(robot, goals, rules_engine) -> np.ndarray:
+def get_action_mask(robot, goals) -> np.ndarray:
     """
     Returns a boolean mask (7,) for the discrete action head.
     True = action is LEGAL (not masked out).
 
     Actions: [intake, score_pin, score_cup, toggle, flip_pin, flip_cup, match_load]
+
+    Note: the `rules_engine` parameter was removed in v8.2 (PROBLEM 52).
+    Legality is determined entirely by robot state and goal stacks; no
+    rules-engine state (endgame_active, scores, etc.) gates any action.
     """
     mask = np.ones(7, dtype=bool)
 

@@ -14,6 +14,12 @@ The main process serialises policy weights → sends once → workers compute
 
 import os
 import warnings
+
+# Module-level suppression so spawn-reimported workers are clean before
+# _worker_fn (which also sets these) even runs.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+warnings.filterwarnings("ignore", message="pkg_resources", category=UserWarning)
+
 import multiprocessing as mp
 import numpy as np
 from typing import Dict, List
@@ -162,6 +168,9 @@ def _worker_fn(conn, seed: int) -> None:
                     last_rv = red_critic( r1o.unsqueeze(0), r2o.unsqueeze(0)).item()
                     last_bv = blue_critic(b1o.unsqueeze(0), b2o.unsqueeze(0)).item()
 
+                # ── v7: drain per-component reward sums for the rollout ───────
+                reward_components = env.drain_reward_components()
+
                 # ── Pack into numpy arrays for efficient IPC ──────────────────
                 def arr(lst, dtype=np.float32):
                     return np.array(lst, dtype=dtype)
@@ -190,6 +199,7 @@ def _worker_fn(conn, seed: int) -> None:
                     "last_rv": last_rv,
                     "last_bv": last_bv,
                     "episodes": episodes,
+                    "reward_components": reward_components,
                 })
 
     except (EOFError, KeyboardInterrupt):

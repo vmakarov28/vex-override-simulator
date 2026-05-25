@@ -19,7 +19,7 @@ import copy
 import random
 import torch
 from typing import Optional, List
-from config.hyperparameters import POOL_SIZE, POOL_SAMPLE_PROB
+from config.hyperparameters import POOL_SIZE, POOL_SAMPLE_PROB, OBS_DIM
 
 
 class OpponentPool:
@@ -100,12 +100,16 @@ class OpponentPool:
         if dir_:
             os.makedirs(dir_, exist_ok=True)
         torch.save({
-            "pool": self._pool,
-            "latest": self._latest_state,
-            "max_size": self.max_size,
+            "pool":        self._pool,
+            "latest":      self._latest_state,
+            "max_size":    self.max_size,
             "sample_prob": self.sample_prob,
+            # Architecture fingerprint — catches obs_dim mismatch on reload
+            # (PROBLEM 51).  Without this, a stale pool would silently load
+            # then crash inside load_state_dict() during sample().
+            "obs_dim":     OBS_DIM,
         }, path)
-        print(f"[Pool] Saved {len(self._pool)} checkpoints → {path}")
+        print(f"[Pool] Saved {len(self._pool)} checkpoints -> {path}")
 
     def load(self, path: str) -> None:
         """Restore pool from disk."""
@@ -113,6 +117,20 @@ class OpponentPool:
             print(f"[Pool] No pool file at {path}. Starting fresh.")
             return
         data = torch.load(path, map_location=self.device)
+
+        # ── Architecture guard (PROBLEM 51) ─────────────────────────────
+        pool_obs_dim = data.get("obs_dim", None)
+        if pool_obs_dim is not None and pool_obs_dim != OBS_DIM:
+            raise ValueError(
+                f"[Pool] Stored obs_dim={pool_obs_dim} does not match "
+                f"current OBS_DIM={OBS_DIM}.  Delete {path} and start fresh — "
+                f"the pool's policy weights have incompatible input shapes."
+            )
+        if pool_obs_dim is None and len(data.get("pool", [])) > 0:
+            print(f"[Pool] WARNING: pool predates obs_dim tracking; "
+                  f"sample() will crash if checkpoint architecture differs "
+                  f"from current OBS_DIM={OBS_DIM}.")
+
         self._pool          = data.get("pool", [])
         self._latest_state  = data.get("latest", None)
         self.max_size       = data.get("max_size", self.max_size)

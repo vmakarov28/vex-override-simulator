@@ -18,6 +18,7 @@ from config.game_rules import (
     MAX_ROBOT_SIZE_START, MIDFIELD_CENTER, MIDFIELD_HALF,
     GOALS, TOGGLES, ROBOT_STARTS,
     ENDGAME_SECONDS,
+    POINTS_AUTONOMOUS_BONUS,
 )
 
 from simulation.robot import Robot
@@ -117,9 +118,14 @@ class OverrideSimulator:
             self.font_sm  = pygame.font.SysFont("monospace", 12)
 
         self._build_walls()
+        self._auton_walls: List = []
+        self._build_auton_walls()
         self._create_robots()
         self._create_field_objects()
         self._register_collision_handlers()
+
+        # Autonomous bonus tracking
+        self._auton_bonus_applied = False
 
         self._field_bg = None
 
@@ -142,6 +148,65 @@ class OverrideSimulator:
             wall.collision_type = COLL_TYPE_WALL
             wall.filter         = wall_filter
         self.space.add(*walls)
+
+    def _build_auton_walls(self):
+        """VEX V5 VRC autonomous rule: robots may NOT cross the white tape
+        lines during the 15-second autonomous period.  The four diagonal
+        tape segments connect each field corner to the nearest face of the
+        midfield diamond, AND the four edges of the midfield diamond itself
+        are white tape — robots may not enter the midfield during auton.
+        Together these eight segments isolate each starting position in its
+        own sealed wedge:
+          - NW diag: (0,0)   → (60, 60)
+          - NE diag: (144,0) → (84, 60)
+          - SW diag: (0,144) → (60, 84)
+          - SE diag: (84,84) → (144,144)
+          - Diamond NW edge: (60,60) → (48,72) → (60,84)
+          - Diamond NE edge: (84,60) → (96,72) → (84,84)
+        Filter mask is CAT_ROBOT only — pins/cups can still slide across
+        (they obey field physics, not the autonomous rule).
+        Removed when match_phase transitions to driver.
+        """
+        sb = self.space.static_body
+        T  = 1.5
+        auton_walls = [
+            # Outer diagonal segments (corner → diamond corner).
+            pymunk.Segment(sb, (0.0,   0.0),  (60.0, 60.0),  T),  # NW
+            pymunk.Segment(sb, (144.0, 0.0),  (84.0, 60.0),  T),  # NE
+            pymunk.Segment(sb, (0.0,   144.0),(60.0, 84.0),  T),  # SW
+            pymunk.Segment(sb, (84.0,  84.0), (144.0,144.0), T),  # SE
+            # Midfield diamond perimeter (vertices: (48,72), (72,48),
+            # (96,72), (72,96)).  Seals off the midfield so wedges are
+            # fully isolated during auton.
+            pymunk.Segment(sb, (60.0, 60.0), (48.0, 72.0), T),  # NW face (upper half)
+            pymunk.Segment(sb, (48.0, 72.0), (60.0, 84.0), T),  # SW face (lower half)
+            pymunk.Segment(sb, (84.0, 60.0), (72.0, 48.0), T),  # NE face (top)
+            pymunk.Segment(sb, (72.0, 48.0), (60.0, 60.0), T),  # NW face (lower half)
+            pymunk.Segment(sb, (84.0, 84.0), (96.0, 72.0), T),  # SE face (top)
+            pymunk.Segment(sb, (96.0, 72.0), (84.0, 60.0), T),  # NE face (bottom)
+            pymunk.Segment(sb, (60.0, 84.0), (72.0, 96.0), T),  # SW face (bottom)
+            pymunk.Segment(sb, (72.0, 96.0), (84.0, 84.0), T),  # SE face (bottom)
+        ]
+        auton_filter = pymunk.ShapeFilter(
+            categories=CAT_WALL,
+            mask=CAT_ROBOT,   # robots only — pins/cups unaffected
+        )
+        for wall in auton_walls:
+            wall.friction       = 0.55
+            wall.elasticity     = 0.05
+            wall.collision_type = COLL_TYPE_WALL
+            wall.filter         = auton_filter
+        self.space.add(*auton_walls)
+        self._auton_walls = list(auton_walls)
+
+    def _remove_auton_walls(self):
+        """Called when autonomous ends so robots can roam freely in driver."""
+        if not hasattr(self, "_auton_walls"):
+            return
+        for w in self._auton_walls:
+            if w in self.space.shapes:
+                self.space.remove(w)
+        self._auton_walls = []
 
     def _create_robots(self):
         order = ["red1", "red2", "blue1", "blue2"]
@@ -235,6 +300,8 @@ class OverrideSimulator:
                         robot.try_score_cup(self.goals, self.rules_engine)
                     if act.get("toggle", False):
                         robot.try_toggle(self.toggles)
+                    if act.get("match_load", False):
+                        self._try_bot_match_load(robot)
                 else:
                     robot.apply_drive(0, 0)
 
@@ -293,6 +360,7 @@ class OverrideSimulator:
     def _update_phase(self):
         if self.time_remaining <= 0:
             if self.match_phase == "autonomous":
+                self._end_autonomous()
                 self.match_phase = "driver"
                 self.time_remaining = DRIVER_SECONDS
             elif self.match_phase == "driver":
@@ -305,9 +373,41 @@ class OverrideSimulator:
                         self.goals, self.toggles, self.robots)
                     self.red_score  = final["red"]
                     self.blue_score = final["blue"]
-        elif self.time_remaining <= 0 and self.match_phase == "autonomous":
-            self.match_phase = "driver"
-            self.time_remaining = DRIVER_SECONDS
+
+    def _end_autonomous(self):
+        """VEX V5 VRC end-of-autonomous routine:
+          1. Remove the autonomous tape-line walls (driver-control is unrestricted).
+          2. Determine the autonomous winner based on current scores.
+          3. Award POINTS_AUTONOMOUS_BONUS (12 pts) to the winning alliance.
+             Tie: no bonus awarded (matches official VRC ruling).
+        """
+        self._remove_auton_walls()
+        if self._auton_bonus_applied:
+            return
+        self._auton_bonus_applied = True
+        # Snapshot the current "auton score" so we can show the breakdown.
+        self._auton_score_red  = self.rules_engine.red_score
+        self._auton_score_blue = self.rules_engine.blue_score
+        # Persist the bonus on the rules engine so recompute_all_scores
+        # (which rebuilds totals every frame) keeps adding it in.
+        if self._auton_score_red > self._auton_score_blue:
+            self.rules_engine.auton_bonus_red = POINTS_AUTONOMOUS_BONUS
+            self._auton_winner = "red"
+        elif self._auton_score_blue > self._auton_score_red:
+            self.rules_engine.auton_bonus_blue = POINTS_AUTONOMOUS_BONUS
+            self._auton_winner = "blue"
+        else:
+            self._auton_winner = "tie"
+        # Surface immediately so observers reading red_score/blue_score
+        # between this call and the next recompute see the right value.
+        self.rules_engine.red_score  += self.rules_engine.auton_bonus_red
+        self.rules_engine.blue_score += self.rules_engine.auton_bonus_blue
+        self.red_score  = self.rules_engine.red_score
+        self.blue_score = self.rules_engine.blue_score
+        print(f"[AUTON] Autonomous ended: red={self._auton_score_red} "
+              f"blue={self._auton_score_blue} winner={self._auton_winner} "
+              f"(+{POINTS_AUTONOMOUS_BONUS} bonus to "
+              f"{self._auton_winner if self._auton_winner != 'tie' else 'none'})")
 
     def _try_flip_toggle(self, robot):
         for toggle in self.toggles:
@@ -533,7 +633,9 @@ class OverrideSimulator:
         red1 = self.robots[0]
         blue1 = self.robots[2]
 
-        # Red Match Load
+        # Red Match Load (DISABLED during autonomous per VRC rules)
+        if self.match_phase == "autonomous":
+            return actions
         if self._is_in_loading_zone(red1, "red"):
             if keys[pygame.K_m] and keys[pygame.K_1]:
                 if not getattr(self, '_m1_pressed_red', False):
@@ -622,6 +724,14 @@ class OverrideSimulator:
         self.timer_started = False
         self.time_remaining = AUTONOMOUS_SECONDS
 
+        # Rebuild autonomous tape-line walls (removed at end of last match).
+        self._remove_auton_walls()
+        self._build_auton_walls()
+        self._auton_bonus_applied = False
+        self._auton_score_red  = 0
+        self._auton_score_blue = 0
+        self._auton_winner = None
+
         self.red_cups_left = 10
         self.red_alliance_pins_left = 12
         self.red_yellow_pins_left = 1
@@ -662,6 +772,45 @@ class OverrideSimulator:
             return (pos.x < 12 and pos.y < 24) or (pos.x < 12 and pos.y > 120)
         else:
             return (pos.x > 132 and pos.y < 24) or (pos.x > 132 and pos.y > 120)
+
+    def _try_bot_match_load(self, robot) -> bool:
+        """Bot-driven match load.  Only red1/blue1 are eligible (matches the
+        keyboard handler's restriction).  Robot must be in its alliance's
+        loading zone.  Picks the best available selection automatically:
+
+            1. Loaded cup + yellow pin (selection 2)   — highest value
+            2. Loaded cup + alliance pin (selection 1) — pin+cup at once
+            3. Individual alliance pin   (selection 4)
+            4. Individual cup            (selection 3)
+            5. Individual yellow pin     (selection 5) — fallback (no cup left)
+
+        Returns True if a match load actually fired.
+        """
+        if robot.robot_id not in ("red1", "blue1"):
+            return False
+        # VEX V5 VRC rule: match loading is PROHIBITED during autonomous
+        # period.  The auton bonus is determined by on-field play only.
+        if self.match_phase == "autonomous":
+            return False
+        alliance = robot.alliance
+        if not self._is_in_loading_zone(robot, alliance):
+            return False
+        if self._has_inventory(alliance, "cup") and self._has_inventory(alliance, "yellow_pin"):
+            self._perform_match_load(robot, 2)
+            return True
+        if self._has_inventory(alliance, "cup") and self._has_inventory(alliance, "alliance_pin"):
+            self._perform_match_load(robot, 1)
+            return True
+        if self._has_inventory(alliance, "alliance_pin"):
+            self._perform_match_load(robot, 4)
+            return True
+        if self._has_inventory(alliance, "cup"):
+            self._perform_match_load(robot, 3)
+            return True
+        if self._has_inventory(alliance, "yellow_pin"):
+            self._perform_match_load(robot, 5)
+            return True
+        return False
 
     def _perform_match_load(self, robot, selection):
         alliance = robot.alliance

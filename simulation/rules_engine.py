@@ -53,6 +53,12 @@ class RulesEngine:
         self.midfield_blue_count  = 0
         self.midfield_red_bonus   = 0    # live +8-per-robot parking pts
         self.midfield_blue_bonus  = 0
+        # Autonomous bonus (+12 pts) is set once when auton ends and must
+        # survive every subsequent recompute_all_scores call — recompute
+        # rebuilds totals from goal stacks, so the bonus is stored here
+        # and added back in each frame.
+        self.auton_bonus_red      = 0
+        self.auton_bonus_blue     = 0
 
     def reset(self):
         self.red_score  = 0
@@ -65,6 +71,8 @@ class RulesEngine:
         self.midfield_blue_count = 0
         self.midfield_red_bonus  = 0
         self.midfield_blue_bonus = 0
+        self.auton_bonus_red     = 0
+        self.auton_bonus_blue    = 0
 
     def check_possession(self, robot):
         """Enforce 1 Pin + 1 Cup possession limit."""
@@ -176,38 +184,105 @@ class RulesEngine:
             self.midfield_red_bonus  = 0
             self.midfield_blue_bonus = 0
 
+        # Persist the auton bonus (+12 to the auton winner) across frames.
+        red  += self.auton_bonus_red
+        blue += self.auton_bonus_blue
+
         self.red_score  = red
         self.blue_score = blue
 
     # ── Final score (match end) ───────────────────────────────────────
     def calculate_final_score(self, goals: list, toggles: list,
                               robots: list) -> Dict:
-        """Freeze the final score.
+        """Freeze the final score, applying SC5b at the end-of-match instant.
 
-        At match end we apply SC5b: yellow pins in the center goal are
-        owned by whichever alliance has STRICTLY more robots in the Midfield.
-        This is done as a one-time adjustment on top of the already-computed
-        toggle-based score, so it can't cause live swings.
+        SC5b — Center goal yellow halves:
+          During live play the center goal's yellow halves contribute 0
+          (see FieldGoal.get_score with midfield_majority=None).  Here, at
+          match end, we count robots inside the Midfield right now and:
+            - strict majority → all visible yellow halves in the center
+              goal score 10 pts each to that alliance
+            - tie  (0-0, 1-1, 2-2) → yellow halves remain 0 (unclaimed)
+          Regular red/blue halves in the center goal were already scored
+          live and are not affected.
         """
-        # The live score already includes: goal stacks + parking bonus.
-        # Apply SC5b adjustment for center goal yellow pins.
+        # Recount robots in midfield at the exact moment the match ends.
+        # We do NOT rely on self.midfield_*_count because those are reset to
+        # 0 outside the endgame window in recompute_all_scores; reading them
+        # here would misclassify the majority if the endgame flag was not
+        # active on the final frame.
+        self._update_midfield_counts(robots)
+        r_count = self.midfield_red_count
+        b_count = self.midfield_blue_count
+        if r_count > b_count:
+            majority = "red"
+        elif b_count > r_count:
+            majority = "blue"
+        else:
+            majority = "tie"
+
+        # Recompute the center goal score using the SC5b majority, regardless
+        # of whether the live score already had yellows credited (it shouldn't,
+        # since live yellows are deferred — but recomputing is the canonical
+        # source of truth).
         center_goal = next((g for g in goals if g.goal_id == CENTER_GOAL_ID), None)
+        delta_r = delta_b = 0
+        n_yellow_visible = 0
         if center_goal:
-            r_count = self.midfield_red_count
-            b_count = self.midfield_blue_count
-            if r_count != b_count:
-                majority = "red" if r_count > b_count else "blue"
-                # Recompute center goal score with SC5b majority
-                old_r = center_goal.red_score
-                old_b = center_goal.blue_score
-                center_goal.get_score(toggles, midfield_majority=majority)
-                # Replace the toggle-based center goal score with SC5b score
-                self.red_score  += center_goal.red_score  - old_r
-                self.blue_score += center_goal.blue_score - old_b
+            old_r = center_goal.red_score
+            old_b = center_goal.blue_score
+            center_goal.get_score(toggles, midfield_majority=majority)
+            delta_r = center_goal.red_score - old_r
+            delta_b = center_goal.blue_score - old_b
+            self.red_score  += delta_r
+            self.blue_score += delta_b
+            # v9.3 PROBLEM 71: count visible yellow halves in the center goal
+            # at match end for the diagnostic line below.
+            n = len(center_goal.stack)
+            for i, (obj, is_pin) in enumerate(center_goal.stack):
+                if not is_pin:
+                    continue
+                # DOWN visibility
+                if i == 0:
+                    down_vis = False
+                else:
+                    prev_obj, prev_is_pin = center_goal.stack[i - 1]
+                    if prev_is_pin:
+                        down_vis = True
+                    else:
+                        flipped = getattr(prev_obj, 'flipped', False)
+                        eff_clear_up = (not prev_obj.clear_on_top) if flipped else prev_obj.clear_on_top
+                        down_vis = eff_clear_up
+                # UP visibility
+                if i + 1 >= n:
+                    up_vis = True
+                else:
+                    next_obj, next_is_pin = center_goal.stack[i + 1]
+                    if next_is_pin:
+                        up_vis = True
+                    else:
+                        flipped = getattr(next_obj, 'flipped', False)
+                        eff_clear_up = (not next_obj.clear_on_top) if flipped else next_obj.clear_on_top
+                        up_vis = not eff_clear_up
+                # Count yellow halves — use name properties (strings), not RGB tuples
+                if down_vis and obj.down_half_name == "yellow":
+                    n_yellow_visible += 1
+                if up_vis and obj.up_half_name == "yellow":
+                    n_yellow_visible += 1
+
+        # v9.3 PROBLEM 71: emit a diagnostic line so the SC5b adjustment is
+        # visible in match-end output.  This makes future "yellow not credited"
+        # bugs immediately obvious without needing to instrument anything.
+        print(f"[SC5b] midfield: red={r_count} blue={b_count} -> majority={majority} | "
+              f"center_yellow_visible={n_yellow_visible} | "
+              f"+pts: red={delta_r} blue={delta_b}")
 
         return {
             "red":  self.red_score,
             "blue": self.blue_score,
             "winner": "red"  if self.red_score  > self.blue_score else
                       "blue" if self.blue_score > self.red_score  else "tie",
+            "midfield_majority":    majority,
+            "midfield_red_count":   r_count,
+            "midfield_blue_count":  b_count,
         }

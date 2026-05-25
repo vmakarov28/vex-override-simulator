@@ -31,6 +31,7 @@ from config.game_rules import (
     POINTS_YELLOW_OWNED, TOGGLE_INTERACTION_RANGE,
     FOUL_STANDARD_PTS,
     ORIENT_VERTICAL, ORIENT_HORIZONTAL,
+    CENTER_GOAL_ID,
 )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -267,13 +268,36 @@ class GamePin:
         }.get(self.color, (C_GRAY_MID, C_GRAY_MID))
 
     def get_up_color(self):
-        """Returns the color of the 'up' (visible/scored) half."""
+        """Returns the color of the 'up' (visible/scored) half as an RGB tuple."""
         c1, c2 = self.get_colors()
         return c2 if self.flipped else c1
 
     def get_down_color(self):
-        """Returns the color of the 'down' half."""
+        """Returns the color of the 'down' half as an RGB tuple."""
         c1, c2 = self.get_colors()
+        return c1 if self.flipped else c2
+
+    # Colour-name helpers — return plain strings so callers can compare
+    # without importing the C_* RGB constants from game_objects.
+    _COLOR_NAME_MAP = {
+        "red":           ("red",    "red"),
+        "blue":          ("blue",   "blue"),
+        "yellow":        ("yellow", "yellow"),
+        "yellow_yellow": ("yellow", "yellow"),
+        "red_yellow":    ("red",    "yellow"),
+        "blue_yellow":   ("blue",   "yellow"),
+    }
+
+    @property
+    def up_half_name(self) -> str:
+        """Name string of the up-facing half: 'red', 'blue', or 'yellow'."""
+        c1, c2 = self._COLOR_NAME_MAP.get(self.color, ("gray", "gray"))
+        return c2 if self.flipped else c1
+
+    @property
+    def down_half_name(self) -> str:
+        """Name string of the down-facing half: 'red', 'blue', or 'yellow'."""
+        c1, c2 = self._COLOR_NAME_MAP.get(self.color, ("gray", "gray"))
         return c1 if self.flipped else c2
 
 
@@ -717,19 +741,31 @@ class FieldGoal:
     def get_score(self, toggles=None, midfield_majority=None):
         """Compute per-alliance scores for this goal's current stack.
 
-        Scoring rules (per VEX Override manual SC3):
+        Scoring rules (per VEX Override manual SC3 / SC5b):
           - Each visible pin half scores 5 pts for its color's alliance.
-          - A yellow visible half scores 10 pts for the alliance that owns
-            the toggle controlling this goal's quadrant. If the toggle is
-            set to yellow (unowned), yellow halves score 0.
+          - For NON-CENTER goals: a yellow visible half scores 10 pts for the
+            alliance that owns the toggle controlling this goal's quadrant.
+            If the toggle is set to yellow (unowned), yellow halves score 0.
+          - For the CENTER goal (SC5b): yellow halves NEVER use toggle
+            ownership.  Instead, ownership is decided at match end by which
+            alliance has STRICTLY more robots in the Midfield.  Ties (0-0,
+            1-1, 2-2) leave yellows unclaimed (0 pts).  During live play
+            (midfield_majority=None) yellow halves contribute 0 — the value
+            locks in only at match end via calculate_final_score().  Regular
+            red/blue halves in the center goal score normally and live.
           - Visibility is determined by the cup orientation above/below each
             half (same eff_clear_up logic used by the draw() method).
           - The goal post always cancels the bottom half of the bottom-most pin.
           - Cups themselves score no points.
 
-        midfield_majority: "red"/"blue"/None — overrides toggle-based yellow
-          ownership for the center goal (SC5b). Only passed at match end by
-          calculate_final_score; NEVER during live play (avoids score swings).
+        midfield_majority: per SC5b, the alliance with majority robots in the
+          Midfield at match end.
+            None  → live play (center goal yellows score 0; non-center goals
+                    fall back to toggle-based ownership).
+            "red" → award center goal yellows to red.
+            "blue"→ award center goal yellows to blue.
+            "tie" → match end with no majority; center goal yellows score 0.
+          For non-center goals this argument is ignored.
 
         Updates self.red_score and self.blue_score.
         Returns the combined total (for legacy callers).
@@ -743,10 +779,17 @@ class FieldGoal:
             return 0
 
         # ── Determine yellow ownership ────────────────────────────────
-        # midfield_majority (SC5b) overrides toggle lookup when provided.
-        # During live play it is always None, so toggle logic runs normally.
-        if midfield_majority is not None:
-            yellow_owner = midfield_majority
+        # SC5b: center goal yellows are decided by midfield robot majority,
+        # not by toggles.  During live play (midfield_majority is None) the
+        # center goal's yellow halves contribute 0 — value is deferred to
+        # match end via calculate_final_score.
+        is_center = (self.goal_id == CENTER_GOAL_ID)
+        if is_center:
+            if midfield_majority in ("red", "blue"):
+                yellow_owner = midfield_majority
+            else:
+                # None (live) or "tie" (final, no majority) → no claim
+                yellow_owner = None
         elif toggles:
             yellow_owner = None
             dx = self.x - 72.0
@@ -938,15 +981,17 @@ class FieldToggle:
         self.width  = 2.0
 
     def try_interact(self, robot):
+        """Single-flip alliance takeover (matches Robot.try_toggle).
+        Pressing toggle near a non-own toggle sets it to the robot's
+        alliance.  Own toggles are no-op (closes the cycle exploit
+        where flipping your own toggle would give it to the opponent).
+        """
         dist = math.sqrt((robot.body.position.x - self.x) ** 2 +
                          (robot.body.position.y - self.y) ** 2)
         if dist <= TOGGLE_INTERACTION_RANGE:
-            if self.owner == "red":
-                self.owner = "blue"
-            elif self.owner == "blue":
-                self.owner = "yellow"
-            else:
-                self.owner = "red" if robot.alliance == "red" else "blue"
+            if self.owner == robot.alliance:
+                return False
+            self.owner = robot.alliance
             return True
         return False
 
