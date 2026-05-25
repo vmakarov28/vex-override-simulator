@@ -271,6 +271,21 @@ class HeuristicBot:
         # Back-off after a failed trip (committed but couldn't reach the
         # zone in time) — don't pound the same path repeatedly.
         self._ml_cooldown_steps: int = 0
+        # Track which loading-zone indices have failed this match (via
+        # STUCK_ESCAPE).  _pick_loading_zone avoids these on retries.
+        self._ml_failed_zones: set = set()
+        # Track high-value toggles that proved unreachable (stuck during
+        # pursuit).  _find_high_value_toggle_flip skips these.
+        self._hv_toggle_blacklist: set = set()
+        # Step counter for the current hv-toggle pursuit so we can
+        # timeout if the bot makes no progress.
+        self._hv_toggle_target_id: Optional[int] = None
+        self._hv_toggle_steps: int = 0
+        # v14 — Post-score toggle claim.  Set right after a score action
+        # that exposes yellow halves on a non-friendly toggle's goal,
+        # so the bot's immediate next priority is to claim that toggle.
+        self._post_score_toggle_id: Optional[int] = None
+        self._post_score_toggle_steps: int = 0
 
         # Diagnostic
         self.last_reason: str = "init"
@@ -304,6 +319,12 @@ class HeuristicBot:
         self._target_load_zone  = None
         self._match_load_commit = 0
         self._ml_cooldown_steps = 0
+        self._ml_failed_zones   = set()
+        self._hv_toggle_blacklist = set()
+        self._hv_toggle_target_id = None
+        self._hv_toggle_steps     = 0
+        self._post_score_toggle_id    = None
+        self._post_score_toggle_steps = 0
         self.last_reason        = "init"
         HeuristicBot._shared_targets[self.robot_id] = {
             "pin": None, "cup": None, "goal": None, "load_zone": None,
@@ -341,6 +362,73 @@ class HeuristicBot:
     @staticmethod
     def _dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
         return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    # ── VEX VRC autonomous wedge helpers ──────────────────────────────── #
+    # The four diagonal tape lines divide the field into four wedges, one
+    # per starting robot position.  During autonomous, each robot is
+    # PHYSICALLY restricted to its own wedge by the auton walls in the
+    # simulator.  The bot uses these helpers to avoid driving into the
+    # walls (it'd just get stuck and waste auton time).
+    _WEDGE_BY_ROBOT = {
+        "red1":  "west",   # x small, y around middle
+        "red2":  "north",  # x around middle, y small
+        "blue1": "south",  # x around middle, y large
+        "blue2": "east",   # x large, y around middle
+    }
+
+    def _is_in_my_auton_wedge(self, x: float, y: float) -> bool:
+        """True if (x,y) is in this robot's autonomous wedge.
+        Wedges defined by the two diagonals y=x and y=144-x:
+          west:  y > x AND y < 144-x
+          north: y < x AND y < 144-x
+          east:  y < x AND y > 144-x
+          south: y > x AND y > 144-x
+        Per VRC Override rules, the midfield diamond is SEALED OFF during
+        auton — robots may not cross any white tape line, including the
+        diamond perimeter.  No shared zone: each robot is confined to its
+        own wedge.
+        """
+        # Reject anything inside the midfield diamond — it's walled off
+        # during auton and not part of any wedge.
+        if abs(x - 72.0) + abs(y - 72.0) <= 24.0:
+            return False
+        diag1 = y < x        # north/east half of the y=x line
+        diag2 = y < 144.0 - x  # north/west half of the y=144-x line
+        wedge = self._WEDGE_BY_ROBOT.get(self.robot_id, "west")
+        if wedge == "west":
+            return (not diag1) and diag2
+        if wedge == "north":
+            return diag1 and diag2
+        if wedge == "east":
+            return diag1 and (not diag2)
+        # south
+        return (not diag1) and (not diag2)
+
+    # Per-robot in-wedge anchor used as the fallback when a target lies
+    # outside our auton wedge.  Each anchor is inside the robot's wedge,
+    # away from the diagonal tape walls and the midfield diamond, near
+    # an in-wedge goal — so falling back here keeps the bot productive
+    # instead of pushing it into a wall.
+    _AUTON_WEDGE_ANCHOR: Dict[str, Tuple[float, float]] = {
+        "red1":  (24.0,  72.0),  # west wedge, between R-High and SW
+        "red2":  (72.0,  24.0),  # north wedge, between NW and B-Low
+        "blue1": (72.0, 120.0),  # south wedge, between R-Low and SE
+        "blue2": (120.0, 72.0),  # east wedge, between B-High and NE
+    }
+
+    def _clamp_target_to_auton_wedge(self, target_xy: Tuple[float, float]
+                                     ) -> Tuple[float, float]:
+        """During autonomous, redirect targets outside our wedge to an
+        in-wedge anchor (the midfield diamond is walled off, so the old
+        MIDFIELD_CENTER fallback would just push the bot into a wall).
+        After auton ends, returns the target unchanged.
+        """
+        if not self._is_in_autonomous():
+            return target_xy
+        tx, ty = target_xy
+        if self._is_in_my_auton_wedge(tx, ty):
+            return target_xy
+        return self._AUTON_WEDGE_ANCHOR.get(self.robot_id, self._pos())
 
     def _deflect_for_obstacles(self, target_xy: Tuple[float, float]
                                 ) -> Tuple[float, float]:
@@ -415,30 +503,38 @@ class HeuristicBot:
             return (ox - side * rp_x * offset, oy - side * rp_y * offset)
 
         def _in_field(p):
-            return 5.0 < p[0] < 139.0 and 5.0 < p[1] < 139.0
+            # 9" margin accounts for robot half-width (8.5") so deflection
+            # waypoints are physically reachable without jamming into the wall.
+            return 9.0 < p[0] < 135.0 and 9.0 < p[1] < 135.0
 
         primary = _wp(side_sign)
         if _in_field(primary):
             return primary
-        # Primary waypoint is outside the field — try the opposite side.
+        # Primary waypoint is outside the robot-reachable area — try the
+        # opposite side of the obstacle.
         alt = _wp(-side_sign)
         if _in_field(alt):
             return alt
-        # Both deflections leave the field — clamp the primary inside it
+        # Both deflections are out of bounds — clamp to robot-reachable area
         # so the bot drives toward a reachable point and keeps moving.
-        return (max(5.0, min(139.0, primary[0])),
-                max(5.0, min(139.0, primary[1])))
+        return (max(9.0, min(135.0, primary[0])),
+                max(9.0, min(135.0, primary[1])))
 
     def _drive_to(self, target_xy: Tuple[float, float],
                   full_speed: bool = True,
                   avoid_obstacles: bool = True) -> Tuple[float, float]:
         """Wheel commands to steer toward target_xy.
 
+        - During autonomous, targets outside our wedge are clamped to the
+          midfield diamond center — the auton walls would block us anyway.
         - If `avoid_obstacles` (default), routes around goals/robots in
           the direct path via `_deflect_for_obstacles`.
         - Turn-in-place only when heading error exceeds SPIN_THRESHOLD_DEG.
         - Within SLOW_RADIUS, throttle is scaled by distance.
         """
+        # VRC autonomous: clamp to wedge so we don't waste cycles pushing
+        # against the diagonal tape walls.
+        target_xy = self._clamp_target_to_auton_wedge(target_xy)
         if avoid_obstacles:
             target_xy = self._deflect_for_obstacles(target_xy)
         rx, ry = self._pos()
@@ -641,14 +737,53 @@ class HeuristicBot:
         v, _, _ = self._best_score_at_goal(goal, has_pin, has_cup)
         return v
 
+    # v12 — A4 effective-speed estimate for time-based valuation.  Tuned
+    # empirically against measured robot movement: ~25 in/s straight-line
+    # under load, plus a per-radian spin penalty of ~0.4 s.
+    EFFECTIVE_SPEED_IN_PER_S = 25.0
+    SPIN_PENALTY_S_PER_RAD   = 0.4
+
+    def _travel_time_to(self, target_xy: Tuple[float, float]) -> float:
+        """Estimate seconds to physically reach target_xy from current pose.
+
+        Accounts for both translation distance AND the heading correction
+        the bot will have to spin through first.  Used by A3/A4 to compute
+        "points per second" rather than naive value-minus-distance.
+        """
+        rx, ry = self._pos()
+        tx, ty = target_xy
+        dx, dy = tx - rx, ty - ry
+        dist = math.hypot(dx, dy)
+        translate_s = dist / self.EFFECTIVE_SPEED_IN_PER_S
+        # Heading error penalty.  At 0 err: no penalty.  At π/2: ~0.6s spin.
+        desired = math.atan2(dy, dx) if dist > 1e-3 else 0.0
+        err = abs(_norm_angle(desired - float(self.robot.body.angle)))
+        spin_s = err * self.SPIN_PENALTY_S_PER_RAD
+        # Reverse-drive cap: at err > 135°, we'd reverse, so cap effective err.
+        if err > math.radians(135.0):
+            spin_s = (math.pi - err) * self.SPIN_PENALTY_S_PER_RAD
+        return max(0.1, translate_s + spin_s)
+
+    # v13 — points-equivalent cost of 1 second of travel.  Tuned so that
+    # a 10-pt score 4s away (cost: 8 pts → net 2) loses to a 5-pt score
+    # 0.5s away (cost: 1 pt → net 4).  But a 10-pt score 0.5s away
+    # (net 9) beats a 5-pt score 0.1s away (net 4.8).
+    TIME_COST_PTS_PER_S = 2.0
+
     def _best_scoreable_goal(self, has_pin: bool, has_cup: bool):
         """Best goal where I can legally place what I'm holding NOW.
 
-        Scoring uses orientation-aware expected value MINUS a distance
-        penalty.  Partners' claimed goals are deprioritised.
+        v13 — Linear time-cost valuation (replaces divisive pps which
+        produced extreme values for very close goals and made the bot
+        prefer marginal 1-pt scores 0.1s away over 10-pt scores 1s away):
+            score = v - TIME_COST_PTS_PER_S * travel_seconds
+
+        Plus a sticky bonus when within 20" of the current target goal
+        (G2 commit-lock) so the bot doesn't flip-flop mid-approach.
         """
         my_pos = self._pos()
         partners = self._partner_targets()
+        in_auton = self._is_in_autonomous()
         best = None
         best_sc = -1e9
         for g in self.sim.goals:
@@ -659,17 +794,26 @@ class HeuristicBot:
                 continue
             if (needs == "pin" and not has_pin) or (needs == "cup" and not has_cup):
                 continue
+            # Auton wedge restriction: white tape walls prevent crossing.
+            # During auton, only score on goals inside our wedge.
+            if in_auton and not self._is_in_my_auton_wedge(g.x, g.y):
+                continue
             v = self._score_value_now(g, has_pin, has_cup)
-            # Even goals with v <= 0 are kept as fallbacks; just heavily penalised.
-            d = self._dist(my_pos, (g.x, g.y))
-            # Bonuses
+            # Strategic value bonuses.
             if g.alliance == self.alliance:
                 v += 3.0    # alliance goals always preferred (only we can score)
             if g.goal_id == CENTER_GOAL_ID:
                 v -= 1.5
             if g.goal_id in partners["goals"]:
                 v -= 8.0
-            sc = v * 4.0 - d
+            # Linear time-cost: subtract pts-per-second × travel-time.
+            travel_s = self._travel_time_to((g.x, g.y))
+            sc = v - self.TIME_COST_PTS_PER_S * travel_s
+            d = self._dist(my_pos, (g.x, g.y))
+            # G2 commit-lock: stickiness inside 20" of current target.
+            # Linear ramp: +1 pt at 20", +4 pts at 0".
+            if g.goal_id == self._target_goal_id and d < 20.0:
+                sc += 1.0 + (3.0 * (20.0 - d) / 20.0)
             if sc > best_sc:
                 best_sc = sc
                 best = g
@@ -761,24 +905,125 @@ class HeuristicBot:
             a["score_cup"] = True
             self.last_reason = f"score_cup:{g.goal_id}(v={v:.1f})"
         self._target_goal_id = g.goal_id
+        # v14 — Post-score toggle claim.  If this score exposes yellow halves
+        # on a goal whose controlling toggle is NOT ours, the bot's IMMEDIATE
+        # next action should be to claim that toggle.  Each visible yellow
+        # half is worth +10 pts when the toggle flips to our alliance.
+        tog = self._toggle_for_goal(g)
+        if tog is not None and tog.owner != self.alliance:
+            # Check if scoring this pin/cup will expose yellow halves.
+            yellow_exposed = self._score_will_expose_yellow(g, ntype)
+            if yellow_exposed:
+                self._post_score_toggle_id = tog.toggle_id
+                self._post_score_toggle_steps = 60   # 3-second pursuit window
         return a
+
+    def _score_will_expose_yellow(self, goal, ntype: str) -> bool:
+        """Check if placing a pin/cup on `goal` would leave a yellow half
+        visible on the top of the resulting stack.
+          - Pin score: places carried pin on top → its visible UP half is
+            the orientation-current UP (or flipped).  If yellow → True.
+          - Cup score: places carried cup on top of an existing pin →
+            pin's UP half may become hidden (cup not clear_up) or stay
+            visible (cup clear_up).  If pin UP was yellow and stays
+            visible → True.
+        """
+        if ntype == "pin":
+            pin = self.robot.carrying_pin
+            if pin is None:
+                return False
+            return (pin.up_half_name == "yellow" or
+                    pin.down_half_name == "yellow")
+        # cup score: cup goes on top of pin in goal.stack[-1]
+        if not goal.stack or not goal.stack[-1][1]:
+            return False
+        pin_below, _ = goal.stack[-1]
+        cup = self.robot.carrying_cup
+        if cup is None:
+            return False
+        # After cup placement, pin_below's UP half visibility depends on
+        # cup's clear_on_top (effectively flipped).
+        flipped = getattr(cup, 'flipped', False)
+        eff_clear_up = (not cup.clear_on_top) if flipped else cup.clear_on_top
+        if eff_clear_up:
+            # Cup is transparent → pin UP stays visible.
+            return pin_below.up_half_name == "yellow"
+        # Cup hides pin UP → no exposed yellow from pin.  Cup's DOWN
+        # half becomes visible (the half touching the pin) — but cup
+        # halves aren't yellow in this game (cups are uniform color).
+        return False
 
     # ── Element pickup helpers ────────────────────────────────────────── #
 
     def _pin_value(self, pin) -> float:
-        """How valuable is this pin?  Negative = avoid."""
+        """How valuable is this pin?  Negative = avoid.
+
+        v12 — A1 live toggle check:
+          Yellow pin halves only score 10 pts when our alliance owns the
+          controlling toggle of the goal we'll score at.  If we DON'T own
+          any toggle whose region contains a scoreable goal, a yellow pin
+          is worth nothing (or negative if opp owns).  Recompute live so
+          the bot doesn't carry a yellow pin around looking for a slot
+          that doesn't exist.
+        """
         c = pin.color
         own_solid    = (self.alliance == "red"  and c == "red")  or (self.alliance == "blue" and c == "blue")
         opp_solid    = (self.alliance == "red"  and c == "blue") or (self.alliance == "blue" and c == "red")
         own_yellow   = (self.alliance == "red"  and c == "red_yellow")  or (self.alliance == "blue" and c == "blue_yellow")
         opp_yellow   = (self.alliance == "red"  and c == "blue_yellow") or (self.alliance == "blue" and c == "red_yellow")
         full_yellow  = (c == "yellow" or c == "yellow_yellow")
-        if own_yellow:   return 1.8
-        if own_solid:    return 1.0
-        if full_yellow:  return 1.4
-        if opp_yellow:   return -1.5
-        if opp_solid:    return -2.0
+        if own_solid:   return 1.0
+        if opp_solid:   return -2.0
+        # Pin has at least one yellow half — multiplier depends on live toggle
+        # ownership of any goal where we can plausibly score it.
+        if own_yellow or full_yellow or opp_yellow:
+            yellow_mult = self._live_yellow_multiplier()
+            base = 1.8 if own_yellow else (1.4 if full_yellow else -1.5)
+            # full_yellow value is multiplied by toggle control (2x both halves
+            # vs 1x one half).  own_yellow has 1 yellow half.  opp_yellow same.
+            if yellow_mult >= 1.0:
+                # Friendly toggle control somewhere — yellow is fully worth it.
+                return base * yellow_mult
+            elif yellow_mult <= -0.5:
+                # Opp controls; yellow becomes a liability.
+                return base * yellow_mult
+            else:
+                # Neutral — yellow scores 0 pts, only color base matters.
+                # full_yellow=1.4 → 0.4 (cup setup); own_yellow=1.8 → 0.5; opp_yellow=-1.5 → -0.5
+                return base * 0.3
         return 0.1
+
+    def _live_yellow_multiplier(self) -> float:
+        """Returns a multiplier for yellow-half pin value based on live toggle
+        ownership across the field:
+          +1.0 → we control at least one toggle whose region has scoreable goals
+                 (yellow scores 10 pts at those goals)
+           0.0 → all toggles in regions with scoreable goals are NEUTRAL
+                (yellow scores 0)
+          -1.0 → opp controls all relevant toggles (yellow scores -10 → opp +10)
+        Used by _pin_value to keep yellow pin valuations honest.
+        """
+        ours = opps = neut = 0
+        for g in self.sim.goals:
+            if g.goal_id == CENTER_GOAL_ID:
+                continue  # SC5b — decided at end, not via toggles
+            needs = self._goal_needs(g)
+            if needs == "full":
+                continue
+            tog = self._toggle_for_goal(g)
+            if tog is None:
+                continue
+            if tog.owner == self.alliance:
+                ours += 1
+            elif tog.owner == self.opp_alliance:
+                opps += 1
+            else:
+                neut += 1
+        if ours > 0:
+            return 1.0   # at least one ours-controlled scoreable goal
+        if opps > 0 and neut == 0:
+            return -1.0  # ALL scoreable goals are opp — yellow is bad
+        return 0.0       # mixed or neutral — yellow worth its base only
 
     # Wall threshold (in inches from the field edge).  Anything inside
     # this margin is hard for a 17×15 robot to physically reach because
@@ -787,7 +1032,7 @@ class HeuristicBot:
     # against each other after being knocked free of their starting
     # cups, making intake unreliable.
     WALL_MARGIN_IN  = 9.0
-    WALL_PENALTY_IN = 100.0   # add this many "virtual inches" to wall items
+    WALL_PENALTY_IN = 100.0
 
     def _is_wall_pinned(self, x: float, y: float) -> bool:
         return (x < self.WALL_MARGIN_IN or x > 144.0 - self.WALL_MARGIN_IN or
@@ -843,6 +1088,7 @@ class HeuristicBot:
 
     def _scan_pins(self, my_pos, partner_pins,
                    skip_blacklist: bool, skip_partner: bool):
+        in_auton = self._is_in_autonomous()
         best, best_sc = None, -1e9
         for p in self.sim.pins:
             if p.scored or p.carried_by is not None:
@@ -857,6 +1103,11 @@ class HeuristicBot:
             if val <= 0:
                 continue
             px, py = float(p.body.position.x), float(p.body.position.y)
+            # Auton wedge restriction: white tape walls prevent us from
+            # reaching any pin outside our wedge.  Skip rather than waste
+            # the trip pathing toward the anchor fallback.
+            if in_auton and not self._is_in_my_auton_wedge(px, py):
+                continue
             d = self._dist(my_pos, (px, py))
             if self._is_wall_pinned(px, py):
                 d += self.WALL_PENALTY_IN
@@ -896,6 +1147,18 @@ class HeuristicBot:
 
     def _scan_cups(self, my_pos, partner_cups,
                    skip_blacklist: bool, skip_partner: bool):
+        """Pick the closest valuable cup.  v12 — B1 nested-pin bonus:
+        cups containing a YELLOW_YELLOW pin are dramatically more valuable
+        because intaking the cup ALSO extracts the nested pin (see
+        Robot.try_intake nested-pin extraction).  We approximate this by
+        subtracting "virtual inches" from the cup's effective distance,
+        so a cup with a yellow pin inside is preferred even if 30+ inches
+        farther than an empty cup.  Multiplier scales with live yellow
+        ownership — if opp owns the toggles, the nested yellow is a
+        liability, not a bonus.
+        """
+        yellow_mult = self._live_yellow_multiplier()
+        in_auton = self._is_in_autonomous()
         best, best_d = None, float("inf")
         for c in self.sim.cups:
             if c.scored or c.carried_by is not None:
@@ -906,9 +1169,29 @@ class HeuristicBot:
             if skip_partner and cid in partner_cups:
                 continue
             cx, cy = float(c.body.position.x), float(c.body.position.y)
+            if in_auton and not self._is_in_my_auton_wedge(cx, cy):
+                continue
             d = self._dist(my_pos, (cx, cy))
             if self._is_wall_pinned(cx, cy):
                 d += self.WALL_PENALTY_IN
+            # Nested pin bonus / penalty.
+            nested = getattr(c, 'contains_pin', None)
+            if nested is not None:
+                up = getattr(nested, 'up_half_name', None)
+                dn = getattr(nested, 'down_half_name', None)
+                if up == "yellow" and dn == "yellow":
+                    # Full yellow_yellow — worth +20 pts if we control toggle.
+                    # Subtract 40 virtual inches if friendly, add 30 if opp.
+                    if yellow_mult >= 1.0:
+                        d -= 40.0
+                    elif yellow_mult <= -0.5:
+                        d += 30.0
+                elif up == "yellow" or dn == "yellow":
+                    # Half-yellow nested — modest bonus / penalty.
+                    if yellow_mult >= 1.0:
+                        d -= 15.0
+                    elif yellow_mult <= -0.5:
+                        d += 10.0
             if d < best_d:
                 best_d, best = d, c
         return best, best_d
@@ -916,9 +1199,40 @@ class HeuristicBot:
     def _action_get_pin(self, a: dict) -> dict:
         pin = self._pick_best_pin()
         if pin is None:
-            # Field is empty of valuable pins — drift to midfield while we wait.
-            a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
-            self.last_reason = "no_pin_available"
+            # Field is empty of valuable pins.  Don't drift — go press an
+            # un-claimed alliance toggle so we keep producing value.  If all
+            # toggles are claimed, position near the highest-value goal so we
+            # are first to react when an element appears.
+            tog = self._find_useful_toggle()
+            if tog is not None:
+                tx, ty = float(tog.x), float(tog.y)
+                if self._dist(self._pos(), (tx, ty)) <= TOGGLE_INTERACTION_RANGE:
+                    a["toggle"] = True
+                    self.last_reason = f"claim_toggle:{tog.toggle_id}"
+                else:
+                    a["left"], a["right"] = self._drive_to((tx, ty), full_speed=True)
+                    self.last_reason = f"go_claim_toggle:{tog.toggle_id}"
+                return a
+            # No toggles left — pre-position near the nearest alliance goal
+            # that still needs a pin, so we score immediately when one appears.
+            best_g = None
+            best_d = float("inf")
+            my_pos = self._pos()
+            for g in self.sim.goals:
+                if not self._valid_goal_for_me(g):
+                    continue
+                if self._goal_needs(g) != "pin":
+                    continue
+                d = self._dist(my_pos, (g.x, g.y))
+                if d < best_d:
+                    best_d, best_g = d, g
+            if best_g is not None:
+                a["left"], a["right"] = self._drive_to(
+                    self._approach_goal_point(best_g), full_speed=True)
+                self.last_reason = f"prepos_at_goal:{best_g.goal_id}"
+            else:
+                a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
+                self.last_reason = "roam_midfield"
             return a
         px, py = float(pin.body.position.x), float(pin.body.position.y)
         d = self._dist(self._pos(), (px, py))
@@ -1003,6 +1317,16 @@ class HeuristicBot:
         # Fire intake when a VALUABLE element is within the sim's
         # effective intake range (intake radius from body OR front face).
         # Skip opp pins and skip wall-pinned objects.
+        #
+        # v14 — Allow opportunistic intake DURING match-load trips too.
+        # If we already have a cup and pick up a pin, both slots fill and
+        # _should_match_load returns False (good — score before another
+        # ML trip).  If we have a pin and pick up a cup, same.  Either
+        # way the bot is more productive than ignoring elements on its
+        # path to the loading zone.  But ONLY allow intake of the slot
+        # we have OPEN — never pick up the type we already hold (causes
+        # an infinite "intake → drop → re-intake" loop with the sim's
+        # possession check).
         if not scoring and not a["intake"]:
             r = self.robot
             need_pin = r.carrying_pin is None
@@ -1074,12 +1398,26 @@ class HeuristicBot:
                 self._cup_blacklist.add(self._target_cup_id)
                 self._target_cup_id = None
                 self._target_cup_steps = 0
-            # Abort any in-flight match-load trip — the path is blocked.
-            # Apply a long cooldown so we don't loop right back into it.
+            # Abort any in-flight match-load trip.  Cooldown depends on
+            # how close we got: if stuck near the zone (within 25") it was
+            # probably just slow squeezing into the wall corner — short
+            # cooldown so we retry quickly.  If stuck far from zone, the
+            # path is genuinely blocked — long cooldown to try other tasks.
             if self._match_load_commit > 0:
+                my = self._pos()
+                zones = self._loading_zone_targets()
+                min_d = min(self._dist(my, z) for z in zones)
                 self._match_load_commit = 0
                 self._target_load_zone  = None
-                self._ml_cooldown_steps = 600   # 30 s back-off
+                if min_d <= 25.0:
+                    self._ml_cooldown_steps = 160   # 8 s — just retry approach
+                else:
+                    self._ml_cooldown_steps = 600   # 30 s — path blocked
+            # Also blacklist any in-pursuit high-value toggle.
+            if self._hv_toggle_target_id is not None:
+                self._hv_toggle_blacklist.add(self._hv_toggle_target_id)
+                self._hv_toggle_target_id = None
+                self._hv_toggle_steps = 0
             # Start an escape burst.  Alternate direction for variety.
             self._escape_dir   = -self._escape_dir
             self._escape_steps = self.ESCAPE_DURATION
@@ -1111,6 +1449,18 @@ class HeuristicBot:
         # so it overrides even endgame park if we're physically blocked).
         self._update_stuck_state()
 
+        # Decrement match-load counters unconditionally every frame so they
+        # tick correctly even when other priorities return early.
+        if self._just_loaded_steps > 0:
+            self._just_loaded_steps -= 1
+        if self._match_load_commit > 0:
+            self._match_load_commit -= 1
+            if self._match_load_commit == 0:
+                self._ml_cooldown_steps = 120   # ~6 s back-off on expiry
+                self._target_load_zone  = None
+        if self._ml_cooldown_steps > 0:
+            self._ml_cooldown_steps -= 1
+
         has_pin = self.robot.carrying_pin is not None
         has_cup = self.robot.carrying_cup is not None
 
@@ -1122,12 +1472,44 @@ class HeuristicBot:
         endgame = (self.sim.rules_engine.endgame_active and
                    self.sim.time_remaining is not None)
 
-        # ── 1. ENDGAME PARK ─────────────────────────────────────────── #
+        # ── 1. ENDGAME PARK (F1 — park vs score breakpoint) ──────────── #
+        # Parking gives a FIXED +8 pts.  Scoring gives variable pts.
+        # We park unconditionally inside ENDGAME_PARK_TIME — too risky to
+        # score then park in <3s.  BUT in the 3-6s window we compare:
+        # if there's a >10pt scoring opportunity within ~3s travel, take
+        # it; otherwise start parking early.
         if endgame and self.sim.time_remaining <= self.ENDGAME_PARK_TIME:
             esc = self._maybe_escape_action()
             if esc is not None: return esc
             a["left"], a["right"] = self._drive_to(self._park_target(), full_speed=True)
             self.last_reason = "endgame_park"
+            return a
+        if (endgame and (has_pin or has_cup) and
+                self.sim.time_remaining is not None and
+                self.sim.time_remaining <= 6.0 and
+                self.sim.time_remaining > self.ENDGAME_PARK_TIME):
+            # Inside 3-6s window — compare best score vs park value.
+            # If best score is much better than +8 park AND reachable in
+            # less than (time_remaining - park_buffer) seconds, score.
+            # Otherwise, start parking now so we make it in time.
+            best_g = self._best_scoreable_goal(has_pin, has_cup)
+            if best_g is not None:
+                v = self._score_value_now(best_g, has_pin, has_cup)
+                travel_to_score = self._travel_time_to((best_g.x, best_g.y))
+                travel_to_park  = self._travel_time_to(self._park_target())
+                # We need: travel_to_score + 0.5s (score) + travel_to_park
+                # to fit inside time_remaining.  Add 0.5s safety margin.
+                total_needed = travel_to_score + 0.5 + travel_to_park + 0.5
+                if v >= 10.0 and total_needed < self.sim.time_remaining:
+                    # Worth scoring then parking.
+                    a["left"], a["right"] = self._drive_to(
+                        self._approach_goal_point(best_g), full_speed=True)
+                    self.last_reason = f"endgame_score_then_park:{best_g.goal_id}"
+                    self._target_goal_id = best_g.goal_id
+                    return a
+            # Park immediately — value of +8 dominates any small score.
+            a["left"], a["right"] = self._drive_to(self._park_target(), full_speed=True)
+            self.last_reason = "endgame_park_early"
             return a
 
         # ── 2. ENDGAME DUMP ─────────────────────────────────────────── #
@@ -1151,10 +1533,108 @@ class HeuristicBot:
         if score_now is not None:
             return score_now
 
+        # ── 3.5. POST-SCORE TOGGLE CLAIM (v14) ─────────────────────────── #
+        # Just scored a pin/cup that exposed yellow halves on a non-friendly
+        # toggle's goal — IMMEDIATELY claim that toggle so visible yellow
+        # halves are credited to us (+10 pts each).
+        # Decrement window each step; expire after 60 steps (3s).
+        if self._post_score_toggle_steps > 0:
+            self._post_score_toggle_steps -= 1
+            if self._post_score_toggle_steps == 0:
+                self._post_score_toggle_id = None
+        if self._post_score_toggle_id is not None:
+            tog = next((t for t in self.sim.toggles
+                        if t.toggle_id == self._post_score_toggle_id), None)
+            if tog is None or tog.owner == self.alliance:
+                # Mission accomplished or toggle no longer exists.
+                self._post_score_toggle_id = None
+                self._post_score_toggle_steps = 0
+            else:
+                tx, ty = float(tog.x), float(tog.y)
+                d_tog = self._dist(self._pos(), (tx, ty))
+                if d_tog <= TOGGLE_INTERACTION_RANGE and getattr(self, '_env_cd_toggle', 0) == 0:
+                    a["toggle"] = True
+                    self.last_reason = f"post_score_toggle:{tog.toggle_id}"
+                    return a
+                a["left"], a["right"] = self._drive_to((tx, ty), full_speed=True)
+                self.last_reason = f"go_post_score_toggle:{tog.toggle_id}"
+                return a
+
         # ── 4. STUCK ESCAPE ────────────────────────────────────────────── #
         esc = self._maybe_escape_action()
         if esc is not None:
             return esc
+
+        # ── 4.4. HIGH-VALUE TOGGLE FLIP (E1) — only as opportunistic ──── #
+        # Only fire if we're already WITHIN TOGGLE_INTERACTION_RANGE of an
+        # opp-controlled toggle with high swing.  No "drive to it" mode —
+        # the opportunistic _finalize_action toggle injection already
+        # handles claim-on-passing, and standalone pursuit caused blue2
+        # to spend 70s driving to an unreachable toggle.
+        if not has_pin and not has_cup:
+            hv_tog = self._find_high_value_toggle_flip()
+            if hv_tog is not None:
+                tx, ty = float(hv_tog.x), float(hv_tog.y)
+                d_tog = self._dist(self._pos(), (tx, ty))
+                if d_tog <= TOGGLE_INTERACTION_RANGE:
+                    a["toggle"] = True
+                    self.last_reason = f"hv_flip_toggle:{hv_tog.toggle_id}"
+                    return a
+
+        # ── 4.5. MATCH LOAD (red1/blue1 only) ──────────────────────────── #
+        # This must come BEFORE goal-approach (priority 6) so a committed
+        # match-load trip is not preempted by opportunistic scoring near
+        # alliance-side goals en route to the loading zone.
+        #
+        # Post-load tight intake: drive straight to the spawn and grab the
+        # loaded element(s) before the wall-pin heuristic makes the bot
+        # drive away.  Selection 1/2 spawns a cup AND a separate nested
+        # pin as TWO physics objects at the same corner.  Robot.try_intake
+        # grabs the loose pin first; if we exited on the first intake we'd
+        # leave the cup behind.  So: keep returning to spawn while EITHER
+        # slot is empty AND an uncarried element still exists near spawn.
+        if (self._just_loaded_steps > 0 and self._last_load_spawn is not None
+                and not (has_pin and has_cup)
+                and self._element_loose_near(self._last_load_spawn)):
+            spawn = self._last_load_spawn
+            d = self._dist(self._pos(), spawn)
+            a["intake"] = True
+            if d <= INTAKE_RADIUS * 1.5:
+                a["left"], a["right"] = self._drive_to(
+                    spawn, full_speed=False, avoid_obstacles=False)
+                a["left"]  *= 0.4
+                a["right"] *= 0.4
+            else:
+                a["left"], a["right"] = self._drive_to(
+                    spawn, full_speed=True, avoid_obstacles=False)
+            self.last_reason = "intake_loaded"
+            return a
+        if self._just_loaded_steps == 0:
+            self._last_load_spawn = None
+
+        # Refresh commit if conditions warrant a new trip.
+        if self._should_match_load(has_pin, has_cup):
+            self._match_load_commit = 60
+
+        if self._match_load_commit > 0 and (not has_pin or not has_cup):
+            zone_idx, lz_pt = self._pick_loading_zone()
+            self._target_load_zone = zone_idx
+            spawn = self._spawn_for_loading_zone(zone_idx)
+            if self._in_loading_zone():
+                a["match_load"] = True
+                a["left"], a["right"] = 0.0, 0.0
+                self._last_load_spawn   = spawn
+                self._just_loaded_steps = 30   # ~1.5 s window
+                self._match_load_commit = 0    # trip done
+                self.last_reason = f"match_load_fire:{zone_idx}"
+                return a
+            a["left"], a["right"] = self._drive_to(
+                lz_pt, full_speed=True, avoid_obstacles=True)
+            self.last_reason = f"drive_to_match_load:{zone_idx}"
+            return a
+
+        if self._match_load_commit == 0:
+            self._target_load_zone = None
 
         # Compute target_goal once for use across the remaining priorities.
         target_goal = self._best_scoreable_goal(has_pin, has_cup)
@@ -1192,13 +1672,32 @@ class HeuristicBot:
             d = self._dist(self._pos(), (target_goal.x, target_goal.y))
             self._target_goal_id = target_goal.goal_id
             if d <= self.SCORE_BRAKE_RADIUS:
-                # Inside brake radius but score_now didn't fire.  That's
-                # because the goal is unservable with our exact inventory
-                # right now (e.g. we have pin+cup but goal is full, picked
-                # only as fallback).  Drive AWAY toward the next useful
-                # task instead of circling in place.
+                # Inside brake radius but score_now didn't fire — this goal
+                # is unservable with our current inventory.  Pick a concrete
+                # next target instead of drifting to midfield.
+                #   - If we can dump anywhere else useful: drive there.
+                #   - Else if a toggle would help: press it.
+                #   - Else go to the SECOND-best goal.
+                alt = self._nearest_dump_goal(has_pin, has_cup)
+                if alt is not None and alt.goal_id != target_goal.goal_id:
+                    self._target_goal_id = alt.goal_id
+                    a["left"], a["right"] = self._drive_to(
+                        self._approach_goal_point(alt), full_speed=True)
+                    self.last_reason = f"redirect_goal:{alt.goal_id}"
+                    return a
+                tog = self._find_useful_toggle()
+                if tog is not None:
+                    tx, ty = float(tog.x), float(tog.y)
+                    if self._dist(self._pos(), (tx, ty)) <= TOGGLE_INTERACTION_RANGE:
+                        a["toggle"] = True
+                        self.last_reason = f"flip_toggle_unserve:{tog.toggle_id}"
+                    else:
+                        a["left"], a["right"] = self._drive_to((tx, ty), full_speed=True)
+                        self.last_reason = f"go_toggle_unserve:{tog.toggle_id}"
+                    return a
+                # Last resort: back off to midfield to find new opportunities.
                 a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
-                self.last_reason = f"abandon_unservable_goal:{target_goal.goal_id}"
+                self.last_reason = f"backoff_unservable:{target_goal.goal_id}"
                 return a
             a["left"], a["right"] = self._drive_to(
                 self._approach_goal_point(target_goal), full_speed=True)
@@ -1211,64 +1710,6 @@ class HeuristicBot:
         # here from priority 6 in v10.0, so it only fires when we genuinely
         # have nothing to do at any goal right now.
         self._target_goal_id = None
-
-        # ── 6.8. MATCH LOAD (red1/blue1 only) ──────────────────────────── #
-        # Decrement counters every step regardless of which branch fires.
-        if self._just_loaded_steps > 0:
-            self._just_loaded_steps -= 1
-        if self._match_load_commit > 0:
-            self._match_load_commit -= 1
-            if self._match_load_commit == 0:
-                # Commit window expired without firing — apply back-off so
-                # we don't pound an unreachable zone every step.
-                self._ml_cooldown_steps = 120   # ~6 s
-                self._target_load_zone  = None
-        if self._ml_cooldown_steps > 0:
-            self._ml_cooldown_steps -= 1
-
-        # Post-load tight intake: drive straight to the spawn and grab it
-        # before the wall-pin penalty in _pick_best_* makes us drive away.
-        if (self._just_loaded_steps > 0 and self._last_load_spawn is not None
-                and (not has_pin or not has_cup)):
-            spawn = self._last_load_spawn
-            d = self._dist(self._pos(), spawn)
-            if d <= INTAKE_RADIUS * 2.0:
-                a["intake"] = True
-                a["left"], a["right"] = self._drive_to(spawn, full_speed=False)
-                a["left"]  *= 0.5
-                a["right"] *= 0.5
-                self.last_reason = "intake_loaded"
-                return a
-        if self._just_loaded_steps == 0:
-            self._last_load_spawn = None
-
-        # Start a new trip if conditions warrant.
-        if self._should_match_load(has_pin, has_cup):
-            self._match_load_commit = 60   # ~3 s commitment
-
-        if self._match_load_commit > 0 and (not has_pin or not has_cup):
-            zone_idx, lz_pt = self._pick_loading_zone()
-            self._target_load_zone = zone_idx
-            spawn = self._spawn_for_loading_zone(zone_idx)
-            if self._in_loading_zone():
-                a["match_load"] = True
-                a["left"], a["right"] = 0.0, 0.0
-                self._last_load_spawn   = spawn
-                self._just_loaded_steps = 30   # ~1.5 s window
-                self._match_load_commit = 0    # trip done
-                self.last_reason = f"match_load_fire:{zone_idx}"
-                return a
-            # Disable obstacle deflection — the loading-zone corner is
-            # often shadowed by alliance-side goals; deflection routes the
-            # bot into walls.  Let physics handle the bump and the wall.
-            a["left"], a["right"] = self._drive_to(
-                lz_pt, full_speed=True, avoid_obstacles=False)
-            self.last_reason = f"drive_to_match_load:{zone_idx}"
-            return a
-
-        # Not heading to the loading zone — release our claim on it.
-        if self._match_load_commit == 0:
-            self._target_load_zone = None
 
         if not has_pin and not has_cup:
             # Both slots empty.  Decide pin vs cup based on alliance/neutral
@@ -1308,31 +1749,74 @@ class HeuristicBot:
             return self._action_get_pin(a)
 
         if has_pin and not has_cup:
-            # We have a pin but no goal needs one.  Fetch a cup so we can
-            # take advantage of any pin-on-top goal (or set one up).
+            # Pin in hand but no goal needs ONLY a pin.  Fetch a cup so we
+            # can complete a stack.
             cup = self._pick_best_cup()
             if cup is not None:
                 return self._action_get_cup(a, cup)
-            # No cups available — keep the pin and roam.
+            # No cups on field either.  Don't roam — DUMP the pin at the
+            # nearest goal that can take it (even at suboptimal value),
+            # then go re-acquire.  Sitting on a pin we can't use is waste.
+            dump_goal = self._nearest_dump_goal(has_pin=True, has_cup=False)
+            if dump_goal is not None:
+                self._target_goal_id = dump_goal.goal_id
+                a["left"], a["right"] = self._drive_to(
+                    self._approach_goal_point(dump_goal), full_speed=True)
+                self.last_reason = f"dump_pin_at:{dump_goal.goal_id}"
+                return a
+            # No goal can take the pin (all full).  Press a toggle to
+            # change ownership so the goal becomes scoreable for us.
+            tog = self._find_useful_toggle()
+            if tog is not None:
+                a["left"], a["right"] = self._drive_to(
+                    (float(tog.x), float(tog.y)), full_speed=True)
+                self.last_reason = f"flip_toggle_for_pin:{tog.toggle_id}"
+                return a
             a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
-            self.last_reason = "carry_pin_idle"
+            self.last_reason = "carry_pin_search"
             return a
 
         if not has_pin and has_cup:
-            # We have a cup but no goal needs one (i.e. all goals are empty
-            # or full).  Fetch a pin to enable the cup somewhere.
+            # Cup in hand but no goal can take a cup.  Fetch a pin so we
+            # can place a pin first (cups need a pin underneath).
             pin = self._pick_best_pin()
             if pin is not None:
                 return self._action_get_pin(a)
+            # No pins available.  Try to dump the cup at any goal that has
+            # a top-pin (needs a cup).
+            dump_goal = self._nearest_dump_goal(has_pin=False, has_cup=True)
+            if dump_goal is not None:
+                self._target_goal_id = dump_goal.goal_id
+                a["left"], a["right"] = self._drive_to(
+                    self._approach_goal_point(dump_goal), full_speed=True)
+                self.last_reason = f"dump_cup_at:{dump_goal.goal_id}"
+                return a
+            tog = self._find_useful_toggle()
+            if tog is not None:
+                a["left"], a["right"] = self._drive_to(
+                    (float(tog.x), float(tog.y)), full_speed=True)
+                self.last_reason = f"flip_toggle_for_cup:{tog.toggle_id}"
+                return a
             a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
-            self.last_reason = "carry_cup_idle"
+            self.last_reason = "carry_cup_search"
             return a
 
-        # Both slots full and no scoreable goal — every goal must be full
-        # or unmatched.  Roam toward midfield; we'll be in scoring range
-        # eventually as opponents change goal state.
+        # Both slots full and no scoreable goal — first try to flip a
+        # toggle to enable scoring at SOME goal.  Otherwise patrol midfield
+        # (mobile, not idle — we'll spot scoring opportunities as goal
+        # state changes from opponent activity).
+        tog = self._find_useful_toggle()
+        if tog is not None:
+            tx, ty = float(tog.x), float(tog.y)
+            if self._dist(self._pos(), (tx, ty)) <= TOGGLE_INTERACTION_RANGE:
+                a["toggle"] = True
+                self.last_reason = f"flip_toggle_full_inv:{tog.toggle_id}"
+            else:
+                a["left"], a["right"] = self._drive_to((tx, ty), full_speed=True)
+                self.last_reason = f"go_toggle_full_inv:{tog.toggle_id}"
+            return a
         a["left"], a["right"] = self._drive_to(MIDFIELD_CENTER, full_speed=True)
-        self.last_reason = "full_inventory_idle"
+        self.last_reason = "patrol_midfield"
         return a
 
     # ── Endgame dump helpers ──────────────────────────────────────────── #
@@ -1380,10 +1864,58 @@ class HeuristicBot:
 
     # ── Policy-action API ─────────────────────────────────────────────── #
 
+    # v13 — Env-wrapper cooldown mirroring.  The env_wrapper applies
+    # cooldowns to discrete actions (score, intake, toggle, match_load,
+    # flip) — if the bot fires the action while the env's cooldown is
+    # active, the action is silently dropped.  To avoid wasting decision
+    # cycles spamming a gated action, the bot mirrors the same cooldowns.
+    # Values mirror config/hyperparameters.py.
+    _ENV_CD_INTAKE     = 5
+    _ENV_CD_SCORE      = 10
+    _ENV_CD_TOGGLE     = 100
+    _ENV_CD_MATCH_LOAD = 30
+    _ENV_CD_FLIP       = 40
+
     def get_policy_action(self):
         """Return `(cont, disc)` numpy arrays matching env_wrapper format."""
         import numpy as np
+        # Initialize env-cooldown counters if missing (lazy init for
+        # backward compat with existing instances).
+        for attr in ("_env_cd_intake", "_env_cd_score",
+                     "_env_cd_toggle", "_env_cd_match_load",
+                     "_env_cd_flip"):
+            if not hasattr(self, attr):
+                setattr(self, attr, 0)
+        # Decrement all env cooldowns once per call.
+        for attr in ("_env_cd_intake", "_env_cd_score",
+                     "_env_cd_toggle", "_env_cd_match_load",
+                     "_env_cd_flip"):
+            if getattr(self, attr) > 0:
+                setattr(self, attr, getattr(self, attr) - 1)
         a = self.get_sim_action()
+        # Gate actions that are on cooldown — env would drop them anyway.
+        # Saves wasted cycles by letting the bot do something else.
+        if self._env_cd_intake > 0 and a.get("intake"):
+            a["intake"] = False
+        if self._env_cd_score > 0:
+            if a.get("score_pin"):  a["score_pin"]  = False
+            if a.get("score_cup"):  a["score_cup"]  = False
+        if self._env_cd_toggle > 0 and a.get("toggle"):
+            a["toggle"] = False
+        if self._env_cd_match_load > 0 and a.get("match_load"):
+            a["match_load"] = False
+        if self._env_cd_flip > 0:
+            if a.get("flip_pin"):  a["flip_pin"]  = False
+            if a.get("flip_cup"):  a["flip_cup"]  = False
+        # Set cooldowns after FIRING (whether or not the env actually
+        # accepts; the env's gate matches ours so this stays in sync).
+        if a.get("intake"):     self._env_cd_intake     = self._ENV_CD_INTAKE
+        if a.get("score_pin"):  self._env_cd_score      = self._ENV_CD_SCORE
+        if a.get("score_cup"):  self._env_cd_score      = self._ENV_CD_SCORE
+        if a.get("toggle"):     self._env_cd_toggle     = self._ENV_CD_TOGGLE
+        if a.get("match_load"): self._env_cd_match_load = self._ENV_CD_MATCH_LOAD
+        if a.get("flip_pin"):   self._env_cd_flip       = self._ENV_CD_FLIP
+        if a.get("flip_cup"):   self._env_cd_flip       = self._ENV_CD_FLIP
         # Track what type of element we last intaked so the chain-stacking
         # bias in section 6 knows which element to fetch next.
         if a["intake"]:
@@ -1416,12 +1948,23 @@ class HeuristicBot:
 
     def _loading_zone_targets(self) -> List[Tuple[float, float]]:
         """Two corner waypoints inside our alliance's loading zone.
-        Index 0 = top corner (y<24), index 1 = bottom corner (y>120).
-        Stays clear of walls (x in [9,135], y in [9,135] keeps us un-pinned).
+        Index 0 = NORTH corner (y>120), index 1 = SOUTH corner (y<24).
+
+        v13 — Deeper blue target.  Red's target (10, 128) lands at the zone
+        boundary (x<12 fires the zone check) and the bot reaches center
+        x≈10 facing north — west extent is just 7.5" so center can sit
+        right against the wall and still satisfy x<12.  Blue's symmetric
+        target (134, 128) DOESN'T work because the bot approaches with
+        some south-east heading from its starting position (72,136) and
+        its east-extent is >9" at any non-purely-east angle, so center
+        stops at ~131.5 — fails the x>132 zone check.  Pushing blue's
+        target to (140, 128) keeps the bot driving east through the
+        wall-stop, letting the center reach its wall-limited maximum
+        which IS inside the zone.
         """
         if self.alliance == "red":
-            return [(10.0, 16.0), (10.0, 128.0)]
-        return [(134.0, 16.0), (134.0, 128.0)]
+            return [(10.0, 128.0), (10.0, 16.0)]
+        return [(140.0, 128.0), (140.0, 16.0)]
 
     def _pick_loading_zone(self) -> Tuple[int, Tuple[float, float]]:
         """Choose which loading-zone corner to use.
@@ -1466,10 +2009,37 @@ class HeuristicBot:
                    key=lambda t: self._dist(my, t))
 
     def _spawn_for_loading_zone(self, idx: int) -> Tuple[float, float]:
-        """Where the spawned cup/pin lands for this loading zone index."""
+        """Where the spawned cup/pin lands for this loading zone index.
+        Spawn y is derived from the zone corner y-coordinate (not the index)
+        so it stays correct regardless of zone ordering in _loading_zone_targets.
+        """
+        zones = self._loading_zone_targets()
+        lz_y = zones[idx][1]
         sx = 6.0 if self.alliance == "red" else 138.0
-        sy = 12.0 if idx == 0 else 132.0
+        sy = 132.0 if lz_y > 72 else 12.0   # north zone → spawn at y=132, south → y=12
         return (sx, sy)
+
+    def _element_loose_near(self, point: Tuple[float, float],
+                            radius: float = 14.0) -> bool:
+        """True if any uncarried, unscored pin or cup sits within `radius`
+        of `point`.  Used by post-load tight-intake to know whether the
+        loader still has something to fetch — match-load selections 1/2
+        spawn cup+pin as two physics objects, and after grabbing the pin
+        first the cup is still loose at the spawn.
+        """
+        for p in self.sim.pins:
+            if p.scored or p.carried_by is not None:
+                continue
+            if self._dist(point, (float(p.body.position.x),
+                                  float(p.body.position.y))) <= radius:
+                return True
+        for c in self.sim.cups:
+            if c.scored or c.carried_by is not None:
+                continue
+            if self._dist(point, (float(c.body.position.x),
+                                  float(c.body.position.y))) <= radius:
+                return True
+        return False
 
     def _in_loading_zone(self) -> bool:
         x, y = self._pos()
@@ -1477,25 +2047,37 @@ class HeuristicBot:
             return x < 12.0 and (y < 24.0 or y > 120.0)
         return x > 132.0 and (y < 24.0 or y > 120.0)
 
-    def _has_reachable_loading_zone(self, max_d: float = 55.0) -> bool:
-        """True if at least one loading-zone corner is within max_d AND
-        has no goal blocking the straight path from our current position.
+    def _has_reachable_loading_zone(self, max_d: float = 70.0) -> bool:
+        """True if at least one loading-zone corner is within max_d inches.
 
-        Used to gate match-load decisions: avoids committing to a trip we
-        cannot complete because alliance-side goals shadow the corner.
+        Distance-only gate (no line-of-sight check here).  The LoS check is
+        used in _pick_loading_zone as a PREFERENCE (prefer clear paths) but
+        NOT as a hard requirement for triggering the trip.  Keeping LoS out
+        of this gate prevents commit-expiry when the robot drifts slightly
+        during its initial spin manoeuvre: even from x≈18 the corner is still
+        within 70" so the commit stays alive and the robot continues driving.
+
+        max_d=70" covers both:
+          • red1  start (10,72)  → corners (10,16)/(10,128)  = 56"
+          • blue1 start (72,136) → corner  (134,128)          = 62.5"
         """
         my = self._pos()
         for pt in self._loading_zone_targets():
-            if self._dist(my, pt) > max_d:
-                continue
-            if self._line_clear_of_goals(my, pt):
+            if self._dist(my, pt) <= max_d:
                 return True
         return False
 
     def _line_clear_of_goals(self, a: Tuple[float, float],
                               b: Tuple[float, float]) -> bool:
-        """True if the segment a→b doesn't pass through any goal's
-        collision radius (goal radius ~10 + robot half-width ~8.5 → 19).
+        """True if the segment a→b doesn't physically collide with any goal.
+
+        Goals in pymunk use `radius * 0.25` as their physics body radius
+        (regular goals: 10 * 0.25 = 2.5").  The robot's half-width when
+        facing along the path is ~7.5".  Required clearance from goal centre
+        to robot path centre ≥ 2.5 + 7.5 = 10".  We use 12" for a small
+        safety margin — enough to allow the wall-hugging approaches to the
+        loading-zone corners (path is ~14" from nearby goals) while still
+        blocking paths that genuinely cut through a goal body.
         """
         ax, ay = a; bx, by = b
         dx, dy = bx - ax, by - ay
@@ -1508,7 +2090,7 @@ class HeuristicBot:
             t = max(0.0, min(1.0, t))
             cx = ax + t * dx
             cy = ay + t * dy
-            if math.hypot(g.x - cx, g.y - cy) < 19.0:
+            if math.hypot(g.x - cx, g.y - cy) < 12.0:
                 return False
         return True
 
@@ -1544,113 +2126,131 @@ class HeuristicBot:
                 int(s.blue_yellow_pins_left))
 
     def _have_loose_yellow_yellow_on_field(self) -> bool:
-        """True if a yellow_yellow pin (both halves yellow) is loose.
+        """True if a yellow_yellow pin (both halves yellow) is loose and
+        accessible (not nested inside a cup, not already scored/carried,
+        not wall-pinned past the reachability margin).
 
         match_load selection 2 spawns a 'yellow_yellow' pin specifically —
         so checking only for that color matches the value of the load.
-        red_yellow / blue_yellow pins (one yellow half) do not justify
-        skipping a match load.
+        Nested yy pins (inside cups in goals or on the field) don't count
+        because they require the cup to be scored/intaked first; until then,
+        the match-load route is the only reliable way to get a fresh yy.
         """
         for p in self.sim.pins:
             if getattr(p, 'scored', False):
                 continue
             if getattr(p, 'carried_by', None) is not None:
                 continue
+            if getattr(p, 'is_nested', False):
+                continue  # still inside a cup — not directly grababble
             up = getattr(p, 'up_half_name', None)
             dn = getattr(p, 'down_half_name', None)
             if up == "yellow" and dn == "yellow":
+                px, py = float(p.body.position.x), float(p.body.position.y)
+                if self._is_wall_pinned(px, py):
+                    continue  # physically unreachable
                 return True
         return False
+
+    def _is_in_autonomous(self) -> bool:
+        """True if the match is in the autonomous period — match-loading is
+        prohibited, and crossing the diagonal tape walls is physically
+        blocked.  The bot must avoid both."""
+        return self.sim.match_phase == "autonomous"
 
     def _should_match_load(self, has_pin: bool, has_cup: bool) -> bool:
         """Decide whether the bot should head to the loading zone.
 
-        Triggers (conservative — match-load competes with normal fetch, so
-        we only fire when match-load is CLEARLY the right choice):
-          1. Empty hands + we still have yellow inventory + no loose
-             yellow_yellow exists on the field.  Match-load is the only
-             remaining route to +20 yellow scoring.
-          2. Empty hands + the entire field is depleted of non-wall
-             fetchable elements + we have inventory.  Pure fallback.
-          3. Partial inventory + the missing element type is genuinely
-             unavailable on the field.
+        v14 — AGGRESSIVE CYCLING for red1/blue1:
+          Match-load inventory holds far more elements (10 cups + 12 pins
+          + 1 yellow per alliance = 23 each side) than the field starts
+          with (~12 pins + 16 cups across the WHOLE field, half ours).
+          So red1/blue1 should treat the loading zone as their PRIMARY
+          source of elements and cycle (load → score → load → score)
+          throughout the match.  Field elements are a side gig picked up
+          en route via opportunistic intake.
 
-        After a failed trip (commit timed out without firing) we back
-        off via _ml_cooldown_steps so we don't pound the same path forever.
+          Triggers:
+            1. Empty hands + any inventory + loading zone reachable.
+               → Just go.  Match-load is the dominant strategy.
+            2. Partial inventory (cup OR pin, not both) + the OTHER slot
+               can be filled by match-load:
+                 - has_pin: cup-alone (sel 3) fills cup slot
+                 - has_cup: pin-alone (sel 4 or 5) fills pin slot
+               → Cycle continues without dropping back to field-fetch.
+            3. Both hands full → False (must score first).
         """
         if not self._can_match_load():
+            return False
+        # VEX VRC rule: no match-loading during autonomous.
+        if self._is_in_autonomous():
             return False
         if has_pin and has_cup:
             return False
         if self._ml_cooldown_steps > 0:
             return False
-        # Skip in the final ~20 s of driver — load/score/park needs ~15 s.
+        # Skip in the final ~15 s of driver — load/score/park needs time.
         if (self.sim.match_phase == "driver" and
                 self.sim.time_remaining is not None and
-                self.sim.time_remaining <= 20.0):
+                self.sim.time_remaining <= 15.0):
             return False
         cups, ap, yp = self._inventory_left()
         if cups + ap + yp == 0:
             return False
-
-        # Distance + line-of-sight gate: only start a trip if a loading
-        # zone corner is close (≤45") AND no goal blocks the direct path.
-        # Without LoS check the bot wedges between alliance-side goals
-        # (e.g. (120,48)) and the wall and wastes time oscillating.
         if not self._has_reachable_loading_zone():
             return False
+        my = self._pos()
+        loading_d = self._dist(my, self._nearest_loading_zone())
 
-        # CASE 1 — yellow pin opportunity, no comparable loose yy left.
-        if (not has_pin and not has_cup and yp > 0 and cups > 0 and
-                not self._have_loose_yellow_yellow_on_field()):
+        # ── CASE 1 — Empty hands + ANY inventory: ALWAYS fire ──────────
+        # Match-load round-trip ≈ 8-10s with nested extraction giving
+        # pin+cup in one intake.  Far more efficient than chasing field
+        # elements that are often wall-pinned, nested, or partner-claimed.
+        if not has_pin and not has_cup:
             return True
 
-        # CASE 1b — yellow pin still in inventory AND loading zone is the
-        # FASTEST route to a yellow_yellow.  We compare round-trip cost:
-        # bot → corner (loading_d) vs bot → nearest loose yy (closest_yy_d).
-        # The _has_reachable_loading_zone gate above already proved a
-        # clear-path corner within range exists, so this is purely about
-        # whether match-load wins on speed.
-        if not has_pin and not has_cup and yp > 0 and cups > 0:
-            my = self._pos()
-            loading_d = self._dist(my, self._nearest_loading_zone())
-            closest_yy_d = float("inf")
-            for p in self.sim.pins:
-                if getattr(p, 'scored', False): continue
-                if getattr(p, 'carried_by', None) is not None: continue
-                if getattr(p, 'up_half_name', None) != "yellow": continue
-                if getattr(p, 'down_half_name', None) != "yellow": continue
-                d = self._dist(my, (float(p.body.position.x),
-                                    float(p.body.position.y)))
-                if d < closest_yy_d: closest_yy_d = d
-            if loading_d <= 50.0 and loading_d < closest_yy_d * 0.85:
-                return True
-            # Early-match: if we've held the yellow inventory unused for
-            # most of the match so far, and the corner is reachable,
-            # spend it.  Sitting on unused yp until endgame is wasteful.
-            # autonomous phase OR first half of driver:
-            in_early = (self.sim.match_phase == "autonomous" or
-                        (self.sim.match_phase == "driver" and
-                         self.sim.time_remaining is not None and
-                         self.sim.time_remaining > 60.0))
-            if in_early and loading_d <= 30.0:
-                return True
-
-        # CASE 2 — empty hands, field depleted of fetchable elements.
-        if (not has_pin and not has_cup and
-                not self._any_useful_pin_on_field() and
-                not self._any_useful_cup_on_field()):
+        # ── CASE 2 — Partial inventory + ML can complete the pair ──────
+        # has_pin but no cup: ML sel 3 gives cup (then score pin+cup combo)
+        # has_cup but no pin: ML sel 4/5 gives pin (then score combo)
+        # Distance-gated so the bot doesn't make a 100" detour for a
+        # single element — but we're VERY permissive (80") because the
+        # combo score after refill is worth ~15-20 pts.
+        if has_pin and not has_cup and cups > 0 and loading_d <= 80.0:
             return True
-
-        # CASE 3 — partial inventory, missing-type unavailable.
-        if has_pin and not has_cup and cups > 0:
-            if not self._any_useful_cup_on_field():
-                return True
-        if has_cup and not has_pin and (ap + yp) > 0:
-            if not self._any_useful_pin_on_field():
-                return True
+        if has_cup and not has_pin and (ap + yp) > 0 and loading_d <= 80.0:
+            return True
 
         return False
+
+    def _closest_loose_yy_distance(self) -> float:
+        """Distance to nearest reachable loose yellow_yellow pin (or inf)."""
+        my = self._pos()
+        best = float("inf")
+        for p in self.sim.pins:
+            if getattr(p, 'scored', False): continue
+            if getattr(p, 'carried_by', None) is not None: continue
+            if getattr(p, 'is_nested', False): continue
+            if getattr(p, 'up_half_name', None) != "yellow": continue
+            if getattr(p, 'down_half_name', None) != "yellow": continue
+            px, py = float(p.body.position.x), float(p.body.position.y)
+            if self._is_wall_pinned(px, py): continue
+            d = self._dist(my, (px, py))
+            if d < best: best = d
+        return best
+
+    def _nearest_useful_pin_distance(self) -> float:
+        """Distance to nearest pin with positive _pin_value (or inf)."""
+        my = self._pos()
+        best = float("inf")
+        for p in self.sim.pins:
+            if p.scored or p.carried_by is not None: continue
+            if getattr(p, 'is_nested', False): continue
+            if self._pin_value(p) <= 0: continue
+            px, py = float(p.body.position.x), float(p.body.position.y)
+            if self._is_wall_pinned(px, py): continue
+            d = self._dist(my, (px, py))
+            if d < best: best = d
+        return best
 
     def _any_useful_pin_on_field(self) -> bool:
         """Read-only: is there at least one valuable, fetchable pin?"""
@@ -1715,12 +2315,16 @@ class HeuristicBot:
 
     def _find_useful_toggle(self):
         my_pos = self._pos()
+        in_auton = self._is_in_autonomous()
         best = None
         best_sc = -1e9
         for t in self.sim.toggles:
             if t.owner == self.alliance:
                 continue
-            d = self._dist(my_pos, (float(t.x), float(t.y)))
+            tx, ty = float(t.x), float(t.y)
+            if in_auton and not self._is_in_my_auton_wedge(tx, ty):
+                continue
+            d = self._dist(my_pos, (tx, ty))
             if d > self.TOGGLE_ROUTE_RANGE:
                 continue
             sc = -d
@@ -1731,6 +2335,87 @@ class HeuristicBot:
                             sc += 10.0
             if sc > best_sc:
                 best_sc = sc
+                best = t
+        return best
+
+    def _find_high_value_toggle_flip(self):
+        """E1 — Return a toggle worth interrupting current activity to flip.
+
+        Computes the SCORE SWING (our pts gained + opp pts denied) from
+        flipping each non-owned toggle.  Only returns a toggle if the
+        swing exceeds 8 pts AND the toggle is within
+        TOGGLE_DEFENSE_MAX_DIST (35") AND we have CLEAR LINE OF SIGHT
+        AND haven't blacklisted it this match.
+
+        Line-of-sight prevents the bot from pursuing toggles blocked by
+        goals/walls — observed: blue2 spent 71s driving toward an
+        unreachable toggle, losing 30+ points of normal scoring.
+
+        Blacklist (self._hv_toggle_blacklist) is set when stuck-escape
+        fires during a high-value toggle pursuit, so the bot doesn't
+        endlessly re-target the same unreachable toggle.
+        """
+        my_pos = self._pos()
+        in_auton = self._is_in_autonomous()
+        best = None
+        best_swing = 8.0    # threshold — anything ≤ 8 isn't worth a detour
+        blacklist = getattr(self, '_hv_toggle_blacklist', set())
+        for t in self.sim.toggles:
+            if t.owner == self.alliance:
+                continue
+            if t.toggle_id in blacklist:
+                continue
+            tx, ty = float(t.x), float(t.y)
+            if in_auton and not self._is_in_my_auton_wedge(tx, ty):
+                continue
+            d = self._dist(my_pos, (tx, ty))
+            if d > self.TOGGLE_DEFENSE_MAX_DIST:
+                continue
+            # Compute swing: sum of yellow half values across goals this
+            # toggle controls.  If opp owns it: we GAIN those halves (+10
+            # each) and DENY opp (+10 each more), so 2x multiplier.
+            # If neutral: we GAIN +10 each (no opp denial).
+            swing = 0.0
+            for g in self.sim.goals:
+                if self._toggle_for_goal(g) is not t:
+                    continue
+                # Count CURRENTLY VISIBLE yellow halves on this goal.
+                n = len(g.stack)
+                for i, (obj, is_pin) in enumerate(g.stack):
+                    if not is_pin:
+                        continue
+                    # UP half visible iff stack-top OR cup above is clear_up.
+                    up_vis = True
+                    if i + 1 < n:
+                        nxt_obj, nxt_is_pin = g.stack[i + 1]
+                        if not nxt_is_pin:
+                            flipped = getattr(nxt_obj, 'flipped', False)
+                            eff_clear_up = ((not nxt_obj.clear_on_top)
+                                            if flipped else nxt_obj.clear_on_top)
+                            up_vis = not eff_clear_up
+                    # DOWN half visible iff pin-below or cup-below with clear_up.
+                    if i == 0:
+                        down_vis = False
+                    else:
+                        prev_obj, prev_is_pin = g.stack[i - 1]
+                        if prev_is_pin:
+                            down_vis = True
+                        else:
+                            flipped = getattr(prev_obj, 'flipped', False)
+                            eff_clear_up = ((not prev_obj.clear_on_top)
+                                            if flipped else prev_obj.clear_on_top)
+                            down_vis = eff_clear_up
+                    if up_vis and obj.up_half_name == "yellow":
+                        swing += 10.0
+                    if down_vis and obj.down_half_name == "yellow":
+                        swing += 10.0
+            if t.owner == self.opp_alliance:
+                swing *= 2.0    # double — gain + deny
+            # Travel cost: subtract pts per second of detour.
+            t_cost = self._travel_time_to((float(t.x), float(t.y)))
+            net = swing - t_cost * 2.0   # ~2 pts/s opportunity cost
+            if net > best_swing:
+                best_swing = net
                 best = t
         return best
 

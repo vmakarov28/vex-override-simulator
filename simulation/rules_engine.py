@@ -53,6 +53,12 @@ class RulesEngine:
         self.midfield_blue_count  = 0
         self.midfield_red_bonus   = 0    # live +8-per-robot parking pts
         self.midfield_blue_bonus  = 0
+        # Autonomous bonus (+12 pts) is set once when auton ends and must
+        # survive every subsequent recompute_all_scores call — recompute
+        # rebuilds totals from goal stacks, so the bonus is stored here
+        # and added back in each frame.
+        self.auton_bonus_red      = 0
+        self.auton_bonus_blue     = 0
 
     def reset(self):
         self.red_score  = 0
@@ -65,6 +71,8 @@ class RulesEngine:
         self.midfield_blue_count = 0
         self.midfield_red_bonus  = 0
         self.midfield_blue_bonus = 0
+        self.auton_bonus_red     = 0
+        self.auton_bonus_blue    = 0
 
     def check_possession(self, robot):
         """Enforce 1 Pin + 1 Cup possession limit."""
@@ -176,6 +184,10 @@ class RulesEngine:
             self.midfield_red_bonus  = 0
             self.midfield_blue_bonus = 0
 
+        # Persist the auton bonus (+12 to the auton winner) across frames.
+        red  += self.auton_bonus_red
+        blue += self.auton_bonus_blue
+
         self.red_score  = red
         self.blue_score = blue
 
@@ -261,7 +273,7 @@ class RulesEngine:
         # v9.3 PROBLEM 71: emit a diagnostic line so the SC5b adjustment is
         # visible in match-end output.  This makes future "yellow not credited"
         # bugs immediately obvious without needing to instrument anything.
-        print(f"[SC5b] midfield: red={r_count} blue={b_count} → majority={majority} | "
+        print(f"[SC5b] midfield: red={r_count} blue={b_count} -> majority={majority} | "
               f"center_yellow_visible={n_yellow_visible} | "
               f"+pts: red={delta_r} blue={delta_b}")
 
