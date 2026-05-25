@@ -2,7 +2,9 @@
 
 A high-fidelity 2D physics simulator for the **2026-2027 VEX V5 Robotics Competition game: Override**.
 
-Built with **Pygame + Pymunk** for realistic rigid-body physics, accurate scoring, and strategy training.
+Built with **Pygame + Pymunk** for realistic rigid-body physics, accurate scoring, and **PyTorch** for strategy training.
+
+<img width="420" height="420" alt="simVid(compressed)" src="https://github.com/user-attachments/assets/714f8448-763d-4070-8269-308d5dd230e2" />
 
 ---
 
