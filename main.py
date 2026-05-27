@@ -6,6 +6,7 @@ Entry point for the VEX Override Neural Strategy Lab.
 Modes
 -----
   interactive   — keyboard-controlled 2v2 match (default)
+  skills        — VEX Robot Skills: 1 robot, 60s, maximize score
   train         — MAPPO self-play training
   train-vis     — Training with periodic live visualization
   eval          — Evaluate a trained checkpoint
@@ -14,6 +15,7 @@ Modes
 Usage
 -----
   python main.py                              # interactive play
+  python main.py --mode skills                # VEX Robot Skills (solo 60s)
   python main.py --mode train                 # start/resume training
   python main.py --mode train --resume artifacts/models/latest.pt
   python main.py --mode train-vis
@@ -35,7 +37,8 @@ def parse_args():
         epilog=__doc__,
     )
     p.add_argument("--mode", type=str, default="interactive",
-                   choices=["interactive", "train", "train-vis", "eval", "heatmap"],
+                   choices=["interactive", "skills", "train", "train-vis",
+                            "eval", "heatmap"],
                    help="Operation mode (default: interactive)")
 
     # Training options
@@ -73,6 +76,15 @@ def run_interactive():
     """Launch the keyboard-controlled 2v2 simulator."""
     from simulation.simulator import OverrideSimulator
     sim = OverrideSimulator(headless=False)
+    sim.run_interactive()
+
+
+def run_skills():
+    """Launch VEX Robot Skills: one red robot alone on the field, 60 seconds,
+    no opposing alliance.  Every visible pin half (red, blue, or owned yellow)
+    counts toward a single Skills Score.  Match ends with a score screen."""
+    from simulation.simulator import OverrideSimulator
+    sim = OverrideSimulator(headless=False, skills_mode=True)
     sim.run_interactive()
 
 
@@ -198,6 +210,21 @@ def main():
         print("  R           = reset match")
         print("  ESC         = quit\n")
         run_interactive()
+
+    elif args.mode == "skills":
+        print("[Main] VEX Robot Skills Challenge — solo 60-second run.")
+        print("  One robot on the field, no opposing alliance.")
+        print("  Every visible pin half counts toward your single Score.")
+        print()
+        print("  WASD        = drive")
+        print("  E           = intake")
+        print("  Q           = score pin   |  Shift+Q = score cup")
+        print("  F           = flip pin    |  Shift+F = flip cup")
+        print("  T           = flip toggle")
+        print("  M + 1..5    = match load (when in corner zone)")
+        print("  R           = reset / run again")
+        print("  ESC         = quit\n")
+        run_skills()
 
     elif args.mode == "train":
         run_train(args)

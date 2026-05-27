@@ -15,6 +15,7 @@ from config.game_rules import (
     FIELD_WIDTH, FIELD_HEIGHT, RENDER_SCALE,
     SCREEN_W, SCREEN_H,
     AUTONOMOUS_SECONDS, DRIVER_SECONDS, SETTLE_SECONDS, TOTAL_SECONDS,
+    SKILLS_SECONDS,
     MAX_ROBOT_SIZE_START, MIDFIELD_CENTER, MIDFIELD_HALF,
     GOALS, TOGGLES, ROBOT_STARTS,
     ENDGAME_SECONDS,
@@ -53,13 +54,18 @@ COLOR_WALL     = (80, 88, 100)
 
 
 class OverrideSimulator:
-    def __init__(self, headless: bool = False, render_scale: float = RENDER_SCALE):
+    def __init__(self, headless: bool = False, render_scale: float = RENDER_SCALE,
+                 skills_mode: bool = False):
         self.headless     = headless
         self.render_scale = render_scale
         self.screen_w     = SCREEN_W
         self.screen_h     = SCREEN_H
+        # ── Skills mode (VEX Robot Skills Challenge) ──────────────────
+        # One robot, 60-second timer, no autonomous period, no opposing
+        # alliance.  All on-field scoring counts toward a single score.
+        self.skills_mode  = skills_mode
         self.timer_started = False
-        self.time_remaining = AUTONOMOUS_SECONDS
+        self.time_remaining = SKILLS_SECONDS if skills_mode else AUTONOMOUS_SECONDS
 
         # Match Load Inventory
         self.red_cups_left = 10
@@ -97,10 +103,11 @@ class OverrideSimulator:
         self.cups: List[GameCup] = []
         self.goals: List[FieldGoal] = []
         self.toggles: List[FieldToggle] = []
-        self.rules_engine = RulesEngine()
+        self.rules_engine = RulesEngine(skills_mode=self.skills_mode)
 
         self.time_elapsed   = 0.0
-        self.match_phase    = "autonomous"
+        # Skills runs are all-driver (no autonomous split).
+        self.match_phase    = "driver" if self.skills_mode else "autonomous"
         self.match_over     = False
         self.red_score      = 0
         self.blue_score     = 0
@@ -119,10 +126,14 @@ class OverrideSimulator:
 
         self._build_walls()
         self._auton_walls: List = []
-        self._build_auton_walls()
+        # Skills mode has no autonomous phase, so the tape-line wedge walls
+        # are never built.
+        if not self.skills_mode:
+            self._build_auton_walls()
         self._create_robots()
         self._create_field_objects()
         self._register_collision_handlers()
+        self._preload_robots()
 
         # Autonomous bonus tracking
         self._auton_bonus_applied = False
@@ -209,6 +220,10 @@ class OverrideSimulator:
         self._auton_walls = []
 
     def _create_robots(self):
+        if self.skills_mode:
+            # VEX Robot Skills: a single robot alone on the field.
+            self.robots = [Robot("red1", "red", self.space)]
+            return
         order = ["red1", "red2", "blue1", "blue2"]
         alliances = {"red1": "red", "red2": "red", "blue1": "blue", "blue2": "blue"}
         self.robots = [Robot(rid, alliances[rid], self.space) for rid in order]
@@ -360,6 +375,7 @@ class OverrideSimulator:
     def _update_phase(self):
         if self.time_remaining <= 0:
             if self.match_phase == "autonomous":
+                # Skills mode never enters this branch (it starts in "driver").
                 self._end_autonomous()
                 self.match_phase = "driver"
                 self.time_remaining = DRIVER_SECONDS
@@ -534,9 +550,6 @@ class OverrideSimulator:
 
     def _draw_hud(self):
         # === SCOREBOARD + TIMER (Top Right) ===
-        rs = self.font_sm.render(f"RED {self.red_score}", True, (255, 100, 100))
-        bs = self.font_sm.render(f"BLUE {self.blue_score}", True, (100, 170, 255))
-
         if self.rules_engine.endgame_active:
             t_color  = (255, 210, 50)
             t_label  = f"ENDGAME  {max(0, int(self.time_remaining))}s"
@@ -545,9 +558,21 @@ class OverrideSimulator:
             t_label = f"{max(0, int(self.time_remaining))}s"
         timer_txt = self.font_sm.render(t_label, True, t_color)
 
-        self.screen.blit(rs,        (self.screen_w - rs.get_width()        - 12, 8))
-        self.screen.blit(bs,        (self.screen_w - bs.get_width()        - 12, 26))
-        self.screen.blit(timer_txt, (self.screen_w - timer_txt.get_width() - 12, 44))
+        if self.skills_mode:
+            # Single combined score — no opposing alliance.
+            ss_label = self.font_hud.render(f"SCORE {self.red_score}",
+                                            True, (255, 220, 90))
+            self.screen.blit(ss_label,
+                             (self.screen_w - ss_label.get_width() - 12, 8))
+            self.screen.blit(timer_txt,
+                             (self.screen_w - timer_txt.get_width() - 12,
+                              8 + ss_label.get_height() + 4))
+        else:
+            rs = self.font_sm.render(f"RED {self.red_score}", True, (255, 100, 100))
+            bs = self.font_sm.render(f"BLUE {self.blue_score}", True, (100, 170, 255))
+            self.screen.blit(rs,        (self.screen_w - rs.get_width()        - 12, 8))
+            self.screen.blit(bs,        (self.screen_w - bs.get_width()        - 12, 26))
+            self.screen.blit(timer_txt, (self.screen_w - timer_txt.get_width() - 12, 44))
 
         # === MIDFIELD PARKING (endgame only) ===
         if self.rules_engine.endgame_active:
@@ -559,47 +584,79 @@ class OverrideSimulator:
             self.screen.blit(mf, (self.screen_w - mf.get_width() - 12, 62))
 
         # === MATCH LOAD INVENTORY (Bottom) ===
-        # Red (left side)
+        # Red (left side) — always shown; in skills mode this is the only one
         red_inv = self.font_sm.render(
             f"Red: {self.red_cups_left}C {self.red_alliance_pins_left}P {self.red_yellow_pins_left}Y",
             True, (255, 150, 150)
         )
         self.screen.blit(red_inv, (8, self.screen_h - 20))
 
-        # Blue (right side)
-        blue_inv = self.font_sm.render(
-            f"Blue: {self.blue_cups_left}C {self.blue_alliance_pins_left}P {self.blue_yellow_pins_left}Y",
-            True, (150, 180, 255)
-        )
-        self.screen.blit(blue_inv, (self.screen_w - blue_inv.get_width() - 8, self.screen_h - 20))
+        # Blue (right side) — hidden in skills mode (no blue alliance)
+        if not self.skills_mode:
+            blue_inv = self.font_sm.render(
+                f"Blue: {self.blue_cups_left}C {self.blue_alliance_pins_left}P {self.blue_yellow_pins_left}Y",
+                True, (150, 180, 255)
+            )
+            self.screen.blit(blue_inv, (self.screen_w - blue_inv.get_width() - 8, self.screen_h - 20))
 
         # === GAME OVER OVERLAY ===
         if self.match_over:
-            winner = ("RED" if self.red_score > self.blue_score else
-                      "BLUE" if self.blue_score > self.red_score else "TIE")
-            w_color = (255, 100, 100) if winner == "RED" else (
-                      (100, 170, 255) if winner == "BLUE" else (200, 200, 200))
-
             ov = pygame.Surface((self.screen_w, self.screen_h), pygame.SRCALPHA)
-            ov.fill((0, 0, 0, 100))
+            ov.fill((0, 0, 0, 140))
             self.screen.blit(ov, (0, 0))
 
-            end_surf = self.font_hud.render(
-                f"{winner} WINS! {self.red_score} – {self.blue_score}", True, w_color)
-            ex = self.screen_w // 2 - end_surf.get_width() // 2
-            ey = self.screen_h // 2 - 20
+            if self.skills_mode:
+                # Skills score screen (no winner — solo challenge).
+                title_surf = self.font_hud.render("SKILLS RUN COMPLETE",
+                                                  True, (255, 220, 90))
+                score_surf = self.font_hud.render(f"Score: {self.red_score}",
+                                                  True, (255, 255, 255))
+                tx = self.screen_w // 2 - title_surf.get_width() // 2
+                ty = self.screen_h // 2 - 56
+                sx = self.screen_w // 2 - score_surf.get_width() // 2
+                sy = ty + title_surf.get_height() + 10
+                box_w = max(title_surf.get_width(), score_surf.get_width()) + 64
+                box_h = title_surf.get_height() + score_surf.get_height() + 36
+                bx = self.screen_w // 2 - box_w // 2
+                by = ty - 14
+                pygame.draw.rect(self.screen, (18, 24, 35),
+                                 (bx, by, box_w, box_h), border_radius=10)
+                pygame.draw.rect(self.screen, (255, 220, 90),
+                                 (bx, by, box_w, box_h), 2, border_radius=10)
+                self.screen.blit(title_surf, (tx, ty))
+                self.screen.blit(score_surf, (sx, sy))
 
-            pygame.draw.rect(self.screen, (18, 24, 35),
-                             (ex - 16, ey - 10, end_surf.get_width() + 32, 48),
-                             border_radius=8)
-            self.screen.blit(end_surf, (ex, ey))
+                reset_txt = self.font_med.render("Press R to run again",
+                                                 True, (200, 200, 210))
+                self.screen.blit(reset_txt,
+                                 (self.screen_w // 2 - reset_txt.get_width() // 2,
+                                  sy + score_surf.get_height() + 14))
+            else:
+                winner = ("RED" if self.red_score > self.blue_score else
+                          "BLUE" if self.blue_score > self.red_score else "TIE")
+                w_color = (255, 100, 100) if winner == "RED" else (
+                          (100, 170, 255) if winner == "BLUE" else (200, 200, 200))
 
-            reset_txt = self.font_med.render("Press R to reset", True, (200, 200, 210))
-            self.screen.blit(reset_txt,
-                             (self.screen_w // 2 - reset_txt.get_width() // 2, ey + 32))
+                end_surf = self.font_hud.render(
+                    f"{winner} WINS! {self.red_score} – {self.blue_score}",
+                    True, w_color)
+                ex = self.screen_w // 2 - end_surf.get_width() // 2
+                ey = self.screen_h // 2 - 20
+
+                pygame.draw.rect(self.screen, (18, 24, 35),
+                                 (ex - 16, ey - 10, end_surf.get_width() + 32, 48),
+                                 border_radius=8)
+                self.screen.blit(end_surf, (ex, ey))
+
+                reset_txt = self.font_med.render("Press R to reset",
+                                                 True, (200, 200, 210))
+                self.screen.blit(reset_txt,
+                                 (self.screen_w // 2 - reset_txt.get_width() // 2,
+                                  ey + 32))
 
     def handle_keyboard(self, keys) -> List[Optional[Dict]]:
-        actions = [None, None, None, None]
+        # Slot count matches len(self.robots): 1 in skills, 4 in a match.
+        actions = [None] * len(self.robots)
         left = right = 0.0
         if keys[pygame.K_w]: left = right = 1.0
         if keys[pygame.K_s]: left = right = -1.0
@@ -614,24 +671,26 @@ class OverrideSimulator:
             "flip_pin": bool(keys[pygame.K_f] and not keys[pygame.K_LSHIFT]),
             "flip_cup": bool(keys[pygame.K_f] and keys[pygame.K_LSHIFT]),
         }
-        left = right = 0.0
-        if keys[pygame.K_UP]:    left = right = 1.0
-        if keys[pygame.K_DOWN]:  left = right = -1.0
-        if keys[pygame.K_LEFT]:  left, right = -0.85, 0.85
-        if keys[pygame.K_RIGHT]: left, right =  0.85, -0.85
-        actions[2] = {
-            "left": left, "right": right,
-            "intake": bool(keys[pygame.K_RSHIFT]),
-            "score_pin": bool(keys[pygame.K_RCTRL]),
-            "score_cup": bool(keys[pygame.K_RCTRL] and keys[pygame.K_LSHIFT]),
-            "toggle": False,
-            "flip_pin": bool(keys[pygame.K_LEFTBRACKET] and not keys[pygame.K_LSHIFT]),
-            "flip_cup": bool(keys[pygame.K_LEFTBRACKET] and keys[pygame.K_LSHIFT]),
-        }
+        # Blue1 arrow-key controls only exist in a 2v2 match.
+        if not self.skills_mode and len(self.robots) > 2:
+            left = right = 0.0
+            if keys[pygame.K_UP]:    left = right = 1.0
+            if keys[pygame.K_DOWN]:  left = right = -1.0
+            if keys[pygame.K_LEFT]:  left, right = -0.85, 0.85
+            if keys[pygame.K_RIGHT]: left, right =  0.85, -0.85
+            actions[2] = {
+                "left": left, "right": right,
+                "intake": bool(keys[pygame.K_RSHIFT]),
+                "score_pin": bool(keys[pygame.K_RCTRL]),
+                "score_cup": bool(keys[pygame.K_RCTRL] and keys[pygame.K_LSHIFT]),
+                "toggle": False,
+                "flip_pin": bool(keys[pygame.K_LEFTBRACKET] and not keys[pygame.K_LSHIFT]),
+                "flip_cup": bool(keys[pygame.K_LEFTBRACKET] and keys[pygame.K_LSHIFT]),
+            }
 
         # === MATCH LOAD SYSTEM (M + Number) ===
         red1 = self.robots[0]
-        blue1 = self.robots[2]
+        blue1 = self.robots[2] if len(self.robots) > 2 else None
 
         # Red Match Load (DISABLED during autonomous per VRC rules)
         if self.match_phase == "autonomous":
@@ -672,8 +731,8 @@ class OverrideSimulator:
             else:
                 self._m5_pressed_red = False
 
-        # Blue Match Load
-        if self._is_in_loading_zone(blue1, "blue"):
+        # Blue Match Load — only in 2v2 match mode (blue1 exists).
+        if blue1 is not None and self._is_in_loading_zone(blue1, "blue"):
             if keys[pygame.K_m] and keys[pygame.K_1]:
                 if not getattr(self, '_m1_pressed_blue', False):
                     self._perform_match_load(blue1, 1)
@@ -713,20 +772,23 @@ class OverrideSimulator:
 
     def reset(self):
         self.time_elapsed   = 0.0
-        self.match_phase    = "autonomous"
+        # Skills runs are all-driver; matches start in autonomous.
+        self.match_phase    = "driver" if self.skills_mode else "autonomous"
         self.match_over     = False
         self.red_score      = 0
         self.blue_score     = 0
-        self.rules_engine   = RulesEngine()
+        self.rules_engine   = RulesEngine(skills_mode=self.skills_mode)
         self._physics_accum = 0.0
 
         # === RESET TIMER ===
         self.timer_started = False
-        self.time_remaining = AUTONOMOUS_SECONDS
+        self.time_remaining = SKILLS_SECONDS if self.skills_mode else AUTONOMOUS_SECONDS
 
         # Rebuild autonomous tape-line walls (removed at end of last match).
+        # Skills has no autonomous phase, so the walls stay removed.
         self._remove_auton_walls()
-        self._build_auton_walls()
+        if not self.skills_mode:
+            self._build_auton_walls()
         self._auton_bonus_applied = False
         self._auton_score_red  = 0
         self._auton_score_blue = 0
@@ -764,6 +826,10 @@ class OverrideSimulator:
 
         for robot in self.robots:
             robot.reset()
+
+        # Re-issue starting preloads so every robot enters auton with
+        # the same pin + cup loadout each match.
+        self._preload_robots()
 
         #print("[Simulator] Match reset.")
     def _is_in_loading_zone(self, robot, alliance):
@@ -875,6 +941,58 @@ class OverrideSimulator:
         color = "yellow_yellow" if pin_type == "yellow" else ("red_yellow" if pin_type == "red" else "blue_yellow")
         pin = GamePin(999, color, x, y, self.space)
         self.pins.append(pin)
+
+    def _preload_robots(self):
+        """VEX VRC starting pre-load: every robot enters the field already
+        holding 1 alliance pin + 1 cup, ready to score immediately when
+        autonomous begins.  Counts against the alliance's matchload pool
+        (2 cups + 2 alliance pins per alliance) so total available
+        elements stay consistent with the matchload UI.
+        """
+        pin_id_base = 9000
+        cup_id_base = 9000
+        for i, robot in enumerate(self.robots):
+            alliance = robot.alliance
+            color = "red_yellow" if alliance == "red" else "blue_yellow"
+            rx     = float(robot.body.position.x)
+            ry     = float(robot.body.position.y)
+            rangle = float(robot.body.angle)
+
+            # Pre-loaded alliance pin.
+            pin = GamePin(pin_id_base + i, color, rx, ry, self.space,
+                          orientation=ORIENT_HORIZONTAL, angle=rangle)
+            pin.carried_by  = robot.robot_id
+            pin.orientation = ORIENT_HORIZONTAL
+            pin.body.angle  = rangle
+            pin.set_carried()
+            pin._build_shape()
+            robot.carrying_pin = pin
+            self.pins.append(pin)
+
+            # Pre-loaded cup.
+            cup = GameCup(cup_id_base + i, "gray", rx, ry, self.space,
+                          orientation=ORIENT_HORIZONTAL, angle=rangle)
+            cup.carried_by  = robot.robot_id
+            cup.orientation = ORIENT_HORIZONTAL
+            cup.body.angle  = rangle
+            cup.set_carried()
+            cup._build_shape()
+            robot.carrying_cup = cup
+            self.cups.append(cup)
+
+            # Snap visual lift to "carried" immediately so the preload
+            # is visible the first frame instead of animating up from 0.
+            robot.lift_state  = 1.0
+            robot.lift_target = 1.0
+
+            # Decrement the matchload pool: each preload comes from the
+            # alliance's element supply.
+            if alliance == "red":
+                self.red_alliance_pins_left -= 1
+                self.red_cups_left          -= 1
+            else:
+                self.blue_alliance_pins_left -= 1
+                self.blue_cups_left          -= 1
 
     def run_interactive(self):
         if self.headless:

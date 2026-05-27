@@ -41,7 +41,11 @@ def get_controlling_toggle(x: float, y: float) -> int:
 
 
 class RulesEngine:
-    def __init__(self):
+    def __init__(self, skills_mode: bool = False):
+        # Skills mode = single-robot solo challenge (no alliance opposition).
+        # When True, recompute_all_scores folds blue-side scoring into the
+        # red total so the entire field counts as the player's score.
+        self.skills_mode = skills_mode
         self.red_score  = 0
         self.blue_score = 0
         self.fouls: Dict[str, list] = {"red": [], "blue": []}
@@ -188,6 +192,14 @@ class RulesEngine:
         red  += self.auton_bonus_red
         blue += self.auton_bonus_blue
 
+        # Skills mode: there is no opposing alliance.  Every visible pin half
+        # on the field — red, blue, or owned-yellow — counts toward the
+        # player's single score.  Fold blue into red and zero blue out.
+        if self.skills_mode:
+            self.red_score  = red + blue
+            self.blue_score = 0
+            return
+
         self.red_score  = red
         self.blue_score = blue
 
@@ -234,8 +246,13 @@ class RulesEngine:
             center_goal.get_score(toggles, midfield_majority=majority)
             delta_r = center_goal.red_score - old_r
             delta_b = center_goal.blue_score - old_b
-            self.red_score  += delta_r
-            self.blue_score += delta_b
+            if self.skills_mode:
+                # No opposing alliance — any SC5b credit goes to the player.
+                self.red_score  += delta_r + delta_b
+                # blue_score stays 0
+            else:
+                self.red_score  += delta_r
+                self.blue_score += delta_b
             # v9.3 PROBLEM 71: count visible yellow halves in the center goal
             # at match end for the diagnostic line below.
             n = len(center_goal.stack)

@@ -72,7 +72,7 @@ class VideoRecorder:
         if self._writer is not None:
             self._writer.release()
             self._writer = None
-            print(f"[VideoRecorder] Wrote {self._frame_count} frames → {self.path}")
+            print(f"[VideoRecorder] Wrote {self._frame_count} frames -> {self.path}")
 
     def __enter__(self):
         return self

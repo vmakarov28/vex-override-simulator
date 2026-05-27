@@ -18,6 +18,7 @@ artifacts/models/
 artifacts/videos/
 artifacts/logs/
 artifacts/heatmaps/
+artifacts/bench/
 
 # Keep the artifacts folder structure
 !artifacts/.gitkeep

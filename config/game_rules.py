@@ -25,6 +25,12 @@ DRIVER_SECONDS = 105
 SETTLE_SECONDS = 5
 TOTAL_SECONDS = AUTONOMOUS_SECONDS + DRIVER_SECONDS
 
+# Robot Skills (single-robot solo challenge per VEX rules).
+# Standard VEX Skills run = 60 seconds, one robot on the field, no alliance
+# opposition.  All elements/goals available; the player scores every visible
+# pin half regardless of color (red/blue/yellow).
+SKILLS_SECONDS = 60
+
 # =============================================================================
 # ROBOT CONSTANTS
 # =============================================================================
@@ -202,6 +208,12 @@ CUP_STARTS = [
     {"side": "gray", "x": 48, "y": 96, "orientation": ORIENT_VERTICAL, "angle": 0.0, "contains_pin": "yellow_yellow"},
     {"side": "gray", "x": 96, "y": 48, "orientation": ORIENT_VERTICAL, "angle": 0.0, "contains_pin": "yellow_yellow"},
     {"side": "gray", "x": 120, "y": 24, "orientation": ORIENT_VERTICAL, "angle": 0.0, "contains_pin": "yellow_yellow"},
+
+
+    {"side": "gray", "x": 48, "y": 72, "orientation": ORIENT_VERTICAL, "angle": 0.0, "contains_pin": "blue_red"},
+    {"side": "gray", "x": 96, "y": 72, "orientation": ORIENT_VERTICAL, "angle": 0.0, "contains_pin": "red_blue"},
+    {"side": "gray", "x": 72, "y": 48, "orientation": ORIENT_VERTICAL, "angle": 0.0, "contains_pin": "red_blue"},
+    {"side": "gray", "x": 72, "y": 96, "orientation": ORIENT_VERTICAL, "angle": 0.0, "contains_pin": "blue_red"},
 ]
 
 # =============================================================================

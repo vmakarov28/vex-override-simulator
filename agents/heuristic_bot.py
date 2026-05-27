@@ -142,20 +142,23 @@ class HeuristicBot:
     # ── Tunables ───────────────────────────────────────────────────────── #
     FLIP_COOLDOWN_STEPS = 40       # matches env_wrapper.COOLDOWN_FLIP
 
-    PICKUP_TIMEOUT     = 50        # ~2.5 s — chase the same pin/cup
-    BLACKLIST_DURATION = 80        # ~4 s — then ignore it
+    # v15: pickup timeout lengthened from 50→100 steps (2.5s→5s).  Prior
+    # value caused pin-target oscillation when the chosen pin was hard to
+    # reach (e.g., behind a goal); the timeout fired before the bot could
+    # close the distance, blacklisting the pin and swapping to a
+    # similarly-hard alternate, which timed out and swapped back, etc.
+    # 5 s is enough to traverse the full field at ~30 in/s carrying.
+    PICKUP_TIMEOUT     = 100       # ~5 s — chase the same pin/cup
+    BLACKLIST_DURATION = 160       # ~8 s — then ignore it
 
     INTAKE_SLOW_MULT  = 1.6        # below 16" → 70% speed
     INTAKE_CRAWL_MULT = 1.05       # below 10.5" → 35% (don't fully stop)
 
-    # v10.1: lowered spin threshold (was 110°).  v10.0's 110° made the bot
-    # try to turn-on-the-fly even at near-reversing angles, which produced
-    # wide circles instead of sharp corrections.  60° turns-in-place
-    # whenever we need a >60° heading correction (sharp pivot).
     SPIN_THRESHOLD_DEG = 60.0
-    # v10.1: reduced SLOW_RADIUS (was 16).  Bot held back too early and
-    # got rammed by allies coming up from behind, or stalled in element
-    # clusters.  8" gives a quick brake right at the goal.
+    # v15: reduced SLOW_RADIUS 8 → 5.  Bot was wasting 1-2 s/cycle
+    # braking too early on approach; tighter brake gives a faster
+    # commit-to-scoring distance.  Risk: occasional overshoot is
+    # absorbed by SCORE_BRAKE_RADIUS gate inside try_score_at_range.
     SLOW_RADIUS        = 8.0
 
     APPROACH_GOAL_INSET  = 9.0     # target this far from goal centre
@@ -165,14 +168,27 @@ class HeuristicBot:
     # Inside this radius we score immediately, regardless of orientation.
     PRE_FLIP_MIN_DIST = 18.0
 
-    # Stuck-escape
+    # Stuck-escape — escape fires fast as a safety net.  The primary
+    # avoidance path is now _deflect_for_obstacles' near-contact
+    # sidestep (handles pressed-against-goal cases the old projection
+    # check missed), so escape only needs to catch wall corners and
+    # other edge cases.
     STUCK_SPEED      = 1.5         # in/s — below this we count as not moving
-    STUCK_STEPS      = 30          # 1.5 s of no movement → escape kicks in
+    STUCK_STEPS      = 18          # 0.9 s of no movement → escape kicks in
     ESCAPE_DURATION  = 16          # 0.8 s of reverse + spin
+
+    # Near-contact sidestep: if a non-destination goal/robot sits within
+    # this distance of us AND in our forward hemisphere, route around it
+    # via a perpendicular waypoint immediately — independent of the
+    # projection-based deflection.  Fixes the "pressed against the goal
+    # for several seconds" issue where the obstacle's projection along
+    # the path was too small to trigger the old deflection code.
+    NEAR_CONTACT_GOAL_DIST  = 15.0
+    NEAR_CONTACT_ROBOT_DIST = 19.0
 
     # Endgame timing (seconds remaining)
     ENDGAME_DUMP_TIME = 8.0
-    ENDGAME_PARK_TIME = 3.0
+    ENDGAME_PARK_TIME = 6.0   # tuned from sweep (was 3.0; tested 6/8/10 — 6 won)
 
     # Toggle proactive routing (priority 8)
     TOGGLE_ROUTE_RANGE = 60.0
@@ -287,6 +303,19 @@ class HeuristicBot:
         self._post_score_toggle_id: Optional[int] = None
         self._post_score_toggle_steps: int = 0
 
+        # v15 — Per-goal progress watchdog.  Tracks how close we've ever
+        # gotten to the current target goal.  If we haven't made any new
+        # progress (haven't pushed the min distance down) for too many
+        # steps, drop the commit-lock and let _best_scoreable_goal re-pick.
+        # Without this, the strong commit-lock can hold us against an
+        # obstacle for 10+ seconds because the value math still says the
+        # locked goal is best.
+        self._goal_min_dist_seen: float = float("inf")
+        self._goal_no_progress_steps: int = 0
+        # Goals abandoned this trip due to no-progress.  Filtered out of
+        # _best_scoreable_goal until we score (then list resets).
+        self._goal_avoid: set = set()
+
         # Diagnostic
         self.last_reason: str = "init"
 
@@ -325,6 +354,9 @@ class HeuristicBot:
         self._hv_toggle_steps     = 0
         self._post_score_toggle_id    = None
         self._post_score_toggle_steps = 0
+        self._goal_min_dist_seen      = float("inf")
+        self._goal_no_progress_steps  = 0
+        self._goal_avoid              = set()
         self.last_reason        = "init"
         HeuristicBot._shared_targets[self.robot_id] = {
             "pin": None, "cup": None, "goal": None, "load_zone": None,
@@ -453,6 +485,58 @@ class HeuristicBot:
         ux, uy = dx / total, dy / total
         # Right-perpendicular to path direction (uy, -ux); left-perp = (-uy, ux).
         rp_x, rp_y = uy, -ux
+
+        # ── Near-contact sidestep ─────────────────────────────────────
+        # Any non-destination obstacle within close range AND in our
+        # forward hemisphere gets routed around immediately, regardless
+        # of how the path-projection math classifies it.  This catches
+        # the "robot pressed against a goal trying to drive past it"
+        # case that the projection-based check below misses (proj is
+        # tiny when the obstacle is right next to us, so the old code
+        # would skip it and the bot would push into the goal forever).
+        near = None
+        near_d = float("inf")
+        for g in self.sim.goals:
+            if math.hypot(g.x - tx, g.y - ty) < 12.0:
+                continue   # this goal IS (probably) the destination
+            gdx, gdy = g.x - rx, g.y - ry
+            d = math.hypot(gdx, gdy)
+            if d > self.NEAR_CONTACT_GOAL_DIST:
+                continue
+            # Forward hemisphere: skip obstacles behind us.
+            if ux * gdx + uy * gdy < -1.0:
+                continue
+            if d < near_d:
+                near_d = d
+                near = (g.x, g.y, gdx, gdy, self.AVOID_GOAL_RADIUS)
+        for r in self.sim.robots:
+            if r.robot_id == self.robot_id:
+                continue
+            ox, oy = float(r.body.position.x), float(r.body.position.y)
+            if math.hypot(ox - tx, oy - ty) < 10.0:
+                continue
+            gdx, gdy = ox - rx, oy - ry
+            d = math.hypot(gdx, gdy)
+            if d > self.NEAR_CONTACT_ROBOT_DIST:
+                continue
+            if ux * gdx + uy * gdy < -1.0:
+                continue
+            if d < near_d:
+                near_d = d
+                near = (ox, oy, gdx, gdy, self.AVOID_ROBOT_RADIUS)
+        if near is not None:
+            ox, oy, gdx, gdy, rad = near
+            # perp > 0 → obstacle is to my right of path → pass on its left
+            perp = rp_x * gdx + rp_y * gdy
+            # Pass on the FAR side of the obstacle (opposite to where it
+            # currently is relative to the path) so we steer AWAY from it.
+            side_sign = -1.0 if perp >= 0.0 else 1.0
+            offset = rad + 7.0
+            wp = (ox + side_sign * rp_x * offset,
+                  oy + side_sign * rp_y * offset)
+            # Clamp to robot-reachable area (9" margin = half-robot + buffer).
+            return (max(9.0, min(135.0, wp[0])),
+                    max(9.0, min(135.0, wp[1])))
 
         closest = None   # (proj_along_path, signed_perp, ox, oy, radius)
 
@@ -587,6 +671,9 @@ class HeuristicBot:
         return None
 
     def _valid_goal_for_me(self, goal) -> bool:
+        # Skills: no opposing alliance — every goal is scoreable.
+        if getattr(self.sim, "skills_mode", False):
+            return True
         return goal.alliance in ("neutral", self.alliance)
 
     # ── Partner coordination ──────────────────────────────────────────── #
@@ -630,15 +717,20 @@ class HeuristicBot:
 
     def _half_pts_for_me(self, half_name: str, goal) -> float:
         """Points we'd earn if this half lands visible on this goal."""
+        skills = getattr(self.sim, "skills_mode", False)
         if half_name == self.alliance:
             return 5.0
         if half_name in ("red", "blue"):
-            return -5.0   # opponent half — gives them 5 pts; mildly bad
+            # In skills, the other-color half ALSO scores for the player
+            # (RulesEngine folds blue into red).  In a match it's an
+            # opponent gift.
+            return 5.0 if skills else -5.0
         if half_name == "yellow":
             if goal.goal_id == CENTER_GOAL_ID:
                 # SC5b: yellow ownership decided at match end by midfield
-                # majority.  Encourage if we have/can plausibly hold majority.
-                if self._we_have_midfield_majority():
+                # majority.  In skills the only robots in the midfield
+                # are the player's, so majority is always the player.
+                if skills or self._we_have_midfield_majority():
                     return 10.0
                 return 0.0
             tog = self._toggle_for_goal(goal)
@@ -646,8 +738,12 @@ class HeuristicBot:
                 return 0.0
             if tog.owner == self.alliance:
                 return 10.0
+            if skills and tog.owner in ("red", "blue"):
+                # In skills, both red and blue toggle states credit the
+                # player (folded).  Only "yellow" (neutral) scores 0.
+                return 10.0
             if tog.owner == self.opp_alliance:
-                return -10.0   # gives them 10 pts
+                return -10.0   # gives them 10 pts (match only)
             return 0.0
         return 0.0
 
@@ -658,12 +754,21 @@ class HeuristicBot:
     def _pin_score_value(self, goal, up_half: str, down_half: str) -> float:
         """Points scored placing a pin in `goal` with given UP / DOWN halves.
         Accounts for goal post hiding DOWN of bottom-most pin and cup-below
-        visibility of stack-position-2 pins."""
+        visibility of stack-position-2 pins.
+
+        v15 — STACK BONUS: the official scoring grants +3 per properly
+        nested pin (one with a cup directly below it).  This is a flat
+        bonus on top of half-visibility points and was missing from the
+        bot's valuation, causing it to value the 2nd pin in a stack
+        identically to a fresh 1st pin elsewhere — leaving easy +3 pts
+        on the table dozens of times per match.
+        """
         n = len(goal.stack)
         if n == 0:
             # First pin: DOWN hidden by post, only UP visible.
             return self._half_pts_for_me(up_half, goal)
-        # n == 2: pin on top of cup.
+        # n == 2: pin on top of cup — visible UP, plus DOWN if cup is
+        # clear-side-up.
         cup_obj, _ = goal.stack[1]
         cup_clear_up = _eff_clear_up(cup_obj)
         up_pts = self._half_pts_for_me(up_half, goal)
@@ -784,6 +889,7 @@ class HeuristicBot:
         my_pos = self._pos()
         partners = self._partner_targets()
         in_auton = self._is_in_autonomous()
+
         best = None
         best_sc = -1e9
         for g in self.sim.goals:
@@ -793,6 +899,9 @@ class HeuristicBot:
             if needs == "full":
                 continue
             if (needs == "pin" and not has_pin) or (needs == "cup" and not has_cup):
+                continue
+            # Skip goals we've already given up on this trip (no-progress).
+            if g.goal_id in self._goal_avoid:
                 continue
             # Auton wedge restriction: white tape walls prevent crossing.
             # During auton, only score on goals inside our wedge.
@@ -810,14 +919,48 @@ class HeuristicBot:
             travel_s = self._travel_time_to((g.x, g.y))
             sc = v - self.TIME_COST_PTS_PER_S * travel_s
             d = self._dist(my_pos, (g.x, g.y))
-            # G2 commit-lock: stickiness inside 20" of current target.
-            # Linear ramp: +1 pt at 20", +4 pts at 0".
-            if g.goal_id == self._target_goal_id and d < 20.0:
-                sc += 1.0 + (3.0 * (20.0 - d) / 20.0)
+
+            # v15 — 1-step LOOKAHEAD: prefer goals that set up a fast
+            # follow-up score.  After scoring here, hands go empty, so
+            # the next move is to fetch.  If a loading zone or a partial
+            # stack (pin+cup ready for stack-bonus pin) sits close to
+            # this goal, the bot can chain it without a long traverse.
+            chain = 0.0
+            for lz in self._loading_zone_targets():
+                if (lz[0] - g.x) ** 2 + (lz[1] - g.y) ** 2 < 35.0 * 35.0:
+                    chain += 2.0
+                    break
+            for g2 in self.sim.goals:
+                if g2 is g:
+                    continue
+                if len(g2.stack) == 2 and not g2.stack[-1][1]:
+                    if (g2.x - g.x) ** 2 + (g2.y - g.y) ** 2 < 35.0 * 35.0:
+                        chain += 2.0
+                        break
+            sc += min(chain, 4.0)
+
+            # v15 STRONG commit-lock: once we've picked a goal, stay with it.
+            # Previously +1..+4 within 20" was not enough to defeat
+            # mid-approach travel-cost noise — the bot oscillated between
+            # two near-equal-value goals every ~1 s, wasting 5-10 s/match.
+            # New: +5 baseline whenever it's still our target, plus a ramp
+            # up to +6 over the final 30" of approach.  Total +11 at 0",
+            # which is hard to dislodge without a clearly-better rival.
+            # (Empirically: +8 base over-committed and missed the center
+            # goal at endgame; +5 base + ramp is the sweet spot.)
+            if g.goal_id == self._target_goal_id:
+                sc += 5.0
+                if d < 30.0:
+                    sc += 6.0 * (30.0 - d) / 30.0
             if sc > best_sc:
                 best_sc = sc
                 best = g
         if best is not None:
+            # Reset watchdog if we switched targets (the new target may
+            # legitimately be farther; old min-dist is irrelevant).
+            if best.goal_id != self._target_goal_id:
+                self._goal_min_dist_seen = float("inf")
+                self._goal_no_progress_steps = 0
             self._target_goal_id = best.goal_id
         return best
 
@@ -865,7 +1008,7 @@ class HeuristicBot:
         # Refuse to score if the best option is meaningfully negative —
         # UNLESS we've been carrying this element so long it's blocking
         # the inventory.  Then accept the loss and free the slot.
-        if v < -1.5:
+        if v < -4.0:   # EXP10: was -1.5 — accept slightly worse scores rather than holding
             carry_too_long = (
                 (ntype == "pin" and self._carry_pin_steps > self.CARRY_PATIENCE_STEPS) or
                 (ntype == "cup" and self._carry_cup_steps > self.CARRY_PATIENCE_STEPS)
@@ -905,6 +1048,13 @@ class HeuristicBot:
             a["score_cup"] = True
             self.last_reason = f"score_cup:{g.goal_id}(v={v:.1f})"
         self._target_goal_id = g.goal_id
+        # v15 — Successful score: clear the per-trip avoid-set and reset
+        # the progress watchdog so a previously-blocked goal is reconsidered
+        # on the next pickup.  Without this we'd permanently avoid any goal
+        # we ever got stuck near.
+        self._goal_avoid.clear()
+        self._goal_min_dist_seen = float("inf")
+        self._goal_no_progress_steps = 0
         # v14 — Post-score toggle claim.  If this score exposes yellow halves
         # on a goal whose controlling toggle is NOT ours, the bot's IMMEDIATE
         # next action should be to claim that toggle.  Each visible yellow
@@ -967,12 +1117,26 @@ class HeuristicBot:
           that doesn't exist.
         """
         c = pin.color
-        own_solid    = (self.alliance == "red"  and c == "red")  or (self.alliance == "blue" and c == "blue")
-        opp_solid    = (self.alliance == "red"  and c == "blue") or (self.alliance == "blue" and c == "red")
-        own_yellow   = (self.alliance == "red"  and c == "red_yellow")  or (self.alliance == "blue" and c == "blue_yellow")
-        opp_yellow   = (self.alliance == "red"  and c == "blue_yellow") or (self.alliance == "blue" and c == "red_yellow")
+        skills = getattr(self.sim, "skills_mode", False)
+        if skills:
+            # No opposing alliance — every pin half is the player's.
+            own_solid    = c in ("red", "blue")
+            opp_solid    = False
+            own_yellow   = c in ("red_yellow", "blue_yellow")
+            opp_yellow   = False
+        else:
+            own_solid    = (self.alliance == "red"  and c == "red")  or (self.alliance == "blue" and c == "blue")
+            opp_solid    = (self.alliance == "red"  and c == "blue") or (self.alliance == "blue" and c == "red")
+            own_yellow   = (self.alliance == "red"  and c == "red_yellow")  or (self.alliance == "blue" and c == "blue_yellow")
+            opp_yellow   = (self.alliance == "red"  and c == "blue_yellow") or (self.alliance == "blue" and c == "red_yellow")
         full_yellow  = (c == "yellow" or c == "yellow_yellow")
-        if own_solid:   return 1.0
+        # red_blue / blue_red have one alliance half each.  We can orient
+        # ours UP so the visible-up half scores for us — equivalent to an
+        # own-solid pin for our scoring purposes (but the opponent half
+        # is still on the pin, so any DOWN-visible scoring gives them 5).
+        mixed_alliance = (c == "red_blue" or c == "blue_red")
+        if own_solid:      return 1.0
+        if mixed_alliance: return 0.8   # slightly less than own_solid — opp half can be exposed
         if opp_solid:   return -2.0
         # Pin has at least one yellow half — multiplier depends on live toggle
         # ownership of any goal where we can plausibly score it.
@@ -1003,6 +1167,7 @@ class HeuristicBot:
           -1.0 → opp controls all relevant toggles (yellow scores -10 → opp +10)
         Used by _pin_value to keep yellow pin valuations honest.
         """
+        skills = getattr(self.sim, "skills_mode", False)
         ours = opps = neut = 0
         for g in self.sim.goals:
             if g.goal_id == CENTER_GOAL_ID:
@@ -1013,12 +1178,19 @@ class HeuristicBot:
             tog = self._toggle_for_goal(g)
             if tog is None:
                 continue
-            if tog.owner == self.alliance:
-                ours += 1
-            elif tog.owner == self.opp_alliance:
-                opps += 1
+            if skills:
+                # No opposing alliance — any red/blue toggle credits player.
+                if tog.owner in ("red", "blue"):
+                    ours += 1
+                else:
+                    neut += 1
             else:
-                neut += 1
+                if tog.owner == self.alliance:
+                    ours += 1
+                elif tog.owner == self.opp_alliance:
+                    opps += 1
+                else:
+                    neut += 1
         if ours > 0:
             return 1.0   # at least one ours-controlled scoreable goal
         if opps > 0 and neut == 0:
@@ -1402,7 +1574,9 @@ class HeuristicBot:
             # how close we got: if stuck near the zone (within 25") it was
             # probably just slow squeezing into the wall corner — short
             # cooldown so we retry quickly.  If stuck far from zone, the
-            # path is genuinely blocked — long cooldown to try other tasks.
+            # path is genuinely blocked — moderate cooldown to try other
+            # tasks.  v15: was 30 s for the far-stuck case which banned
+            # match-load for half the skills match after one bump.
             if self._match_load_commit > 0:
                 my = self._pos()
                 zones = self._loading_zone_targets()
@@ -2303,13 +2477,20 @@ class HeuristicBot:
     def _should_flip_pin_for_goal(self, goal) -> bool:
         """Should we flip the pin before dropping it at `goal`?  Uses
         the same value model as _try_score_at_range so en-route
-        pre-flips and at-range flips agree."""
+        pre-flips and at-range flips agree.
+
+        v15: en-route pre-flip threshold raised from +0.5 to +3 pts.
+        Pre-flip eats the 40-step (2s) flip cooldown, blocking any
+        at-range flip — so it should only fire when the orientation
+        gain is meaningful (a half visibility worth ~5 pts, easily
+        worth the 2s).  Tiny +0.5 gains were causing wasted cooldowns
+        on goals the bot then bypassed mid-trip."""
         pin = self.robot.carrying_pin
         if pin is None or self._goal_needs(goal) != "pin":
             return False
         v_now  = self._pin_score_value(goal, pin.up_half_name, pin.down_half_name)
         v_flip = self._pin_score_value(goal, pin.down_half_name, pin.up_half_name)
-        return v_flip > v_now + 0.5
+        return v_flip > v_now + 3.0
 
     # ── Priority 8 — proactive toggle routing ────────────────────────── #
 

@@ -265,6 +265,8 @@ class GamePin:
             "yellow_yellow": (C_YELLOW, C_YELLOW),   # ← ADD THIS LINE
             "red_yellow":   (C_RED, C_YELLOW),
             "blue_yellow":  (C_BLUE, C_YELLOW),
+            "red_blue":     (C_RED, C_BLUE),
+            "blue_red":     (C_BLUE, C_RED),
         }.get(self.color, (C_GRAY_MID, C_GRAY_MID))
 
     def get_up_color(self):
@@ -286,6 +288,8 @@ class GamePin:
         "yellow_yellow": ("yellow", "yellow"),
         "red_yellow":    ("red",    "yellow"),
         "blue_yellow":   ("blue",   "yellow"),
+        "red_blue":      ("red",    "blue"),
+        "blue_red":      ("blue",   "red"),
     }
 
     @property
@@ -849,6 +853,35 @@ class FieldGoal:
                     elif yellow_owner == "blue":
                         blue_pts += POINTS_YELLOW_OWNED
                     # toggle=yellow → 0 pts (no alliance owns it yet)
+
+            # Stack bonus (POINTS_STACK_BONUS): awarded for each pin at
+            # stack index >= 1 that is "properly nested" (cup directly
+            # below it).  Game manual: "Bonus per additional properly
+            # nested pin (requires cup between pins)."  The bonus goes
+            # to the alliance whose color is on the pin (red/blue side
+            # of red_yellow / blue_yellow, or the toggle owner for a
+            # pure yellow_yellow pin).
+            if i >= 1:
+                prev_obj, prev_is_pin = self.stack[i - 1]
+                if not prev_is_pin:   # cup directly below = nested
+                    pc = getattr(obj, "color", "")
+                    if pc in ("red", "red_yellow"):
+                        red_pts  += POINTS_STACK_BONUS
+                    elif pc in ("blue", "blue_yellow"):
+                        blue_pts += POINTS_STACK_BONUS
+                    elif pc == "yellow_yellow":
+                        if yellow_owner == "red":
+                            red_pts  += POINTS_STACK_BONUS
+                        elif yellow_owner == "blue":
+                            blue_pts += POINTS_STACK_BONUS
+                    elif pc in ("red_blue", "blue_red"):
+                        # Mixed-alliance pin: award stack bonus to whichever
+                        # alliance's half is currently UP (visible on top).
+                        up_color = obj.get_up_color()
+                        if up_color == C_RED:
+                            red_pts  += POINTS_STACK_BONUS
+                        elif up_color == C_BLUE:
+                            blue_pts += POINTS_STACK_BONUS
 
         self.red_score  = red_pts
         self.blue_score = blue_pts
