@@ -57,6 +57,11 @@ python main.py --mode interactive        # keyboard-controlled 2v2 match
 python main.py --mode skills             # VEX Robot Skills (solo 60s)
 python run_with_bots.py                  # watch 4 heuristic bots play
 python run_bot_skills.py                 # watch the bot run skills
+
+# Example
+cd C:\Users\aipla\Desktop\override_sim
+venv\Scripts\activate
+python main.py
 ```
 
 ---
