@@ -5,7 +5,8 @@ Entry point for the VEX Override Neural Strategy Lab.
 
 Modes
 -----
-  interactive   — keyboard-controlled 2v2 match (default)
+  menu          — interactive launcher (DEFAULT when no --mode given)
+  interactive   — keyboard-controlled 2v2 match (legacy direct entry)
   skills        — VEX Robot Skills: 1 robot, 60s, maximize score
   train         — MAPPO self-play training
   train-vis     — Training with periodic live visualization
@@ -14,8 +15,9 @@ Modes
 
 Usage
 -----
-  python main.py                              # interactive play
-  python main.py --mode skills                # VEX Robot Skills (solo 60s)
+  python main.py                              # launch the menu UI
+  python main.py --mode interactive           # skip menu — direct 2v2
+  python main.py --mode skills                # skip menu — solo skills
   python main.py --mode train                 # start/resume training
   python main.py --mode train --resume artifacts/models/latest.pt
   python main.py --mode train-vis
@@ -36,10 +38,10 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--mode", type=str, default="interactive",
-                   choices=["interactive", "skills", "train", "train-vis",
-                            "eval", "heatmap"],
-                   help="Operation mode (default: interactive)")
+    p.add_argument("--mode", type=str, default="menu",
+                   choices=["menu", "interactive", "skills", "train",
+                            "train-vis", "eval", "heatmap"],
+                   help="Operation mode (default: menu — interactive launcher)")
 
     # Training options
     p.add_argument("--resume",           type=str, default=None,
@@ -86,6 +88,20 @@ def run_skills():
     from simulation.simulator import OverrideSimulator
     sim = OverrideSimulator(headless=False, skills_mode=True)
     sim.run_interactive()
+
+
+def run_menu_loop():
+    """Show the interactive launcher, then run whatever the user picked.
+    Loops back to the menu after each match until the user quits."""
+    from ui.menu import show_menu
+    from ui.runner import run_configured_match
+    while True:
+        config = show_menu()
+        if config is None:
+            return                       # user chose Quit / closed window
+        run_configured_match(config)
+        # After the match the sim's display has been torn down.  Looping
+        # re-creates the menu window via pygame.display.set_mode.
 
 
 def run_train(args):
@@ -198,6 +214,11 @@ def run_heatmap(args):
 
 def main():
     args = parse_args()
+
+    if args.mode == "menu":
+        print("[Main] Opening VEX Override launcher...")
+        run_menu_loop()
+        return
 
     if args.mode == "interactive":
         print("[Main] Launching interactive simulator. Controls:")
