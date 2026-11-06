@@ -141,42 +141,53 @@ Only red1 / blue1 can match-load. Match loading is disabled during the Autonomou
 
 ---
 
-## Autonomous Period
+## Rules (manual v2.0) — see `docs/RULES_AUDIT.md`
 
-- Lasts **15 seconds** at the start of each match.
-- The field is divided into **four wedge-shaped zones** by white tape diagonal lines. Each robot starts in its own wedge.
-- **Robots may not cross any white tape line** — the simulator enforces this with physical walls along all 8 boundary segments (4 outer diagonals + 4 midfield diamond edges).
-- All four robots actively compete during auton: scoring goals, picking up elements, and claiming toggles within their wedge.
-- At the end of auton, the alliance with the higher score earns a **+12 autonomous bonus** (tie = no bonus). The bonus persists through the rest of the match.
-- **Skills mode has no autonomous period** — the 60-second run is all driver-control.
-
----
-
-## Endgame (Last 20 Seconds of Driver / Skills)
-
-- **+8 points per robot** parked in the Midfield diamond (live, updates every frame).
-- **Center Goal** locks after reaching Pin + Cup + Pin (3 items).
-- Yellow pin ownership in the center goal is decided by **Midfield robot majority** at match end (SC5b rule).
-- In Skills mode, the player's lone robot trivially holds the midfield majority, so any yellow halves visible in the center goal at match end score +10 each.
-
----
-
-## Scoring Summary
+The simulator follows the official V5RC Override game manual **v2.0 (Sept 3, 2026)**.
+`docs/RULES_AUDIT.md` lists 22 places where earlier versions of this sim
+differed from the manual and how each was fixed.  `tests/test_rules.py`
+checks the scoring against the manual's own worked example.
 
 | Item | Points |
 |---|---|
-| Alliance pin in goal (per visible half) | 5 |
-| Yellow pin half (toggle-controlled, or skills-mode in center) | 10 |
-| Cup alone | 0 |
-| Stack bonus (per extra nested pin, requires cup between pins) | 3 |
-| Robot parked in Midfield (endgame, per robot per second) | +8 |
-| Autonomous bonus (winning alliance only) | +12 |
+| Each visible red / blue pin half | 5 |
+| Each visible Owned yellow pin half | 10 |
+| Each robot ending the match in the Midfield | 8 |
+| Autonomous Bonus (tie: 6 each) | 12 |
 
-In **Skills mode**, the bot's `RulesEngine` folds blue-side scoring into the red total (no opposing alliance), so every visible half on the entire field contributes to the player's single score.
+* A pin sitting on a goal shows **both** halves.  Every cup hides exactly one
+  half (the one in its opaque end), so each extra cup + pin on a stack adds
+  one visible half.
+* Each neutral goal starts with a yellow/yellow pin already on it, so setting
+  a toggle is instantly worth 20.
+* Autonomous (15 s): one Autonomous Line (corner-to-corner double tape plus the
+  Midfield square).  Each alliance may use its own half, the line, the Midfield
+  and the 28 objects that start on the line.  Autonomous Win Point (SC8) is
+  checked and reported.
+* Endgame = last 10 s: no placing on the Midfield goal.
+* Skills: red halves only score in red quadrants or the Midfield, blue halves
+  only in blue quadrants or the Midfield, and a toggle only counts when it
+  matches its quadrant's colour.
 
----
+## Robot model and route planner (`strategy/`)
 
-## Heuristic Bot Performance (v1.1)
+`config/robot_profile.py` describes the robot.  `USER_ROBOT` (default):
+front intake takes any element, the back intake takes standing pins only,
+and the robot scores only out of the back.
+
+```bash
+python -m strategy.find_routes            # best auton (red/blue, points/AWP) + skills routes
+python -m strategy.find_routes --video    # also save MP4 replays
+```
+
+The planner beam-searches whole action sequences (intake, back-intake,
+match load, place with orientation choice, toggle, park), then drives every
+candidate route in the physics simulator and keeps the best **physics-verified**
+one.  Results (JSON + PNG + MP4 + `ROUTES.md`) go to `artifacts/routes/`.
+
+Interactive keys: **Q** scores out of the back, **G** = back intake.
+
+## Heuristic Bot Performance (v1.1, old rules)
 
 Deterministic skills-mode benchmark (seed 2000, 60-second run):
 

@@ -54,15 +54,15 @@ C_SHADOW     = (15, 15, 20)
 # PHYSICS SIZES (inches) and MASSES
 # ────────────────────────────────────────────────────────────────────────────
 # Physics sizes (inches)
-PIN_PHYS_HALF_LEN = 3.0          # ← Was 4.10 (now correct 6" full length)
+PIN_PHYS_HALF_LEN = 3.25         # official Pin: 6.5" (165 mm) long
 PIN_PHYS_HALF_WID = 0.77 #1.05
 PIN_PHYS_RADIUS_V = 0.77 #1.05
 PIN_CORNER_R      = 0.35
 PIN_MASS          = 0.55
 
 
-CUP_REAL_DIAMETER = 4.0          # Official VEX Override cup diameter
-CUP_REAL_HEIGHT   = 4.5          # Official height when horizontal
+CUP_REAL_DIAMETER = 3.15         # official Cup: 3.15" (80 mm) diameter
+CUP_REAL_HEIGHT   = 6.5          # official Cup: 6.5" (164.5 mm) tall
 CUP_PHYS_RADIUS_V = CUP_REAL_DIAMETER / 2          # 2.0 inches
 CUP_PHYS_HALF_WID = CUP_REAL_DIAMETER / 2
 CUP_PHYS_HALF_LEN = CUP_REAL_HEIGHT / 2            # 2.25 inches
@@ -92,6 +92,8 @@ CAT_ROBOT   = 1 << 2
 CAT_PIN     = 1 << 3
 CAT_CUP     = 1 << 4
 CAT_CARRIED = 1 << 5
+CAT_ROBOT_RED  = 1 << 6     # extra category bits so auton walls can block
+CAT_ROBOT_BLUE = 1 << 7     # only one alliance's robots
 
 NORMAL_PIN_FILTER = pymunk.ShapeFilter(
     categories=CAT_PIN,
@@ -107,6 +109,7 @@ CARRIED_FILTER = pymunk.ShapeFilter(categories=CAT_CARRIED, mask=0)
 # VELOCITY-LIMITER (anti-launch guarantee)
 # ════════════════════════════════════════════════════════════════════════════
 MAX_OBJ_LINEAR_SPEED  = 70.0
+NEST_EJECT_IMPULSE    = 40.0   # impulse needed to knock a nested pin out of a cup
 MAX_OBJ_ANGULAR_SPEED = 14.0
 
 def _limit_velocity(body, gravity, damping, dt):
@@ -426,7 +429,7 @@ class GameCup:
     def __init__(self, cup_id: int, side: str, x: float, y: float,
                  space: pymunk.Space,
                  orientation: str = ORIENT_VERTICAL, angle: float = 0.0,
-                 contains_pin: str = None):   # ← NEW PARAMETER
+                 contains_pin: str = None, clear_up: bool = True):
         self.cup_id      = cup_id
         self.side        = side
         self.space       = space
@@ -437,7 +440,7 @@ class GameCup:
         self.scored          = False
         self.goal_id         = None
         self.carried_by      = None
-        self.clear_on_top    = True
+        self.clear_on_top    = bool(clear_up)   # manual: 24 gray-up, 12 clear-up
         self.flipped         = False
         self._knock_cooldown = 0.0
 
@@ -508,7 +511,10 @@ class GameCup:
         self._build_shape()
         self._knock_cooldown = 0.12
 
-        # NEW: If this cup has a nested pin, separate it immediately
+        # A nested pin only flies out on a hard hit; on a gentle tip it stays
+        # inside the (now lying) cup and can still be intaken with it.
+        if self.contains_pin and impulse_mag < NEST_EJECT_IMPULSE:
+            return
         if self.contains_pin:
             pin = self.contains_pin
             pin.carried_by = None
@@ -710,6 +716,10 @@ class FieldGoal:
         self.y        = goal_dict["y"]
         self.radius   = goal_dict["radius"]
         self.label    = goal_dict["label"]
+        from simulation.scoring import goal_region
+        self.kind = ("center" if self.goal_id == CENTER_GOAL_ID else
+                     "neutral" if self.alliance == "neutral" else "alliance")
+        self.region = goal_region(self.goal_id, self.x, self.y, CENTER_GOAL_ID)
 
         # NEW: Proper ordered stack (bottom → top)
         self.stack = []          # list of (obj, is_pin) tuples
@@ -742,150 +752,41 @@ class FieldGoal:
         self.stack.append((obj, is_pin))
         self.stack_count = len(self.stack)
     
-    def get_score(self, toggles=None, midfield_majority=None):
-        """Compute per-alliance scores for this goal's current stack.
+    def stack_desc(self):
+        """Stack as plain tuples for simulation.scoring."""
+        out = []
+        for obj, is_pin in self.stack:
+            if is_pin:
+                out.append(("pin", obj.down_half_name, obj.up_half_name))
+            else:
+                flipped = getattr(obj, "flipped", False)
+                clear_up = (not obj.clear_on_top) if flipped else obj.clear_on_top
+                out.append(("cup", clear_up))
+        return out
 
-        Scoring rules (per VEX Override manual SC3 / SC5b):
-          - Each visible pin half scores 5 pts for its color's alliance.
-          - For NON-CENTER goals: a yellow visible half scores 10 pts for the
-            alliance that owns the toggle controlling this goal's quadrant.
-            If the toggle is set to yellow (unowned), yellow halves score 0.
-          - For the CENTER goal (SC5b): yellow halves NEVER use toggle
-            ownership.  Instead, ownership is decided at match end by which
-            alliance has STRICTLY more robots in the Midfield.  Ties (0-0,
-            1-1, 2-2) leave yellows unclaimed (0 pts).  During live play
-            (midfield_majority=None) yellow halves contribute 0 — the value
-            locks in only at match end via calculate_final_score().  Regular
-            red/blue halves in the center goal score normally and live.
-          - Visibility is determined by the cup orientation above/below each
-            half (same eff_clear_up logic used by the draw() method).
-          - The goal post always cancels the bottom half of the bottom-most pin.
-          - Cups themselves score no points.
+    def get_score(self, toggles=None, midfield_majority=None, skills=False):
+        """Per-alliance points for this goal (manual v2.0 SC2-SC5, RSC3).
 
-        midfield_majority: per SC5b, the alliance with majority robots in the
-          Midfield at match end.
-            None  → live play (center goal yellows score 0; non-center goals
-                    fall back to toggle-based ownership).
-            "red" → award center goal yellows to red.
-            "blue"→ award center goal yellows to blue.
-            "tie" → match end with no majority; center goal yellows score 0.
-          For non-center goals this argument is ignored.
-
-        Updates self.red_score and self.blue_score.
-        Returns the combined total (for legacy callers).
+        midfield_majority: owner of Midfield yellow pins — only known at match
+          end (None/'tie' during play → Midfield yellows score 0 live).
+        skills: Robot Skills rules (RSC3); everything is credited to red.
+        Updates self.red_score / self.blue_score; returns the total.
         """
-        red_pts  = 0
-        blue_pts = 0
-
-        if not self.stack:
-            self.red_score  = 0
-            self.blue_score = 0
-            return 0
-
-        # ── Determine yellow ownership ────────────────────────────────
-        # SC5b: center goal yellows are decided by midfield robot majority,
-        # not by toggles.  During live play (midfield_majority is None) the
-        # center goal's yellow halves contribute 0 — value is deferred to
-        # match end via calculate_final_score.
-        is_center = (self.goal_id == CENTER_GOAL_ID)
-        if is_center:
-            if midfield_majority in ("red", "blue"):
-                yellow_owner = midfield_majority
-            else:
-                # None (live) or "tie" (final, no majority) → no claim
-                yellow_owner = None
-        elif toggles:
-            yellow_owner = None
-            dx = self.x - 72.0
-            dy = self.y - 72.0
-            if abs(dx) >= abs(dy):
-                tid = 1 if dx <= 0 else 2
-            else:
-                tid = 3 if dy <= 0 else 4
+        from simulation.scoring import score_stack, TOGGLE_OF_QUADRANT
+        toggle_owner = None
+        if self.region != "midfield" and toggles:
+            tid = TOGGLE_OF_QUADRANT[self.region]
             for t in toggles:
                 if t.toggle_id == tid:
                     if t.owner in ("red", "blue"):
-                        yellow_owner = t.owner
+                        toggle_owner = t.owner
                     break
-        else:
-            yellow_owner = None
-
-        # ── Visibility helper — must match draw() exactly ──
-        def eff_clear_up(cup):
-            """True = clear/white half is UP in the stack (dark went down)."""
-            flipped = getattr(cup, 'flipped', False)
-            return not cup.clear_on_top if flipped else cup.clear_on_top
-
-        # ── Score each pin half ───────────────────────────────────────────
-        n = len(self.stack)
-        for i, (obj, is_pin) in enumerate(self.stack):
-            if not is_pin:
-                continue  # cups contribute no points
-
-            # DOWN half visibility
-            if i == 0:
-                down_vis = False   # goal post always hides the first pin's bottom
-            else:
-                prev_obj, prev_is_pin = self.stack[i - 1]
-                # cup_below's TOP is clear when eff_clear_up=True → pin DOWN visible
-                down_vis = eff_clear_up(prev_obj) if not prev_is_pin else True
-
-            # UP half visibility
-            if i + 1 >= n:
-                up_vis = True      # top of stack = open air, always visible
-            else:
-                next_obj, next_is_pin = self.stack[i + 1]
-                # cup_above's BOTTOM is clear when eff_clear_up=False → pin UP visible
-                up_vis = (not eff_clear_up(next_obj)) if not next_is_pin else True
-
-            # Award points for each visible half
-            for visible, color in ((down_vis, obj.get_down_color()),
-                                   (up_vis,   obj.get_up_color())):
-                if not visible:
-                    continue
-                if color == C_RED:
-                    red_pts  += POINTS_PIN_IN_GOAL
-                elif color == C_BLUE:
-                    blue_pts += POINTS_PIN_IN_GOAL
-                elif color == C_YELLOW:
-                    if yellow_owner == "red":
-                        red_pts  += POINTS_YELLOW_OWNED
-                    elif yellow_owner == "blue":
-                        blue_pts += POINTS_YELLOW_OWNED
-                    # toggle=yellow → 0 pts (no alliance owns it yet)
-
-            # Stack bonus (POINTS_STACK_BONUS): awarded for each pin at
-            # stack index >= 1 that is "properly nested" (cup directly
-            # below it).  Game manual: "Bonus per additional properly
-            # nested pin (requires cup between pins)."  The bonus goes
-            # to the alliance whose color is on the pin (red/blue side
-            # of red_yellow / blue_yellow, or the toggle owner for a
-            # pure yellow_yellow pin).
-            if i >= 1:
-                prev_obj, prev_is_pin = self.stack[i - 1]
-                if not prev_is_pin:   # cup directly below = nested
-                    pc = getattr(obj, "color", "")
-                    if pc in ("red", "red_yellow"):
-                        red_pts  += POINTS_STACK_BONUS
-                    elif pc in ("blue", "blue_yellow"):
-                        blue_pts += POINTS_STACK_BONUS
-                    elif pc == "yellow_yellow":
-                        if yellow_owner == "red":
-                            red_pts  += POINTS_STACK_BONUS
-                        elif yellow_owner == "blue":
-                            blue_pts += POINTS_STACK_BONUS
-                    elif pc in ("red_blue", "blue_red"):
-                        # Mixed-alliance pin: award stack bonus to whichever
-                        # alliance's half is currently UP (visible on top).
-                        up_color = obj.get_up_color()
-                        if up_color == C_RED:
-                            red_pts  += POINTS_STACK_BONUS
-                        elif up_color == C_BLUE:
-                            blue_pts += POINTS_STACK_BONUS
-
-        self.red_score  = red_pts
-        self.blue_score = blue_pts
-        return red_pts + blue_pts   # legacy callers that just want a total
+        mid_owner = midfield_majority if midfield_majority in ("red", "blue") else None
+        pts = score_stack(self.stack_desc(), self.region, toggle_owner,
+                          mid_owner, skills=skills)
+        self.red_score = pts["red"]
+        self.blue_score = pts["blue"]
+        return self.red_score + self.blue_score
 
     def draw(self, surface, font_small):
         sx = int(self.x * RENDER_SCALE)
@@ -908,7 +809,7 @@ class FieldGoal:
         pygame.draw.circle(surface, inner_color,  (sx, sy), post_r)
 
         if not self.stack:
-            score = self.get_score()
+            score = self.red_score + self.blue_score
             if font_small and score > 0:
                 txt = font_small.render(f"+{score}", True, (255, 230, 80))
                 surface.blit(txt, (sx - txt.get_width() // 2, sy + 12))
@@ -934,7 +835,7 @@ class FieldGoal:
                 vis.append(None)
                 continue
             if i == 0:
-                down_vis = False
+                down_vis = True      # sits in the goal, still visible (SC3)
             else:
                 prev_obj, prev_is_pin = self.stack[i - 1]
                 down_vis = eff_clear_up(prev_obj) if not prev_is_pin else True
@@ -992,7 +893,7 @@ class FieldGoal:
                 y = cup_y - CUP_R
 
         # Score label
-        score = self.get_score()
+        score = self.red_score + self.blue_score   # cached by rules engine
         if font_small and score > 0:
             txt = font_small.render(f"+{score}", True, (255, 230, 80))
             surface.blit(txt, (sx - txt.get_width() // 2, sy + 12))
@@ -1066,7 +967,8 @@ def create_field_objects(space: pymunk.Space):
             space,
             c.get("orientation", ORIENT_VERTICAL),
             c.get("angle", 0.0),
-            c.get("contains_pin", None)
+            c.get("contains_pin", None),
+            c.get("clear_up", True),
         )
         cups.append(cup)
         
@@ -1074,8 +976,22 @@ def create_field_objects(space: pymunk.Space):
         if cup.contains_pin:
             nested_pins.append(cup.contains_pin)
 
+    # SG7b: the 28 Scoring Objects that begin ON the Autonomous Line (the four
+    # pin+cup clusters on the y = x tape and the four red/blue pin cups on
+    # the Midfield tape) may be used by either alliance during auton.
+    for obj in pins + nested_pins + cups:
+        obj.on_auton_line = starts_on_auton_line(obj.body.position.x,
+                                                 obj.body.position.y)
+
     # Return both normal pins + nested pins
     return pins + nested_pins, cups
+
+
+def starts_on_auton_line(x: float, y: float) -> bool:
+    if abs(y - x) / math.sqrt(2) <= 6.0:            # cluster on the y = x tape
+        return True
+    l1 = abs(x - 72) + abs(y - 72)
+    return abs(l1 - 24) <= 2.0                      # on the Midfield tape
 
 def create_goals(space: pymunk.Space = None):
     return [FieldGoal(g, space) for g in GOALS]

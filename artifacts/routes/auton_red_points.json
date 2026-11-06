@@ -1,0 +1,407 @@
+{
+ "alliance": "red",
+ "planned_points": 125,
+ "physics_points": 125,
+ "physics_awp": {
+  "pins": 13,
+  "goals_with_2": 4,
+  "no_perimeter_contact": true,
+  "awp": true
+ },
+ "plans": {
+  "red1": [
+   {
+    "type": "toggle",
+    "toggle": 1,
+    "colour": "red",
+    "t_end": 1.03,
+    "score_after": 70,
+    "desc": "set toggle 1 (left wall) to red"
+   },
+   {
+    "type": "place",
+    "goal": 1,
+    "items": [
+     "pin"
+    ],
+    "flip_pin": true,
+    "flip_cup": false,
+    "t_end": 3.18,
+    "score_after": 85,
+    "desc": "reverse onto R-High and place pin (flip pin)"
+   },
+   {
+    "type": "pick_front",
+    "obj": 24,
+    "x": 2,
+    "y": 96,
+    "pull_nested": false,
+    "t_end": 4.83,
+    "desc": "front-intake cup+yellow_yellow @(2,96)"
+   },
+   {
+    "type": "place",
+    "goal": 0,
+    "items": [
+     "pin",
+     "cup"
+    ],
+    "flip_pin": false,
+    "flip_cup": false,
+    "t_end": 7.26,
+    "score_after": 105,
+    "desc": "reverse onto R-Low and place pin then cup"
+   },
+   {
+    "type": "pick_front",
+    "obj": 44,
+    "x": 24,
+    "y": 120,
+    "pull_nested": false,
+    "t_end": 8.7,
+    "desc": "front-intake cup+yellow_yellow @(24,120)"
+   },
+   {
+    "type": "place",
+    "goal": 0,
+    "items": [
+     "pin",
+     "cup"
+    ],
+    "flip_pin": false,
+    "flip_cup": true,
+    "t_end": 10.19,
+    "score_after": 115,
+    "desc": "reverse onto R-Low and place pin then cup (flip cup)"
+   },
+   {
+    "type": "pick_front",
+    "obj": 45,
+    "x": 48,
+    "y": 96,
+    "pull_nested": false,
+    "t_end": 12.06,
+    "desc": "front-intake cup+yellow_yellow @(48,96)"
+   },
+   {
+    "type": "place",
+    "goal": 0,
+    "items": [
+     "pin"
+    ],
+    "flip_pin": false,
+    "flip_cup": false,
+    "t_end": 13.44,
+    "score_after": 125,
+    "desc": "reverse onto R-Low and place pin"
+   }
+  ],
+  "red2": [
+   {
+    "type": "toggle",
+    "toggle": 4,
+    "colour": "red",
+    "t_end": 1.03,
+    "score_after": 95,
+    "desc": "set toggle 4 (bottom wall) to red"
+   },
+   {
+    "type": "pick_front",
+    "obj": 43,
+    "x": 99.2,
+    "y": 142,
+    "pull_nested": false,
+    "t_end": 3.06,
+    "desc": "front-intake cup @(99,142)"
+   },
+   {
+    "type": "place",
+    "goal": 7,
+    "items": [
+     "cup",
+     "pin"
+    ],
+    "flip_pin": true,
+    "flip_cup": false,
+    "t_end": 5.01,
+    "score_after": 105,
+    "desc": "reverse onto SE and place cup then pin (flip pin)"
+   },
+   {
+    "type": "pick_front",
+    "obj": 42,
+    "x": 96,
+    "y": 142,
+    "pull_nested": false,
+    "t_end": 6.16,
+    "desc": "front-intake cup+yellow_yellow @(96,142)"
+   },
+   {
+    "type": "place",
+    "goal": 7,
+    "items": [
+     "cup",
+     "pin"
+    ],
+    "flip_pin": false,
+    "flip_cup": false,
+    "t_end": 7.5,
+    "score_after": 115,
+    "desc": "reverse onto SE and place cup then pin"
+   },
+   {
+    "type": "pick_front",
+    "obj": 15,
+    "x": 120,
+    "y": 114,
+    "pull_nested": false,
+    "t_end": 9.62,
+    "desc": "front-intake blue_yellow pin @(120,114)"
+   },
+   {
+    "type": "pick_front",
+    "obj": 19,
+    "x": 120,
+    "y": 120,
+    "pull_nested": false,
+    "t_end": 10.24,
+    "desc": "front-intake cup @(120,120)"
+   },
+   {
+    "type": "place",
+    "goal": 7,
+    "items": [
+     "cup",
+     "pin"
+    ],
+    "flip_pin": true,
+    "flip_cup": true,
+    "t_end": 11.69,
+    "score_after": 125,
+    "desc": "reverse onto SE and place cup then pin (flip pin) (flip cup)"
+   }
+  ]
+ },
+ "action_log": {
+  "red1": [
+   {
+    "i": 0,
+    "type": "toggle",
+    "status": "ok",
+    "t": 0.6,
+    "planned_t": 1.03
+   },
+   {
+    "i": 1,
+    "type": "place",
+    "status": "ok",
+    "t": 2.75,
+    "planned_t": 3.18
+   },
+   {
+    "i": 2,
+    "type": "pick_front",
+    "status": "ok",
+    "t": 5.15,
+    "planned_t": 4.83
+   },
+   {
+    "i": 3,
+    "type": "place",
+    "status": "ok",
+    "t": 7.95,
+    "planned_t": 7.26
+   },
+   {
+    "i": 4,
+    "type": "pick_front",
+    "status": "ok",
+    "t": 9.75,
+    "planned_t": 8.7
+   },
+   {
+    "i": 5,
+    "type": "place",
+    "status": "ok",
+    "t": 11.6,
+    "planned_t": 10.19
+   },
+   {
+    "i": 6,
+    "type": "pick_front",
+    "status": "ok",
+    "t": 13.55,
+    "planned_t": 12.06
+   },
+   {
+    "i": 7,
+    "type": "place",
+    "status": "ok",
+    "t": 14.9,
+    "planned_t": 13.44
+   }
+  ],
+  "red2": [
+   {
+    "i": 0,
+    "type": "toggle",
+    "status": "ok",
+    "t": 0.6,
+    "planned_t": 1.03
+   },
+   {
+    "i": 1,
+    "type": "pick_front",
+    "status": "ok",
+    "t": 2.55,
+    "planned_t": 3.06
+   },
+   {
+    "i": 2,
+    "type": "place",
+    "status": "ok",
+    "t": 4.8,
+    "planned_t": 5.01
+   },
+   {
+    "i": 3,
+    "type": "pick_front",
+    "status": "ok",
+    "t": 6.6,
+    "planned_t": 6.16
+   },
+   {
+    "i": 4,
+    "type": "place",
+    "status": "ok",
+    "t": 8.4,
+    "planned_t": 7.5
+   },
+   {
+    "i": 5,
+    "type": "pick_front",
+    "status": "ok",
+    "t": 10.05,
+    "planned_t": 9.62
+   },
+   {
+    "i": 6,
+    "type": "pick_front",
+    "status": "ok",
+    "t": 10.45,
+    "planned_t": 10.24
+   },
+   {
+    "i": 7,
+    "type": "place",
+    "status": "ok",
+    "t": 12.1,
+    "planned_t": 11.69
+   }
+  ]
+ },
+ "final_stacks": {
+  "R-Low": [
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ],
+   [
+    "cup",
+    false
+   ],
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ],
+   [
+    "cup",
+    false
+   ],
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ]
+  ],
+  "R-High": [
+   [
+    "pin",
+    "red",
+    "yellow"
+   ]
+  ],
+  "B-Low": [],
+  "B-High": [],
+  "Center": [
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ]
+  ],
+  "NW": [
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ]
+  ],
+  "SW": [
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ]
+  ],
+  "SE": [
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ],
+   [
+    "cup",
+    false
+   ],
+   [
+    "pin",
+    "red",
+    "yellow"
+   ],
+   [
+    "cup",
+    false
+   ],
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ],
+   [
+    "cup",
+    false
+   ],
+   [
+    "pin",
+    "blue",
+    "yellow"
+   ]
+  ],
+  "NE": [
+   [
+    "pin",
+    "yellow",
+    "yellow"
+   ]
+  ]
+ },
+ "final_toggles": {
+  "1": "red",
+  "2": "yellow",
+  "3": "yellow",
+  "4": "red"
+ }
+}

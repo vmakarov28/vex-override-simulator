@@ -156,7 +156,9 @@ def main():
     print(f"[BotSkills] Seed (base): {base_seed}")
     print(f"[BotSkills] Rendering  : {'on' if render else 'OFF (headless)'}")
 
-    sim  = OverrideSimulator(headless=args.headless, skills_mode=True)
+    from config.robot_profile import LEGACY_ROBOT   # bot assumes centre scoring
+    sim  = OverrideSimulator(headless=args.headless, skills_mode=True,
+                             robot_profiles={'red1': LEGACY_ROBOT})
     sim.rng = np.random.default_rng(base_seed)
     bot  = HeuristicBot("red1", sim)
 

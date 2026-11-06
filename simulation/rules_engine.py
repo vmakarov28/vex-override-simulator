@@ -1,10 +1,13 @@
 """
 simulation/rules_engine.py
-Full VEX Override scoring + rules per the official game manual.
-- Cups = 0 points alone
-- Pins = 5 points when placed
-- Stack bonus only for proper nesting (pin → cup → pin → cup ...)
-- Toggle control applies yellow pin bonus to the 2 closest goals
+VEX Override scoring + rules per the official game manual v2.0.
+- Each visible red/blue pin half = 5, each visible Owned yellow half = 10
+- Cups score nothing; there is no stack bonus
+- Yellow ownership: Quadrant toggle (SC5a) or Midfield robot majority (SC5b)
+- +8 per robot ending the match in the Midfield (SC6), end of match only
+- Autonomous Bonus 12 (tie: 6 each), Autonomous Win Point check (SC8)
+- Robot Skills scoring restrictions (RSC3)
+The per-goal math lives in simulation/scoring.py (shared with strategy/).
 """
 
 from config.game_rules import (
@@ -41,6 +44,8 @@ def get_controlling_toggle(x: float, y: float) -> int:
 
 
 class RulesEngine:
+    VERBOSE = True   # print the [SC5b] diagnostic at match end
+
     def __init__(self, skills_mode: bool = False):
         # Skills mode = single-robot solo challenge (no alliance opposition).
         # When True, recompute_all_scores folds blue-side scoring into the
@@ -112,14 +117,40 @@ class RulesEngine:
 
     # ── Midfield helpers ──────────────────────────────────────────────
     @staticmethod
+    def robot_outline(robot, n_per_edge: int = 4):
+        """Sample points on the robot's rectangular footprint."""
+        a = robot.body.angle
+        c, s_ = math.cos(a), math.sin(a)
+        px, py = robot.body.position
+        hl = getattr(robot, "robot_length", 15.0) / 2.0
+        hw = getattr(robot, "robot_width", 15.0) / 2.0
+        corners = [(-hl, -hw), (hl, -hw), (hl, hw), (-hl, hw)]
+        pts = [(px, py)]
+        for i in range(4):
+            (x0, y0), (x1, y1) = corners[i], corners[(i + 1) % 4]
+            for k in range(n_per_edge):
+                t = k / n_per_edge
+                lx, ly = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+                pts.append((px + lx * c - ly * s_, py + lx * s_ + ly * c))
+        return pts
+
+    @staticmethod
     def is_robot_in_midfield(robot) -> bool:
-        """True if any part of the robot is within the Midfield plane.
-        Uses L1 (Manhattan) distance which matches the diamond boundary,
-        plus a 10-inch buffer for robot physical size (SC6: 'any part').
-        """
+        """SC6: at least partially within the Midfield (the tape square,
+        a diamond |dx|+|dy| <= 24 around the field centre)."""
         mc_x, mc_y = MIDFIELD_CENTER
-        rx, ry = robot.body.position
-        return abs(rx - mc_x) + abs(ry - mc_y) <= MIDFIELD_HALF + 10.0
+        for x, y in RulesEngine.robot_outline(robot):
+            if abs(x - mc_x) + abs(y - mc_y) <= MIDFIELD_HALF:
+                return True
+        return False
+
+    @staticmethod
+    def robot_touches_perimeter(robot, tol: float = 0.75) -> bool:
+        from config.game_rules import FIELD_WIDTH, FIELD_HEIGHT
+        for x, y in RulesEngine.robot_outline(robot, 2):
+            if x <= tol or y <= tol or x >= FIELD_WIDTH - tol or y >= FIELD_HEIGHT - tol:
+                return True
+        return False
 
     def _update_midfield_counts(self, robots: list):
         """Count robots in midfield and compute live parking bonus."""
@@ -170,23 +201,16 @@ class RulesEngine:
 
         # ── Goal stack scoring (toggle-based, stable) ─────────────────
         for goal in goals:
-            goal.get_score(toggles)   # updates goal.red_score / goal.blue_score
+            goal.get_score(toggles, skills=self.skills_mode)
             red  += goal.red_score
             blue += goal.blue_score
 
-        # ── Live midfield parking bonus (endgame only) ────────────────
-        # Only the +8-per-robot bonus updates live.  Yellow pin ownership
-        # for the center goal (SC5b) is NOT applied here — it locks in at
-        # match end to prevent confusing score swings.
-        if self.endgame_active and robots:
+        # ── Midfield robots (SC6) ──────────────────────────────────────
+        # Counted ONLY at match end (calculate_final_score).  Live counts are
+        # kept for the HUD / bots but NOT added to the score.  (The old sim
+        # added +8/robot live during the last 20 s.)
+        if robots:
             self._update_midfield_counts(robots)
-            red  += self.midfield_red_bonus
-            blue += self.midfield_blue_bonus
-        else:
-            self.midfield_red_count  = 0
-            self.midfield_blue_count = 0
-            self.midfield_red_bonus  = 0
-            self.midfield_blue_bonus = 0
 
         # Persist the auton bonus (+12 to the auton winner) across frames.
         red  += self.auton_bonus_red
@@ -218,6 +242,8 @@ class RulesEngine:
           Regular red/blue halves in the center goal were already scored
           live and are not affected.
         """
+        # Base: goal stacks with toggle ownership (no Midfield yet).
+        self.recompute_all_scores(goals, toggles, robots)
         # Recount robots in midfield at the exact moment the match ends.
         # We do NOT rely on self.midfield_*_count because those are reset to
         # 0 outside the endgame window in recompute_all_scores; reading them
@@ -226,7 +252,10 @@ class RulesEngine:
         self._update_midfield_counts(robots)
         r_count = self.midfield_red_count
         b_count = self.midfield_blue_count
-        if r_count > b_count:
+        if self.skills_mode:
+            # RSC3a.iii.2: Midfield yellows are Owned if the robot ends there.
+            majority = "red" if r_count > 0 else "tie"
+        elif r_count > b_count:
             majority = "red"
         elif b_count > r_count:
             majority = "blue"
@@ -243,7 +272,8 @@ class RulesEngine:
         if center_goal:
             old_r = center_goal.red_score
             old_b = center_goal.blue_score
-            center_goal.get_score(toggles, midfield_majority=majority)
+            center_goal.get_score(toggles, midfield_majority=majority,
+                                  skills=self.skills_mode)
             delta_r = center_goal.red_score - old_r
             delta_b = center_goal.blue_score - old_b
             if self.skills_mode:
@@ -261,7 +291,7 @@ class RulesEngine:
                     continue
                 # DOWN visibility
                 if i == 0:
-                    down_vis = False
+                    down_vis = True
                 else:
                     prev_obj, prev_is_pin = center_goal.stack[i - 1]
                     if prev_is_pin:
@@ -290,9 +320,17 @@ class RulesEngine:
         # v9.3 PROBLEM 71: emit a diagnostic line so the SC5b adjustment is
         # visible in match-end output.  This makes future "yellow not credited"
         # bugs immediately obvious without needing to instrument anything.
-        print(f"[SC5b] midfield: red={r_count} blue={b_count} -> majority={majority} | "
-              f"center_yellow_visible={n_yellow_visible} | "
-              f"+pts: red={delta_r} blue={delta_b}")
+        # SC6: +8 per robot at least partially in the Midfield at the end.
+        self.red_score  += self.midfield_red_bonus
+        if self.skills_mode:
+            self.red_score += self.midfield_blue_bonus
+        else:
+            self.blue_score += self.midfield_blue_bonus
+        if RulesEngine.VERBOSE:
+            print(f"[SC5b] midfield: red={r_count} blue={b_count} -> majority={majority} | "
+                  f"center_yellow_visible={n_yellow_visible} | "
+                  f"+pts: red={delta_r} blue={delta_b} | "
+                  f"park +{self.midfield_red_bonus}/+{self.midfield_blue_bonus}")
 
         return {
             "red":  self.red_score,
@@ -303,3 +341,36 @@ class RulesEngine:
             "midfield_red_count":   r_count,
             "midfield_blue_count":  b_count,
         }
+
+    # ── Autonomous Win Point (SC8) ─────────────────────────────────────
+    def autonomous_win_point(self, goals: list, toggles: list, robots: list,
+                             alliance: str, worlds: bool = False) -> Dict:
+        """Evaluate SC8 for `alliance` at the end of the Autonomous Period.
+        "Pins Scored" = Scored pin halves, only counting goals in Quadrants on
+        the opposing side of the Autonomous Line are excluded.  Midfield goal
+        alliance-colour halves count; Midfield yellows are not Owned in
+        auton (SC7a)."""
+        from config.game_rules import (AWP_MIN_PINS, AWP_MIN_GOALS_WITH_2,
+                                       AWP_MIN_PINS_WORLDS, AWP_MIN_GOALS_WITH_2_WORLDS)
+        from simulation.scoring import scored_halves, QUADRANT_COLOR, TOGGLE_OF_QUADRANT
+        need_pins = AWP_MIN_PINS_WORLDS if worlds else AWP_MIN_PINS
+        need_goals = AWP_MIN_GOALS_WITH_2_WORLDS if worlds else AWP_MIN_GOALS_WITH_2
+        owners = {t.toggle_id: t.owner for t in toggles}
+        total = 0
+        goals_with_2 = 0
+        for g in goals:
+            if g.region != "midfield" and QUADRANT_COLOR[g.region] != alliance:
+                continue          # opposing side of the Autonomous Line
+            owner = None
+            if g.region != "midfield":
+                owner = owners.get(TOGGLE_OF_QUADRANT[g.region])
+                owner = owner if owner in ("red", "blue") else None
+            n = scored_halves(g.stack_desc(), g.region, owner, alliance)
+            total += n
+            if n >= 2:
+                goals_with_2 += 1
+        no_perimeter = not any(self.robot_touches_perimeter(r) for r in robots
+                               if r.alliance == alliance)
+        return {"pins": total, "goals_with_2": goals_with_2,
+                "no_perimeter_contact": no_perimeter,
+                "awp": total >= need_pins and goals_with_2 >= need_goals and no_perimeter}

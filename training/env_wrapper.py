@@ -106,7 +106,11 @@ class OverrideEnv:
         self.rng             = np.random.default_rng(seed)
         self._step_count     = 0
 
-        self.sim = OverrideSimulator(headless=headless)
+        # RL action space has no rear intake; train on the legacy robot model.
+        from config.robot_profile import LEGACY_ROBOT
+        self.sim = OverrideSimulator(
+            headless=headless,
+            robot_profiles={rid: LEGACY_ROBOT for rid in ('red1', 'red2', 'blue1', 'blue2')})
 
         self._prev_red_score  = 0
         self._prev_blue_score = 0
@@ -1112,12 +1116,12 @@ class OverrideEnv:
 
                 # Determine which halves are actually visible at placement time.
                 # UP half: always visible — it is now the top of the stack.
-                # DOWN half: hidden by the goal post for the first pin (index 0);
-                #            for deeper pins, visible only if the cup below has its
-                #            clear side facing up (dark side down = blocks nothing).
+                # DOWN half: the first pin's bottom half sits in the goal and IS
+                #            visible (manual SC3 / Figure SC5); for deeper pins,
+                #            visible only if the cup below has its clear side up.
                 up_vis = True
                 if pin_idx == 0:
-                    down_vis = False  # goal post always hides the bottom-most pin's DOWN half
+                    down_vis = True
                 else:
                     prev_obj, prev_is_pin = post_stack[pin_idx - 1]
                     down_vis = _eff_clear_up(prev_obj) if not prev_is_pin else True

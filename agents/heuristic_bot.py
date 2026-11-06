@@ -2576,7 +2576,7 @@ class HeuristicBot:
                             up_vis = not eff_clear_up
                     # DOWN half visible iff pin-below or cup-below with clear_up.
                     if i == 0:
-                        down_vis = False
+                        down_vis = True    # bottom half in the goal is visible (SC3)
                     else:
                         prev_obj, prev_is_pin = g.stack[i - 1]
                         if prev_is_pin:

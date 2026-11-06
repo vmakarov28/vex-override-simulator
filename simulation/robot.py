@@ -28,8 +28,10 @@ from config.game_rules import (
     POINTS_PIN_IN_GOAL, POINTS_CUP_IN_GOAL, POINTS_STACK_BONUS,
     ROBOT_STARTS,
 )
+from config.robot_profile import RobotProfile, DEFAULT_PROFILE
 from simulation.game_objects import (
-    ORIENT_HORIZONTAL,
+    ORIENT_HORIZONTAL, ORIENT_VERTICAL,
+    CAT_ROBOT_RED, CAT_ROBOT_BLUE,
     COLL_TYPE_ROBOT,
     CAT_WALL, CAT_GOAL, CAT_ROBOT, CAT_PIN, CAT_CUP,
     GamePin,
@@ -49,30 +51,38 @@ ROBOT_FILTER = pymunk.ShapeFilter(
 class Robot:
     """One VEX Override robot with differential drive, intake, and scoring."""
 
-    def __init__(self, robot_id: str, alliance: str, space: pymunk.Space):
+    def __init__(self, robot_id: str, alliance: str, space: pymunk.Space,
+                 profile: RobotProfile = None):
         self.robot_id = robot_id
         self.alliance = alliance
         self.space = space
+        self.profile = profile or DEFAULT_PROFILE
 
         start = ROBOT_STARTS[robot_id]
         self.start_pos   = start["pos"]
         self.start_angle = start["angle"]
 
         mass = 15.0
-        self.robot_width  = 17.0
-        self.robot_length = 15.0
+        # NOTE: pymunk box (w, h) puts the first size along the body x-axis,
+        # which is the robot's FORWARD direction.  So robot_length goes first.
+        self.robot_width  = float(self.profile.width)
+        self.robot_length = float(self.profile.length)
 
-        moment = pymunk.moment_for_box(mass, (self.robot_width, self.robot_length))
+        moment = pymunk.moment_for_box(mass, (self.robot_length, self.robot_width))
         self.body = pymunk.Body(mass, moment)
         self.body.position = self.start_pos
         self.body.angle    = self.start_angle
 
         self.shape = pymunk.Poly.create_box(
-            self.body, (self.robot_width, self.robot_length))
+            self.body, (self.robot_length, self.robot_width))
         self.shape.friction       = 0.35          # realistic plastic/metal
         self.shape.elasticity     = 0.05
         self.shape.collision_type = COLL_TYPE_ROBOT
-        self.shape.filter         = ROBOT_FILTER
+        alliance_cat = CAT_ROBOT_RED if alliance == "red" else CAT_ROBOT_BLUE
+        self.shape.filter = pymunk.ShapeFilter(
+            categories=CAT_ROBOT | alliance_cat,
+            mask=CAT_WALL | CAT_GOAL | CAT_ROBOT | CAT_PIN | CAT_CUP,
+        )
         self.shape.game_object    = self
         space.add(self.body, self.shape)
 
@@ -81,6 +91,8 @@ class Robot:
         self.successful_scores: int          = 0
         self.foul_count: int                 = 0
         self.intake_cooldown: float          = 0.0
+        self.mech_busy: float                = 0.0   # scoring / flipping lockout (s)
+        self.toggle_progress: float          = 0.0
         self.intake_in_progress: bool        = False
         self.pending_intake_object           = None
         self.is_scoring: bool                = False
@@ -88,25 +100,59 @@ class Robot:
         self.scoring_objects                 = []
         self.lift_state: float               = 0.0
         self.lift_target: float              = 0.0
+        self._dt: float                      = 1 / 60.0
+        # Set by the simulator: callable(x, y) -> bool, False when an object
+        # at (x, y) may not be touched right now (opponent side in auton).
+        self.touch_allowed = None
 
+    # ── geometry helpers ─────────────────────────────────────────────────
+    def _point_along(self, dist: float):
+        a = self.body.angle
+        p = self.body.position
+        return p.x + math.cos(a) * dist, p.y + math.sin(a) * dist
+
+    def front_point(self):
+        return self._point_along(self.robot_length / 2.0 + 2.0)
+
+    def rear_point(self):
+        return self._point_along(-(self.robot_length / 2.0 + 2.0))
+
+    def score_point(self):
+        side = self.profile.score_side
+        if side == "rear":
+            return self.rear_point()
+        if side == "front":
+            return self.front_point()
+        p = self.body.position
+        return p.x, p.y
+
+    # Drive force is applied on EVERY physics substep (physics_substep).  The
+    # old code applied it once per step() call, so only the first of N
+    # substeps was driven and the robot's speed depended on the step size.
+    # DRIVE_SCALE reproduces the original interactive feel (1 driven substep
+    # in 4 at 60 fps): ~60 in/s top speed, ~190 deg/s turning.
+    DRIVE_SCALE = 0.25
+
+    def physics_substep(self):
+        left, right = getattr(self, "_cmd", (0.0, 0.0))
+        thrust = (left + right) * ROBOT_DRIVE_FORCE * self.DRIVE_SCALE
+        torque = (right - left) * ROBOT_TURN_TORQUE * self.DRIVE_SCALE
+        angle = self.body.angle
+        self.body.apply_force_at_world_point(
+            (math.cos(angle) * thrust, math.sin(angle) * thrust), self.body.position)
+        self.body.torque += torque
+        vmax = min(ROBOT_MAX_SPEED, self.profile.max_speed * 1.15)
+        if self.body.velocity.length > vmax:
+            self.body.velocity = self.body.velocity.normalized() * vmax
 
     def apply_drive(self, left: float, right: float):
-        thrust = (left + right) * ROBOT_DRIVE_FORCE
-        torque = (right - left) * ROBOT_TURN_TORQUE
-
-        angle = self.body.angle
-        fx = math.cos(angle) * thrust
-        fy = math.sin(angle) * thrust
-        self.body.apply_force_at_world_point((fx, fy), self.body.position)
-        self.body.torque += torque
-
-        if self.body.velocity.length > ROBOT_MAX_SPEED:
-            self.body.velocity = self.body.velocity.normalized() * ROBOT_MAX_SPEED
-
+        self._cmd = (float(left), float(right))
+        dt = self._dt
         if abs(left) < 0.1 and abs(right) < 0.1:
             brake = 0.35 if (self.carrying_pin or self.carrying_cup) else 0.55
-            self.body.velocity *= brake
-            self.body.angular_velocity *= 0.32
+            k = dt * 60.0                       # tuned per 1/60 s frame
+            self.body.velocity *= brake ** k
+            self.body.angular_velocity *= 0.32 ** k
 
         self.lift_target = 1.0 if (self.carrying_pin or self.carrying_cup) else 0.0
         if self.lift_target > self.lift_state:
@@ -115,241 +161,224 @@ class Robot:
             self.lift_state = max(self.lift_state - 0.10, self.lift_target)
 
         if self.intake_cooldown > 0:
-            self.intake_cooldown -= 1 / 60.0
+            self.intake_cooldown -= dt
+        if self.mech_busy > 0:
+            self.mech_busy -= dt
 
         if self.is_scoring and self.scoring_timer > 0:
-            self.scoring_timer -= 1 / 60.0
+            self.scoring_timer -= dt
             if self.scoring_timer <= 0:
                 self.is_scoring = False
                 self.scoring_objects = []
 
-    def try_intake(self, pins: list, cups: list) -> bool:
-        """Attempt to intake the nearest eligible object in front of the robot.
+    # ── intake ───────────────────────────────────────────────────────────
+    def _touch_ok(self, obj) -> bool:
+        if self.touch_allowed is None:
+            return True
+        if getattr(obj, "on_auton_line", False):
+            return True
+        p = obj.body.position
+        return self.touch_allowed(p.x, p.y)
 
-        Possession rules (strictly enforced):
-          - At most 1 pin  held at any time.
-          - At most 1 cup  held at any time.
-          - Having both is legal; the robot is simply full when both slots are
-            occupied and will refuse further intakes until one is scored.
+    def _grab(self, obj, kind: str):
+        angle = self.body.angle
+        obj.carried_by  = self.robot_id
+        obj.orientation = ORIENT_HORIZONTAL
+        obj.body.angle  = angle
+        obj.body.velocity         = (0, 0)
+        obj.body.angular_velocity = 0
+        if hasattr(obj, "is_nested"):
+            obj.is_nested = False
+        obj.set_carried()
+        obj._build_shape()
+        if kind == "pin":
+            self.carrying_pin = obj
+        else:
+            self.carrying_cup = obj
 
-        Intake geometry:
-          - The search origin is the robot's front face centre.
-          - Objects within INTAKE_RADIUS inches of that origin are eligible.
-          - We also accept objects that are within INTAKE_RADIUS of the robot's
-            body centre (catches wall-pinned pieces that slide behind the nose).
-          - Closest eligible object wins (separate closest for pin vs cup so
-            that spamming E while carrying 1 cup will grab the nearest pin
-            regardless of nearby cups, and vice-versa).
+    def try_intake(self, pins: list, cups: list, only=None) -> bool:
+        """FRONT intake: nearest loose pin or cup in front of the robot.
+
+        Possession (SG6): at most 1 pin + 1 cup.  A cup with a nested pin
+        is taken as both at once when the pin slot is free; if the robot
+        already holds a pin, a loaded cup cannot be taken (would be 2 pins).
         """
         if self.intake_cooldown > 0:
             return False
-
         has_pin = self.carrying_pin is not None
         has_cup = self.carrying_cup is not None
-
-        # Both slots full — nothing to do.
         if has_pin and has_cup:
             return False
+        fx, fy = self.front_point()
 
-        pos   = self.body.position
-        angle = self.body.angle
-
-        # Two candidate origins: front-face centre and body centre.
-        # Using both catches objects pinned against the wall that have slid
-        # slightly behind the robot's geometric front point.
-        half_len = self.robot_length / 2.0
-        front_x  = pos.x + math.cos(angle) * (half_len + 2.0)
-        front_y  = pos.y + math.sin(angle) * (half_len + 2.0)
-
-        def in_range(obj_pos):
-            """True if obj_pos is within INTAKE_RADIUS of front OR body."""
-            d_front = math.hypot(obj_pos.x - front_x, obj_pos.y - front_y)
-            d_body  = math.hypot(obj_pos.x - pos.x,   obj_pos.y - pos.y)
-            return min(d_front, d_body), d_front <= INTAKE_RADIUS or d_body <= INTAKE_RADIUS
-
-        best_pin  = None;  best_pin_d  = 999.0
-        best_cup  = None;  best_cup_d  = 999.0
-
-        # ── Pin search (only if we don't already have one) ──────────────
-        if not has_pin:
+        best, best_d, best_kind = None, INTAKE_RADIUS, None
+        if not has_pin and self.profile.front_intake_pins:
             for pin in pins:
                 if pin.carried_by is not None or getattr(pin, 'scored', False):
                     continue
                 if getattr(pin, 'is_nested', False):
-                    continue          # nested pins are picked up with their cup
-                d, ok = in_range(pin.body.position)
-                if ok and d < best_pin_d:
-                    best_pin_d = d
-                    best_pin   = pin
-
-        # ── Cup search (only if we don't already have one) ──────────────
-        if not has_cup:
+                    continue          # nested pins come with their cup
+                if only is not None and pin not in only:
+                    continue
+                d = math.hypot(pin.body.position.x - fx, pin.body.position.y - fy)
+                if d <= best_d and self._touch_ok(pin):
+                    best, best_d, best_kind = pin, d, "pin"
+        if not has_cup and self.profile.front_intake_cups:
             for cup in cups:
                 if cup.carried_by is not None or getattr(cup, 'scored', False):
                     continue
-                d, ok = in_range(cup.body.position)
-                if ok and d < best_cup_d:
-                    best_cup_d = d
-                    best_cup   = cup
-
-        # ── Choose: prefer whichever is closer, subject to what we need ─
-        # If we need both, grab the closer one first.
-        # If we only need one type, grab that type.
-        target_obj  = None
-        target_type = None
-
-        if best_pin is not None and best_cup is not None:
-            # Need both — take the closer one.
-            if best_pin_d <= best_cup_d:
-                target_obj, target_type = best_pin, "pin"
-            else:
-                target_obj, target_type = best_cup, "cup"
-        elif best_pin is not None:
-            target_obj, target_type = best_pin, "pin"
-        elif best_cup is not None:
-            target_obj, target_type = best_cup, "cup"
-
-        if target_obj is None:
+                if cup.contains_pin is not None and has_pin:
+                    continue          # would exceed 1 pin
+                if only is not None and cup not in only:
+                    continue
+                d = math.hypot(cup.body.position.x - fx, cup.body.position.y - fy)
+                if d <= best_d and self._touch_ok(cup):
+                    best, best_d, best_kind = cup, d, "cup"
+        if best is None:
             return False
 
-        # ── Perform intake ───────────────────────────────────────────────
-        target_obj.carried_by  = self.robot_id
-        target_obj.orientation = ORIENT_HORIZONTAL
-        target_obj.body.angle  = angle
-        target_obj.body.velocity         = (0, 0)
-        target_obj.body.angular_velocity = 0
-        target_obj.set_carried()
-        target_obj._build_shape()
-
-        if target_type == "pin":
-            self.carrying_pin = target_obj
-
-        else:  # cup
-            self.carrying_cup = target_obj
-
-            # If the cup has a nested pin AND we don't already have a pin,
-            # extract it as a separately carried pin.
-            # If we already carry a pin, leave the nested pin inside the cup
-            # (the robot takes the cup-with-pin as one unit).
-            nested = target_obj.contains_pin
-            if nested is not None and self.carrying_pin is None:
-                nested.carried_by          = self.robot_id
-                nested.orientation         = ORIENT_HORIZONTAL
-                nested.body.angle          = angle
-                nested.body.velocity       = (0, 0)
-                nested.body.angular_velocity = 0
-                nested.set_carried()
-                if nested.shape:
-                    nested.shape.filter = CARRIED_FILTER
-                self.carrying_pin          = nested
-                target_obj.contains_pin    = None
-                if hasattr(nested, 'is_nested'):
-                    nested.is_nested = False   # allow it to render normally
-
-        # Short cooldown prevents a single keypress registering as two intakes.
-        self.intake_cooldown = 0.15
+        if best_kind == "pin":
+            self._grab(best, "pin")
+        else:
+            nested = best.contains_pin
+            self._grab(best, "cup")
+            if nested is not None:
+                best.contains_pin = None
+                self._grab(nested, "pin")
+        self.intake_cooldown = self.profile.intake_time
         return True
 
-    def try_score_pin(self, goals: list, rules_engine) -> bool:
-        if not self.carrying_pin: return False
-        pos = self.body.position
-        for goal in goals:
-            if math.hypot(pos.x - goal.x, pos.y - goal.y) > SCORING_RADIUS: continue
-
-            # Alliance goals: only the matching alliance may score here.
-            if goal.alliance != "neutral" and goal.alliance != self.alliance:
+    def try_intake_rear(self, pins: list, cups: list, only=None) -> bool:
+        """BACK intake: VERTICAL pins only (standing alone, or standing up in
+        a vertical cup when rear_pulls_nested_pin)."""
+        if not self.profile.rear_intake_vertical_pins:
+            return False
+        if self.intake_cooldown > 0 or self.carrying_pin is not None:
+            return False
+        rx, ry = self.rear_point()
+        best, best_d, best_cup = None, INTAKE_RADIUS, None
+        for pin in pins:
+            if pin.carried_by is not None or getattr(pin, 'scored', False):
                 continue
-
-            # Endgame: central goal is locked once the stack reaches
-            # Pin + Cup + Pin (3 items). Locked in if already at/above that
-            # height before endgame started.
-            if getattr(rules_engine, 'endgame_active', False):
-                from config.game_rules import CENTER_GOAL_ID, ENDGAME_CENTER_MAX_STACK
-                if goal.goal_id == CENTER_GOAL_ID and len(goal.stack) >= ENDGAME_CENTER_MAX_STACK:
+            if getattr(pin, 'is_nested', False) or pin.orientation != ORIENT_VERTICAL:
+                continue
+            if only is not None and pin not in only:
+                continue
+            d = math.hypot(pin.body.position.x - rx, pin.body.position.y - ry)
+            if d <= best_d and self._touch_ok(pin):
+                best, best_d, best_cup = pin, d, None
+        if self.profile.rear_pulls_nested_pin:
+            for cup in cups:
+                if cup.contains_pin is None or cup.carried_by is not None:
                     continue
-
-            # Prevent pin on pin (illegal stack) — skip this goal, keep trying others
-            if goal.stack:
-                last_obj, last_is_pin = goal.stack[-1]
-                if last_is_pin:
+                if getattr(cup, 'scored', False) or cup.orientation != ORIENT_VERTICAL:
                     continue
+                if only is not None and cup not in only:
+                    continue
+                d = math.hypot(cup.body.position.x - rx, cup.body.position.y - ry)
+                if d <= best_d and self._touch_ok(cup):
+                    best, best_d, best_cup = cup.contains_pin, d, cup
+        if best is None:
+            return False
+        if best_cup is not None:
+            best_cup.contains_pin = None
+            best.body.position = best_cup.body.position
+        self._grab(best, "pin")
+        self.intake_cooldown = self.profile.intake_time
+        return True
 
-            rules_engine.process_scored_object(goal, self.carrying_pin, self.alliance)
-            self.carrying_pin.scored = True
-            self.carrying_pin.goal_id = goal.goal_id
-            try:
-                if self.carrying_pin.shape and self.carrying_pin.shape in self.space.shapes:
-                    self.space.remove(self.carrying_pin.shape)
-                if self.carrying_pin.body in self.space.bodies:
-                    self.space.remove(self.carrying_pin.body)
-            except: pass
-            self.carrying_pin = None
-            self.successful_scores += 1
-            self.is_scoring = True
-            self.scoring_timer = 0.5
-            return True
-        return False
+    # ── scoring ──────────────────────────────────────────────────────────
+    def _goal_accepts(self, goal, kind: str, rules_engine) -> bool:
+        from config.game_rules import (CENTER_GOAL_ID, GOAL_HEIGHT,
+                                       PIN_STACK_HEIGHT)
+        skills = getattr(rules_engine, "skills_mode", False)
+        # SG9: never touch the opponent's alliance goals (Skills: RSC2e
+        # allows every goal).
+        if not skills and goal.alliance != "neutral" and goal.alliance != self.alliance:
+            return False
+        # SG12 (v2.0): no Placing on the Midfield Goal during the Endgame.
+        if getattr(rules_engine, 'endgame_active', False) and goal.goal_id == CENTER_GOAL_ID:
+            return False
+        if self.touch_allowed is not None and not self.touch_allowed(goal.x, goal.y):
+            return False
+        if goal.stack:
+            last_is_pin = goal.stack[-1][1]
+        else:
+            last_is_pin = None
+        if kind == "pin" and last_is_pin is True:
+            return False
+        if kind == "cup" and last_is_pin is not True:
+            return False
+        n_pins = sum(1 for _, ip in goal.stack if ip)
+        top = GOAL_HEIGHT[goal.kind] + PIN_STACK_HEIGHT * n_pins
+        if top > self.profile.max_place_height:
+            return False
+        return True
 
-    def try_toggle(self, toggles: list) -> bool:
-        """Try to flip the nearest toggle.
+    def _in_score_range(self, goal) -> bool:
+        sx, sy = self.score_point()
+        return math.hypot(sx - goal.x, sy - goal.y) <= SCORING_RADIUS
 
-        Single-flip alliance takeover: pressing toggle while next to a
-        toggle that is NOT already ours sets it to our alliance directly.
-        If it's already ours, it's a no-op (pressing toggle on an own
-        toggle previously cycled red→blue→yellow, accidentally giving
-        ownership to the opponent — that exploit is closed).
-        """
-        pos = self.body.position
-        for toggle in toggles:
-            dist = math.hypot(pos.x - toggle.x, pos.y - toggle.y)
-            if dist <= 18:  # interaction range
-                if toggle.owner == self.alliance:
-                    return False         # no-op; don't give it away
-                toggle.owner = self.alliance
+    def _place(self, goal, obj, rules_engine, attr: str):
+        rules_engine.process_scored_object(goal, obj, self.alliance)
+        obj.scored = True
+        obj.goal_id = goal.goal_id
+        try:
+            if obj.shape and obj.shape in self.space.shapes:
+                self.space.remove(obj.shape)
+            if obj.body in self.space.bodies:
+                self.space.remove(obj.body)
+        except Exception:
+            pass
+        setattr(self, attr, None)
+        self.successful_scores += 1
+        self.is_scoring = True
+        self.scoring_timer = 0.5
+
+    def try_score_pin(self, goals: list, rules_engine) -> bool:
+        if not self.carrying_pin or self.mech_busy > 0:
+            return False
+        for goal in goals:
+            if self._in_score_range(goal) and self._goal_accepts(goal, "pin", rules_engine):
+                self._place(goal, self.carrying_pin, rules_engine, "carrying_pin")
+                self.mech_busy = self.profile.score_pin_time
                 return True
         return False
 
     def try_score_cup(self, goals: list, rules_engine) -> bool:
-        if not self.carrying_cup: 
+        if not self.carrying_cup or self.mech_busy > 0:
             return False
-        pos = self.body.position
         for goal in goals:
-            if math.hypot(pos.x - goal.x, pos.y - goal.y) > SCORING_RADIUS: 
-                continue
+            if self._in_score_range(goal) and self._goal_accepts(goal, "cup", rules_engine):
+                # The cup half facing the FRONT of the robot goes DOWN.
+                self._place(goal, self.carrying_cup, rules_engine, "carrying_cup")
+                self.mech_busy = self.profile.score_cup_time
+                return True
+        return False
 
-            # Alliance goals: only the matching alliance may score here.
-            if goal.alliance != "neutral" and goal.alliance != self.alliance:
-                continue
-
-            # Endgame: central goal locked once stack reaches Pin+Cup+Pin (3 items).
-            if getattr(rules_engine, 'endgame_active', False):
-                from config.game_rules import CENTER_GOAL_ID, ENDGAME_CENTER_MAX_STACK
-                if goal.goal_id == CENTER_GOAL_ID and len(goal.stack) >= ENDGAME_CENTER_MAX_STACK:
-                    continue
-
-            # Prevent illegal stacks (cup must go on a pin) — skip this goal, keep trying others
-            if not goal.stack:
-                continue
-            last_obj, last_is_pin = goal.stack[-1]
-            if not last_is_pin:
-                continue
-
-            # The side facing the FRONT of the robot goes DOWN on the goal.
-            rules_engine.process_scored_object(goal, self.carrying_cup, self.alliance)
-            self.carrying_cup.scored = True
-            self.carrying_cup.goal_id = goal.goal_id
-            try:
-                if self.carrying_cup.shape and self.carrying_cup.shape in self.space.shapes:
-                    self.space.remove(self.carrying_cup.shape)
-                if self.carrying_cup.body in self.space.bodies:
-                    self.space.remove(self.carrying_cup.body)
-            except: 
-                pass
-            self.carrying_cup = None
-            self.successful_scores += 1
-            self.is_scoring = True
-            self.scoring_timer = 0.5
-            return True
+    def try_toggle(self, toggles: list, skills: bool = False) -> bool:
+        """Push on the nearest toggle.  It only changes colour after
+        TOGGLE_SET_TIME seconds of continuous contact (the old sim flipped it
+        instantly).  Head-to-head: sets it to our alliance.  Skills (RSC3):
+        sets it to the colour of its own Quadrant, the only setting that
+        makes yellow pins there Owned."""
+        from config.game_rules import TOGGLE_SET_TIME, TOGGLE_INTERACTION_RANGE
+        pos = self.body.position
+        for toggle in toggles:
+            if math.hypot(pos.x - toggle.x, pos.y - toggle.y) <= TOGGLE_INTERACTION_RANGE:
+                target = toggle.quadrant if skills else self.alliance
+                if toggle.owner == target:
+                    self.toggle_progress = 0.0
+                    return False
+                if self.touch_allowed is not None and not self.touch_allowed(toggle.x, toggle.y):
+                    return False
+                self.toggle_progress += self._dt
+                if self.toggle_progress >= TOGGLE_SET_TIME:
+                    toggle.owner = target
+                    self.toggle_progress = 0.0
+                    return True
+                return False
+        self.toggle_progress = 0.0
         return False
 
     def try_score(self, goals: list, rules_engine) -> bool:
@@ -407,6 +436,8 @@ class Robot:
         self.successful_scores     = 0
         self.foul_count            = 0
         self.intake_cooldown       = 0.0
+        self.mech_busy             = 0.0
+        self.toggle_progress       = 0.0
         self.intake_in_progress    = False
         self.pending_intake_object = None
         self.is_scoring            = False
@@ -428,7 +459,7 @@ class Robot:
 
         cos_a, sin_a = math.cos(angle), math.sin(angle)
         corners = []
-        for dx, dy in [(-half_w, -half_l), (half_w, -half_l), (half_w, half_l), (-half_w, half_l)]:
+        for dx, dy in [(-half_l, -half_w), (half_l, -half_w), (half_l, half_w), (-half_l, half_w)]:
             wx = pos.x + dx * cos_a - dy * sin_a
             wy = pos.y + dx * sin_a + dy * cos_a
             corners.append((wx * sc, wy * sc))

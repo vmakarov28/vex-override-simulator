@@ -19,8 +19,13 @@ from config.game_rules import (
     MAX_ROBOT_SIZE_START, MIDFIELD_CENTER, MIDFIELD_HALF,
     GOALS, TOGGLES, ROBOT_STARTS,
     ENDGAME_SECONDS,
-    POINTS_AUTONOMOUS_BONUS,
+    POINTS_AUTONOMOUS_BONUS, POINTS_AUTONOMOUS_TIE,
+    AUTON_LINE_HALF_WIDTH, PREPLACED_GOAL_PINS,
+    MATCH_LOADS_CUPS, MATCH_LOADS_ALLIANCE_PINS, MATCH_LOADS_YELLOW_PINS,
+    SKILLS_LOADS_CUPS, SKILLS_LOADS_RED_PINS, SKILLS_LOADS_BLUE_PINS,
+    SKILLS_LOADS_YELLOW_PINS, MATCH_LOAD_TIME,
 )
+from config.robot_profile import DEFAULT_PROFILE
 
 from simulation.robot import Robot
 from simulation.game_objects import (
@@ -30,8 +35,9 @@ from simulation.game_objects import (
     COLL_TYPE_PIN, COLL_TYPE_CUP, COLL_TYPE_WALL, COLL_TYPE_GOAL,
     COLL_TYPE_ROBOT,
     CAT_WALL, CAT_GOAL, CAT_ROBOT, CAT_PIN, CAT_CUP,
+    CAT_ROBOT_RED, CAT_ROBOT_BLUE,
     ORIENT_VERTICAL, ORIENT_HORIZONTAL,
-    NORMAL_PIN_FILTER,          # ← ADD THIS
+    NORMAL_PIN_FILTER,
 )
 
 from simulation.rules_engine import RulesEngine
@@ -41,8 +47,15 @@ from simulation.rules_engine import RulesEngine
 # ════════════════════════════════════════════════════════════════════════════
 PHYSICS_HZ        = 240
 PHYSICS_DT        = 1.0 / PHYSICS_HZ
-MAX_SUBSTEPS      = 4               # 4 × 1/240 s ≈ 67 ms sim time per control step
-KNOCK_IMPULSE     = 0.01            # ← Lowered for reliable knock-over
+# Max physics substeps per step() call.  This used to be 4 (= 1/60 s), so a
+# bot stepping at CONTROL_DT = 1/20 s only got ONE THIRD of the match time
+# to move — the match clock ran 3x faster than the physics.  32 substeps
+# covers any dt up to 0.133 s.
+MAX_SUBSTEPS      = 32
+# Contact impulse needed to tip a standing pin/cup.  0.01 meant ANY touch
+# (even a 1 in/s brush) tipped it over.  Measured robot→cup impulses: light
+# brush < 1, slow push (~15 in/s) ~12, full-speed hit 100-300.
+KNOCK_IMPULSE     = 3.0
 SOLVER_ITERATIONS = 10              # 10 iters is stable for 2-D top-down physics
 
 COLOR_BG       = (22, 28, 38)
@@ -55,7 +68,8 @@ COLOR_WALL     = (80, 88, 100)
 
 class OverrideSimulator:
     def __init__(self, headless: bool = False, render_scale: float = RENDER_SCALE,
-                 skills_mode: bool = False):
+                 skills_mode: bool = False, robot_profiles: Optional[Dict] = None,
+                 preplaced_pins: bool = True):
         self.headless     = headless
         self.render_scale = render_scale
         self.screen_w     = SCREEN_W
@@ -64,17 +78,16 @@ class OverrideSimulator:
         # One robot, 60-second timer, no autonomous period, no opposing
         # alliance.  All on-field scoring counts toward a single score.
         self.skills_mode  = skills_mode
+        # robot_id -> RobotProfile (default: config.robot_profile.DEFAULT_PROFILE)
+        self.robot_profiles = robot_profiles or {}
+        # Head-to-head matches start with a yellow pin on each neutral goal.
+        self.preplaced_pins = preplaced_pins and not skills_mode
+        self.auton_awp = {}
         self.timer_started = False
         self.time_remaining = SKILLS_SECONDS if skills_mode else AUTONOMOUS_SECONDS
 
-        # Match Load Inventory
-        self.red_cups_left = 10
-        self.red_alliance_pins_left = 12
-        self.red_yellow_pins_left = 1
-
-        self.blue_cups_left = 10
-        self.blue_alliance_pins_left = 12
-        self.blue_yellow_pins_left = 1
+        # Match Load Inventory (Preloads are separate — SG5)
+        self._reset_inventory()
 
         self.match_load_mode = False
         self._last_m_press_red = False
@@ -126,11 +139,10 @@ class OverrideSimulator:
 
         self._build_walls()
         self._auton_walls: List = []
-        # Skills mode has no autonomous phase, so the tape-line wedge walls
-        # are never built.
+        self._create_robots()
+        # Skills mode has no autonomous phase, so the auton walls are never built.
         if not self.skills_mode:
             self._build_auton_walls()
-        self._create_robots()
         self._create_field_objects()
         self._register_collision_handlers()
         self._preload_robots()
@@ -161,54 +173,58 @@ class OverrideSimulator:
         self.space.add(*walls)
 
     def _build_auton_walls(self):
-        """VEX V5 VRC autonomous rule: robots may NOT cross the white tape
-        lines during the 15-second autonomous period.  The four diagonal
-        tape segments connect each field corner to the nearest face of the
-        midfield diamond, AND the four edges of the midfield diamond itself
-        are white tape — robots may not enter the midfield during auton.
-        Together these eight segments isolate each starting position in its
-        own sealed wedge:
-          - NW diag: (0,0)   → (60, 60)
-          - NE diag: (144,0) → (84, 60)
-          - SW diag: (0,144) → (60, 84)
-          - SE diag: (84,84) → (144,144)
-          - Diamond NW edge: (60,60) → (48,72) → (60,84)
-          - Diamond NE edge: (84,60) → (96,72) → (84,84)
-        Filter mask is CAT_ROBOT only — pins/cups can still slide across
-        (they obey field physics, not the autonomous rule).
-        Removed when match_phase transitions to driver.
+        """SG7: during the Autonomous Period a robot may not touch tiles or
+        objects on the OPPOSING side of the Autonomous Line.
+
+        The Autonomous Line is the double tape from the top-left corner to the
+        bottom-right corner (y = x) plus the tape square around the Midfield.
+        Red side = y > x, blue side = y < x.  The line itself and the Midfield
+        may be used by BOTH alliances (SG7b, SG8, glossary "Midfield").
+
+        So each alliance gets its own invisible wall along the FAR edge of the
+        tape band, which detours around the far side of the Midfield diamond.
+        The wall's shape filter only hits that alliance's robots.  (The old
+        sim sealed every robot in its own wedge and kept everyone out of the
+        Midfield — far stricter than the manual.)
         """
         sb = self.space.static_body
-        T  = 1.5
-        auton_walls = [
-            # Outer diagonal segments (corner → diamond corner).
-            pymunk.Segment(sb, (0.0,   0.0),  (60.0, 60.0),  T),  # NW
-            pymunk.Segment(sb, (144.0, 0.0),  (84.0, 60.0),  T),  # NE
-            pymunk.Segment(sb, (0.0,   144.0),(60.0, 84.0),  T),  # SW
-            pymunk.Segment(sb, (84.0,  84.0), (144.0,144.0), T),  # SE
-            # Midfield diamond perimeter (vertices: (48,72), (72,48),
-            # (96,72), (72,96)).  Seals off the midfield so wedges are
-            # fully isolated during auton.
-            pymunk.Segment(sb, (60.0, 60.0), (48.0, 72.0), T),  # NW face (upper half)
-            pymunk.Segment(sb, (48.0, 72.0), (60.0, 84.0), T),  # SW face (lower half)
-            pymunk.Segment(sb, (84.0, 60.0), (72.0, 48.0), T),  # NE face (top)
-            pymunk.Segment(sb, (72.0, 48.0), (60.0, 60.0), T),  # NW face (lower half)
-            pymunk.Segment(sb, (84.0, 84.0), (96.0, 72.0), T),  # SE face (top)
-            pymunk.Segment(sb, (96.0, 72.0), (84.0, 60.0), T),  # NE face (bottom)
-            pymunk.Segment(sb, (60.0, 84.0), (72.0, 96.0), T),  # SW face (bottom)
-            pymunk.Segment(sb, (72.0, 96.0), (84.0, 84.0), T),  # SE face (bottom)
-        ]
-        auton_filter = pymunk.ShapeFilter(
-            categories=CAT_WALL,
-            mask=CAT_ROBOT,   # robots only — pins/cups unaffected
-        )
-        for wall in auton_walls:
-            wall.friction       = 0.55
-            wall.elasticity     = 0.05
-            wall.collision_type = COLL_TYPE_WALL
-            wall.filter         = auton_filter
-        self.space.add(*auton_walls)
-        self._auton_walls = list(auton_walls)
+        T = 0.5
+        w = AUTON_LINE_HALF_WIDTH
+        # Red robots are kept on y >= x - w.
+        red_pts = [(w, 0.0), ((120 + w) / 2, (120 - w) / 2), (72.0, 48.0),
+                   (96.0, 72.0), ((168 + w) / 2, (168 - w) / 2), (144.0, 144.0 - w)]
+        # Blue robots are kept on y <= x + w (mirror across y = x).
+        blue_pts = [(y, x) for (x, y) in red_pts]
+        self._auton_walls = []
+        for pts, cat in ((red_pts, CAT_ROBOT_RED), (blue_pts, CAT_ROBOT_BLUE)):
+            filt = pymunk.ShapeFilter(categories=CAT_WALL, mask=cat)
+            for p0, p1 in zip(pts[:-1], pts[1:]):
+                seg = pymunk.Segment(sb, p0, p1, T)
+                seg.friction = 0.55
+                seg.elasticity = 0.05
+                seg.collision_type = COLL_TYPE_WALL
+                seg.filter = filt
+                self.space.add(seg)
+                self._auton_walls.append(seg)
+        for robot in self.robots:
+            robot.touch_allowed = self._auton_touch_fn(robot.alliance)
+
+    @staticmethod
+    def auton_side_ok(alliance: str, x: float, y: float) -> bool:
+        """True if (x, y) may be touched by `alliance` during auton."""
+        w = AUTON_LINE_HALF_WIDTH
+        if abs(x - MIDFIELD_CENTER[0]) + abs(y - MIDFIELD_CENTER[1]) <= MIDFIELD_HALF:
+            return True
+        if alliance == "red":
+            return y >= x - w
+        return y <= x + w
+
+    def _auton_touch_fn(self, alliance: str):
+        def ok(x, y, _a=alliance):
+            if self.match_phase != "autonomous":
+                return True
+            return OverrideSimulator.auton_side_ok(_a, x, y)
+        return ok
 
     def _remove_auton_walls(self):
         """Called when autonomous ends so robots can roam freely in driver."""
@@ -218,20 +234,65 @@ class OverrideSimulator:
             if w in self.space.shapes:
                 self.space.remove(w)
         self._auton_walls = []
+        for robot in getattr(self, "robots", []):
+            robot.touch_allowed = None
 
     def _create_robots(self):
+        def prof(rid):
+            return self.robot_profiles.get(rid, DEFAULT_PROFILE)
         if self.skills_mode:
-            # VEX Robot Skills: a single robot alone on the field.
-            self.robots = [Robot("red1", "red", self.space)]
+            # VEX Robot Skills: a single robot, starting in the Quadrant next
+            # to the red Alliance Station (RSC2a) = red1's start.
+            self.robots = [Robot("red1", "red", self.space, prof("red1"))]
             return
         order = ["red1", "red2", "blue1", "blue2"]
         alliances = {"red1": "red", "red2": "red", "blue1": "blue", "blue2": "blue"}
-        self.robots = [Robot(rid, alliances[rid], self.space) for rid in order]
+        self.robots = [Robot(rid, alliances[rid], self.space, prof(rid)) for rid in order]
 
     def _create_field_objects(self):
         self.pins, self.cups = create_field_objects(self.space)
         self.goals   = create_goals(self.space)
         self.toggles = create_toggles()
+        self._preplace_goal_pins()
+
+    def _preplace_goal_pins(self):
+        """Figure FO-2: every neutral Goal starts with a yellow/yellow Pin
+        Placed on it (head-to-head only; Skills goals start empty)."""
+        if not self.preplaced_pins:
+            return
+        for goal in self.goals:
+            colour = PREPLACED_GOAL_PINS.get(goal.goal_id)
+            if not colour:
+                continue
+            pin = GamePin(8000 + goal.goal_id, colour, goal.x, goal.y, self.space,
+                          orientation=ORIENT_VERTICAL)
+            pin.scored = True
+            pin.goal_id = goal.goal_id
+            try:
+                self.space.remove(pin.shape, pin.body)
+            except Exception:
+                pass
+            goal.add_to_stack(pin)
+            self.pins.append(pin)
+
+    def _reset_inventory(self):
+        if self.skills_mode:
+            # RSC4b — everything comes through the red loaders
+            self.red_cups_left = SKILLS_LOADS_CUPS
+            self.red_alliance_pins_left = SKILLS_LOADS_RED_PINS
+            self.red_blue_pins_left = SKILLS_LOADS_BLUE_PINS
+            self.red_yellow_pins_left = SKILLS_LOADS_YELLOW_PINS
+            self.blue_cups_left = 0
+            self.blue_alliance_pins_left = 0
+            self.blue_yellow_pins_left = 0
+        else:
+            self.red_cups_left = MATCH_LOADS_CUPS
+            self.red_alliance_pins_left = MATCH_LOADS_ALLIANCE_PINS
+            self.red_yellow_pins_left = MATCH_LOADS_YELLOW_PINS
+            self.red_blue_pins_left = 0
+            self.blue_cups_left = MATCH_LOADS_CUPS
+            self.blue_alliance_pins_left = MATCH_LOADS_ALLIANCE_PINS
+            self.blue_yellow_pins_left = MATCH_LOADS_YELLOW_PINS
 
     def _register_collision_handlers(self):
         pairs = [
@@ -297,6 +358,8 @@ class OverrideSimulator:
         if self.match_over:
             return
 
+        for robot in self.robots:
+            robot._dt = dt
         if actions:
             for i, robot in enumerate(self.robots):
                 if i < len(actions) and actions[i]:
@@ -304,32 +367,48 @@ class OverrideSimulator:
                     robot.apply_drive(float(act.get("left", 0)), float(act.get("right", 0)))
 
                     if act.get("flip_pin", False) and robot.carrying_pin:
-                        robot.carrying_pin.flip()
+                        if robot.profile.can_flip_pin and robot.mech_busy <= 0:
+                            robot.carrying_pin.flip()
+                            robot.mech_busy = robot.profile.flip_time
                     if act.get("flip_cup", False) and robot.carrying_cup:
-                        robot.carrying_cup.flip()
+                        if robot.profile.can_flip_cup and robot.mech_busy <= 0:
+                            robot.carrying_cup.flip()
+                            robot.mech_busy = robot.profile.flip_time
+                    only = act.get("intake_only")
                     if act.get("intake", False):
-                        robot.try_intake(self.pins, self.cups)
+                        robot.try_intake(self.pins, self.cups, only)
+                    if act.get("intake_rear", False):
+                        robot.try_intake_rear(self.pins, self.cups, only)
                     if act.get("score_pin", False):
                         robot.try_score_pin(self.goals, self.rules_engine)
                     if act.get("score_cup", False):
                         robot.try_score_cup(self.goals, self.rules_engine)
                     if act.get("toggle", False):
-                        robot.try_toggle(self.toggles)
+                        robot.try_toggle(self.toggles, skills=self.skills_mode)
+                    else:
+                        robot.toggle_progress = 0.0
                     if act.get("match_load", False):
-                        self._try_bot_match_load(robot)
+                        self._try_bot_match_load(robot, act.get("match_load"), dt)
+                    else:
+                        robot._load_progress = 0.0
                 else:
                     robot.apply_drive(0, 0)
+        else:
+            for robot in self.robots:
+                robot.apply_drive(0, 0)
 
         self._physics_accum += dt
         steps = 0
         while self._physics_accum >= PHYSICS_DT and steps < MAX_SUBSTEPS:
             for robot in self.robots:
+                robot.physics_substep()
                 robot.update_carried_positions()
             self.space.step(PHYSICS_DT)
             self._physics_accum -= PHYSICS_DT
             steps += 1
         if self._physics_accum > PHYSICS_DT * MAX_SUBSTEPS:
             self._physics_accum = 0.0
+        self.time_elapsed += dt
 
         for pin in self.pins: pin.update(dt)
         for cup in self.cups: cup.update(dt)
@@ -340,7 +419,9 @@ class OverrideSimulator:
 
         # Set endgame flag before scoring so the +8 bonus and central goal
         # height restriction apply immediately when time crosses 20s.
+        # Endgame is a Head-to-Head concept (glossary); Skills has none.
         self.rules_engine.endgame_active = (
+            not self.skills_mode and
             self.match_phase == "driver" and
             self.timer_started and
             self.time_remaining <= ENDGAME_SECONDS
@@ -413,13 +494,23 @@ class OverrideSimulator:
             self.rules_engine.auton_bonus_blue = POINTS_AUTONOMOUS_BONUS
             self._auton_winner = "blue"
         else:
+            # SC7b: a tie (including 0-0) gives each alliance 6 points.
+            self.rules_engine.auton_bonus_red = POINTS_AUTONOMOUS_TIE
+            self.rules_engine.auton_bonus_blue = POINTS_AUTONOMOUS_TIE
             self._auton_winner = "tie"
+        # SC8: Autonomous Win Point status for each alliance
+        self.auton_awp = {
+            a: self.rules_engine.autonomous_win_point(
+                self.goals, self.toggles, self.robots, a)
+            for a in ("red", "blue")}
         # Surface immediately so observers reading red_score/blue_score
         # between this call and the next recompute see the right value.
         self.rules_engine.red_score  += self.rules_engine.auton_bonus_red
         self.rules_engine.blue_score += self.rules_engine.auton_bonus_blue
         self.red_score  = self.rules_engine.red_score
         self.blue_score = self.rules_engine.blue_score
+        if not RulesEngine.VERBOSE:
+            return
         print(f"[AUTON] Autonomous ended: red={self._auton_score_red} "
               f"blue={self._auton_score_blue} winner={self._auton_winner} "
               f"(+{POINTS_AUTONOMOUS_BONUS} bonus to "
@@ -585,8 +676,9 @@ class OverrideSimulator:
 
         # === MATCH LOAD INVENTORY (Bottom) ===
         # Red (left side) — always shown; in skills mode this is the only one
+        extra = f" {self.red_blue_pins_left}B" if self.skills_mode else ""
         red_inv = self.font_sm.render(
-            f"Red: {self.red_cups_left}C {self.red_alliance_pins_left}P {self.red_yellow_pins_left}Y",
+            f"Red: {self.red_cups_left}C {self.red_alliance_pins_left}P {self.red_yellow_pins_left}Y{extra}",
             True, (255, 150, 150)
         )
         self.screen.blit(red_inv, (8, self.screen_h - 20))
@@ -665,6 +757,7 @@ class OverrideSimulator:
         actions[0] = {
             "left": left, "right": right,
             "intake": bool(keys[pygame.K_e]),
+            "intake_rear": bool(keys[pygame.K_g]),     # back intake (vertical pins)
             "score_pin": bool(keys[pygame.K_q] and not keys[pygame.K_LSHIFT]),
             "score_cup": bool(keys[pygame.K_q] and keys[pygame.K_LSHIFT]),
             "toggle": bool(keys[pygame.K_t]),
@@ -784,22 +877,13 @@ class OverrideSimulator:
         self.timer_started = False
         self.time_remaining = SKILLS_SECONDS if self.skills_mode else AUTONOMOUS_SECONDS
 
-        # Rebuild autonomous tape-line walls (removed at end of last match).
-        # Skills has no autonomous phase, so the walls stay removed.
-        self._remove_auton_walls()
-        if not self.skills_mode:
-            self._build_auton_walls()
         self._auton_bonus_applied = False
         self._auton_score_red  = 0
         self._auton_score_blue = 0
         self._auton_winner = None
 
-        self.red_cups_left = 10
-        self.red_alliance_pins_left = 12
-        self.red_yellow_pins_left = 1
-        self.blue_cups_left = 10
-        self.blue_alliance_pins_left = 12
-        self.blue_yellow_pins_left = 1
+        self._reset_inventory()
+        self.auton_awp = {}
         self.match_load_mode = False
 
         for obj in self.pins + self.cups:
@@ -823,9 +907,13 @@ class OverrideSimulator:
         self.pins, self.cups = create_field_objects(self.space)
         self.goals   = create_goals(self.space)
         self.toggles = create_toggles()
+        self._preplace_goal_pins()
 
         for robot in self.robots:
             robot.reset()
+        if not self.skills_mode:
+            self._remove_auton_walls()
+            self._build_auton_walls()
 
         # Re-issue starting preloads so every robot enters auton with
         # the same pin + cup loadout each match.
@@ -839,44 +927,87 @@ class OverrideSimulator:
         else:
             return (pos.x > 132 and pos.y < 24) or (pos.x > 132 and pos.y > 120)
 
-    def _try_bot_match_load(self, robot) -> bool:
-        """Bot-driven match load.  Only red1/blue1 are eligible (matches the
-        keyboard handler's restriction).  Robot must be in its alliance's
-        loading zone.  Picks the best available selection automatically:
+    def _try_bot_match_load(self, robot, choice=True, dt: float = 0.05) -> bool:
+        """Bot-driven Match Load (SG11).
 
-            1. Loaded cup + yellow pin (selection 2)   — highest value
-            2. Loaded cup + alliance pin (selection 1) — pin+cup at once
-            3. Individual alliance pin   (selection 4)
-            4. Individual cup            (selection 3)
-            5. Individual yellow pin     (selection 5) — fallback (no cup left)
+        Either robot of an alliance may take Match Loads from its own
+        alliance's Loaders, during the Driver Controlled Period only (Skills:
+        any time, red Loaders only).  The robot must sit in one of its Load
+        Zones and hold the action for the robot profile's match_load_time;
+        the element(s) are then handed straight into the robot's intake (the
+        drive-team member drops them in the Loader, the robot pulls them out
+        of the bottom opening).
 
-        Returns True if a match load actually fired.
+        choice: True/"auto" or one of
+          "cup+pin" (loaded cup with alliance pin), "cup+yellow", "cup+blue"
+          (Skills), "cup", "pin", "yellow", "blue" (Skills).
+        Returns True when a load completed this step.
         """
-        if robot.robot_id not in ("red1", "blue1"):
-            return False
-        # VEX V5 VRC rule: match loading is PROHIBITED during autonomous
-        # period.  The auton bonus is determined by on-field play only.
         if self.match_phase == "autonomous":
             return False
         alliance = robot.alliance
         if not self._is_in_loading_zone(robot, alliance):
+            robot._load_progress = 0.0
             return False
-        if self._has_inventory(alliance, "cup") and self._has_inventory(alliance, "yellow_pin"):
-            self._perform_match_load(robot, 2)
-            return True
-        if self._has_inventory(alliance, "cup") and self._has_inventory(alliance, "alliance_pin"):
-            self._perform_match_load(robot, 1)
-            return True
-        if self._has_inventory(alliance, "alliance_pin"):
-            self._perform_match_load(robot, 4)
-            return True
-        if self._has_inventory(alliance, "cup"):
-            self._perform_match_load(robot, 3)
-            return True
-        if self._has_inventory(alliance, "yellow_pin"):
-            self._perform_match_load(robot, 5)
-            return True
-        return False
+        inv_alliance = alliance
+        need_pin = robot.carrying_pin is None
+        need_cup = robot.carrying_cup is None
+        if not (need_pin or need_cup):
+            return False
+
+        def have(kind):
+            if kind == "cup":
+                return self._has_inventory(inv_alliance, "cup")
+            if kind == "pin":
+                return self._has_inventory(inv_alliance, "alliance_pin")
+            if kind == "yellow":
+                return self._has_inventory(inv_alliance, "yellow_pin")
+            if kind == "blue":
+                return self._has_inventory(inv_alliance, "blue_pin")
+            return False
+
+        if choice in (True, "auto", None):
+            order = ["cup+yellow", "cup+pin", "cup+blue", "pin", "blue", "yellow", "cup"]
+        else:
+            order = [choice]
+        pick = None
+        for c in order:
+            parts = c.split("+")
+            ok = True
+            for part in parts:
+                if part == "cup" and not need_cup:
+                    ok = False
+                if part != "cup" and not need_pin:
+                    ok = False
+                if not have(part):
+                    ok = False
+            if ok:
+                pick = parts
+                break
+        if pick is None:
+            return False
+
+        robot._load_progress = getattr(robot, "_load_progress", 0.0) + dt
+        if robot._load_progress < robot.profile.match_load_time:
+            return False
+        robot._load_progress = 0.0
+        x, y = robot.body.position
+        for part in pick:
+            if part == "cup":
+                obj = GameCup(9500 + len(self.cups), "gray", x, y, self.space)
+                self.cups.append(obj)
+                self._use_inventory(inv_alliance, "cup")
+                robot._grab(obj, "cup")
+            else:
+                colour = {"pin": "red_yellow" if alliance == "red" else "blue_yellow",
+                          "yellow": "yellow_yellow", "blue": "blue_yellow"}[part]
+                obj = GamePin(9500 + len(self.pins), colour, x, y, self.space)
+                self.pins.append(obj)
+                self._use_inventory(inv_alliance,
+                                    {"pin": "alliance_pin", "yellow": "yellow_pin",
+                                     "blue": "blue_pin"}[part])
+                robot._grab(obj, "pin")
+        return True
 
     def _perform_match_load(self, robot, selection):
         alliance = robot.alliance
@@ -906,6 +1037,7 @@ class OverrideSimulator:
             if item_type == "cup": return self.red_cups_left > 0
             if item_type == "alliance_pin": return self.red_alliance_pins_left > 0
             if item_type == "yellow_pin": return self.red_yellow_pins_left > 0
+            if item_type == "blue_pin": return getattr(self, "red_blue_pins_left", 0) > 0
         else:
             if item_type == "cup": return self.blue_cups_left > 0
             if item_type == "alliance_pin": return self.blue_alliance_pins_left > 0
@@ -917,6 +1049,7 @@ class OverrideSimulator:
             if item_type == "cup": self.red_cups_left -= 1
             if item_type == "alliance_pin": self.red_alliance_pins_left -= 1
             if item_type == "yellow_pin": self.red_yellow_pins_left -= 1
+            if item_type == "blue_pin": self.red_blue_pins_left -= 1
         else:
             if item_type == "cup": self.blue_cups_left -= 1
             if item_type == "alliance_pin": self.blue_alliance_pins_left -= 1
@@ -943,23 +1076,16 @@ class OverrideSimulator:
         self.pins.append(pin)
 
     def _preload_robots(self):
-        """VEX VRC starting pre-load: every robot enters the field already
-        holding 1 alliance pin + 1 cup, ready to score immediately when
-        autonomous begins.  Counts against the alliance's matchload pool
-        (2 cups + 2 alliance pins per alliance) so total available
-        elements stay consistent with the matchload UI.
-        """
-        pin_id_base = 9000
-        cup_id_base = 9000
+        """SG5: each robot starts holding ONE Preload Pin (red/yellow for red,
+        blue/yellow for blue) and no Cup.  Preloads are separate from the
+        Match Load supply.  Skills (RSC2c): one red/yellow Preload.
+        (The old sim also gave every robot a cup and took both from the
+        Match Loads.)"""
         for i, robot in enumerate(self.robots):
-            alliance = robot.alliance
-            color = "red_yellow" if alliance == "red" else "blue_yellow"
-            rx     = float(robot.body.position.x)
-            ry     = float(robot.body.position.y)
+            color = "red_yellow" if robot.alliance == "red" else "blue_yellow"
+            rx, ry = float(robot.body.position.x), float(robot.body.position.y)
             rangle = float(robot.body.angle)
-
-            # Pre-loaded alliance pin.
-            pin = GamePin(pin_id_base + i, color, rx, ry, self.space,
+            pin = GamePin(9000 + i, color, rx, ry, self.space,
                           orientation=ORIENT_HORIZONTAL, angle=rangle)
             pin.carried_by  = robot.robot_id
             pin.orientation = ORIENT_HORIZONTAL
@@ -968,31 +1094,8 @@ class OverrideSimulator:
             pin._build_shape()
             robot.carrying_pin = pin
             self.pins.append(pin)
-
-            # Pre-loaded cup.
-            cup = GameCup(cup_id_base + i, "gray", rx, ry, self.space,
-                          orientation=ORIENT_HORIZONTAL, angle=rangle)
-            cup.carried_by  = robot.robot_id
-            cup.orientation = ORIENT_HORIZONTAL
-            cup.body.angle  = rangle
-            cup.set_carried()
-            cup._build_shape()
-            robot.carrying_cup = cup
-            self.cups.append(cup)
-
-            # Snap visual lift to "carried" immediately so the preload
-            # is visible the first frame instead of animating up from 0.
             robot.lift_state  = 1.0
             robot.lift_target = 1.0
-
-            # Decrement the matchload pool: each preload comes from the
-            # alliance's element supply.
-            if alliance == "red":
-                self.red_alliance_pins_left -= 1
-                self.red_cups_left          -= 1
-            else:
-                self.blue_alliance_pins_left -= 1
-                self.blue_cups_left          -= 1
 
     def run_interactive(self):
         if self.headless:

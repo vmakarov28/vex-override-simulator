@@ -57,7 +57,11 @@ class OverrideEnv(ParallelEnv):
         self.render_mode = render_mode
         self.headless    = headless
 
-        self.sim             = OverrideSimulator(headless=headless)
+        # HeuristicBot was written for the legacy centre-scoring robot model.
+        from config.robot_profile import LEGACY_ROBOT
+        self.sim             = OverrideSimulator(
+            headless=headless,
+            robot_profiles={rid: LEGACY_ROBOT for rid in ('red1', 'red2', 'blue1', 'blue2')})
         self.agents          = list(AGENT_IDS)
         self.possible_agents = list(AGENT_IDS)
 
@@ -456,7 +460,7 @@ class OverrideEnv(ParallelEnv):
                 #              (clear top = transparent from above = DOWN half visible).
                 up_vis = True
                 if pin_idx == 0:
-                    down_vis = False          # goal post always hides the bottom pin's DOWN face
+                    down_vis = True           # bottom half in the goal is visible (manual SC3)
                 else:
                     prev_obj, prev_is_pin = post_stack[pin_idx - 1]
                     # If prev is a cup: visible when clear side is up (transparent top).
